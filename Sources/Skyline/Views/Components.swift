@@ -1,7 +1,7 @@
 import SwiftUI
 import SkylineCore
 
-/// Translucent rounded card with an Apple-Weather-style small-caps header.
+/// Rounded "readable glass" card with a small-caps header.
 struct Card<Content: View>: View {
     var title: String? = nil
     var systemImage: String? = nil
@@ -13,7 +13,7 @@ struct Card<Content: View>: View {
             if let title {
                 Label(title.uppercased(), systemImage: systemImage ?? "info.circle")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.65))
+                    .foregroundStyle(Glass.secondaryText)
             }
             if let subtitle {
                 Text(subtitle)
@@ -28,7 +28,7 @@ struct Card<Content: View>: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .glassCard()
     }
 }
 
@@ -59,7 +59,7 @@ struct TileValue: View {
             if let label { Text(label).font(.headline) }
             Spacer(minLength: 0)
             if let detail {
-                Text(detail).font(.caption).foregroundStyle(.white.opacity(0.85))
+                Text(detail).font(.caption).foregroundStyle(Glass.secondaryText)
                     .lineLimit(3).fixedSize(horizontal: false, vertical: true)
             }
         }

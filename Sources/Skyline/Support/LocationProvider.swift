@@ -3,8 +3,8 @@ import Foundation
 
 /// Thin CoreLocation wrapper. Uses one-shot `requestLocation()` (no continuous updates) to save power.
 ///
-/// Permission policy: the system prompt is requested only when the status is `.notDetermined`, and
-/// only once ever (remembered in defaults). The status is read from `locationManagerDidChangeAuthorization`,
+/// Permission policy: the system prompt is requested only when the status is `.notDetermined` (never
+/// when authorized or denied). The status is read from `locationManagerDidChangeAuthorization`,
 /// which CoreLocation calls right after the manager is created, never by re-requesting at launch.
 /// Failed fixes are retried with backoff (5 s, 20 s, 60 s, then every 5 min) so "My Location" always
 /// resolves even when the first `requestLocation()` times out.
@@ -19,6 +19,7 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
     private var retryCount = 0
     private var retryTask: Task<Void, Never>?
     private var started = false
+    private var requestedThisLaunch = false
 
     static let requestedKey = "locationAuthorizationRequested"
 
@@ -51,8 +52,11 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         status = newStatus
         switch newStatus {
         case .notDetermined:
-            // First launch ever: ask once. Never ask again, even if the status reads undetermined later.
-            if !defaults.bool(forKey: Self.requestedKey) {
+            // Only an app that has never been answered is .notDetermined (the stable signing identity in
+            // build-app.sh keeps the answer across rebuilds), so this asks once ever. At most once per
+            // launch, so an ignored prompt is not re-posted while the app runs.
+            if !requestedThisLaunch {
+                requestedThisLaunch = true
                 defaults.set(true, forKey: Self.requestedKey)
                 manager.requestWhenInUseAuthorization()
             }

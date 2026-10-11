@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import SkylineCore
 
@@ -32,7 +33,7 @@ struct ContentView: View {
                     } label: {
                         Label("Map", systemImage: store.radarExpanded ? "list.bullet" : "map")
                     }
-                    .help(store.radarExpanded ? "Back to the forecast" : "Show the radar map")
+                    .help(store.radarExpanded ? "Back to the forecast" : "Give the radar map the whole window")
                 }
                 Button {
                     Task { await store.refreshAll(force: true) }
@@ -54,6 +55,19 @@ struct ContentView: View {
             StressTest.runIfRequested(store: store)
             if let raw = defaults.string(forKey: "SkylineOpenModule"), let module = DetailModule(rawValue: raw) {
                 store.activeModule = ModuleSelection(module: module, day: nil)
+            }
+            // `-SkylineWindowSize 980x760`: QA/screenshot hook to test the narrow layout.
+            if let raw = defaults.string(forKey: "SkylineWindowSize") {
+                let parts = raw.lowercased().split(separator: "x").compactMap { Double($0) }
+                if parts.count == 2 {
+                    DispatchQueue.main.async {
+                        guard let window = NSApp.windows.first(where: { $0.isVisible && $0.styleMask.contains(.titled) && $0.frame.height > 300 }) else { return }
+                        var frame = window.frame
+                        frame.origin.y += frame.height - parts[1]
+                        frame.size = CGSize(width: parts[0], height: parts[1])
+                        window.setFrame(frame, display: true)
+                    }
+                }
             }
         }
     }

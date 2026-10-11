@@ -5,6 +5,7 @@ import SkylineCore
 struct RadarCard: View {
     let location: WeatherLocation
     let pinText: String?
+    var alerts: [WeatherAlert] = []
     var namespace: Namespace.ID
     @Environment(WeatherStore.self) private var store
     @AppStorage(RadarOpacity.key) private var opacity = RadarOpacity.defaultValue
@@ -17,7 +18,8 @@ struct RadarCard: View {
                 RadarMapView(playback: radar, center: location.coordinate, frames: radar.frames,
                              maxNativeZoom: radar.provider.maximumNativeZoom, interactive: false,
                              spanDegrees: 3.2, opacity: opacity, pinText: pinText,
-                             followsPlayback: !expanded, reportsProgress: !expanded)
+                             followsPlayback: !expanded, reportsProgress: !expanded,
+                             alerts: alerts, focusedAlertID: nil)
                     .allowsHitTesting(false)
                 // Whole map is a button, like Apple's map tile.
                 Color.clear
@@ -55,11 +57,26 @@ struct RadarCard: View {
     }
 }
 
+/// The always-visible radar of the wide layout: same map UI as the expanded view, no autoplay
+/// (an idle window stays at ~0 % CPU), and its button hides/shows the forecast column instead.
+struct RadarPanel: View {
+    let location: WeatherLocation
+    let pinText: String?
+    var alerts: [WeatherAlert] = []
+    @Namespace private var unused
+
+    var body: some View {
+        ExpandedRadarView(location: location, pinText: pinText, alerts: alerts, namespace: unused, isPanel: true)
+    }
+}
+
 /// The expanded map filling the detail area (not a window or sheet).
 struct ExpandedRadarView: View {
     let location: WeatherLocation
     let pinText: String?
+    var alerts: [WeatherAlert] = []
     var namespace: Namespace.ID
+    var isPanel = false
     @Environment(WeatherStore.self) private var store
     @AppStorage(RadarOpacity.key) private var opacity = RadarOpacity.defaultValue
 
@@ -69,18 +86,28 @@ struct ExpandedRadarView: View {
             RadarMapView(playback: radar, center: location.coordinate, frames: radar.frames,
                          maxNativeZoom: radar.provider.maximumNativeZoom, interactive: true,
                          spanDegrees: radar.provider == .nexrad ? 5 : 9, opacity: opacity,
-                         pinText: pinText, followsPlayback: true, reportsProgress: true)
+                         pinText: pinText, followsPlayback: true, reportsProgress: true,
+                         alerts: alerts, focusedAlertID: store.focusedAlertID)
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
-                    CircleButton(systemImage: "arrow.down.right.and.arrow.up.left", help: "Collapse map (Esc)") { collapse() }
-                        .keyboardShortcut(.cancelAction)
+                    if isPanel {
+                        CircleButton(systemImage: store.radarExpanded ? "sidebar.trailing" : "arrow.up.left.and.arrow.down.right",
+                                     help: store.radarExpanded ? "Show the forecast column (Esc)" : "Give the map the whole window") {
+                            withAnimation(.spring(response: 0.42, dampingFraction: 0.9)) { store.radarExpanded.toggle() }
+                        }
+                        .keyboardShortcut(store.radarExpanded ? KeyboardShortcut.cancelAction : nil)
+                    } else {
+                        CircleButton(systemImage: "arrow.down.right.and.arrow.up.left", help: "Collapse map (Esc)") { collapse() }
+                            .keyboardShortcut(.cancelAction)
+                    }
                     VStack(alignment: .leading, spacing: 2) {
                         Text(location.isCurrentLocation ? "My Location" : location.name).font(.headline)
-                        Text("Precipitation").font(.caption).opacity(0.8)
+                        Text(alerts.isEmpty ? "Precipitation" : "Precipitation · \(alerts.count) alert\(alerts.count == 1 ? "" : "s") outlined")
+                            .font(.caption).foregroundStyle(Glass.secondaryText)
                     }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .glassChip(RoundedRectangle(cornerRadius: 10, style: .continuous))
                     Spacer()
                     RadarOptions(radar: radar, opacity: $opacity)
                 }
@@ -89,7 +116,7 @@ struct ExpandedRadarView: View {
                 HStack(alignment: .bottom) {
                     RadarLegend(provider: radar.provider)
                         .padding(10)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .glassChip(RoundedRectangle(cornerRadius: 10, style: .continuous))
                     Spacer()
                 }
                 .padding(.horizontal, 12)
@@ -99,13 +126,13 @@ struct ExpandedRadarView: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .matchedGeometryEffect(id: "radar-map", in: namespace, isSource: store.radarExpanded)
+        .modifier(MatchedIfExpanded(enabled: !isPanel, namespace: namespace, isSource: store.radarExpanded))
         .foregroundStyle(.white)
-        .task {
+        .task(id: location.id) {
             radar.configure(for: location.coordinate)
             await radar.loadFrames()
-            // Intent only: the clock starts once every frame's tiles are prefetched.
-            if radar.frames.count > 1 { radar.setPlaying(true) }
+            // Expanding is an explicit "show me the loop"; the always-on panel waits for Space/Play.
+            if !isPanel, radar.frames.count > 1 { radar.setPlaying(true) }
         }
     }
 
@@ -114,6 +141,15 @@ struct ExpandedRadarView: View {
         withAnimation(.spring(response: 0.42, dampingFraction: 0.9)) {
             store.radarExpanded = false
         }
+    }
+}
+
+private struct MatchedIfExpanded: ViewModifier {
+    let enabled: Bool
+    let namespace: Namespace.ID
+    let isSource: Bool
+    func body(content: Content) -> some View {
+        if enabled { content.matchedGeometryEffect(id: "radar-map", in: namespace, isSource: isSource) } else { content }
     }
 }
 
@@ -127,7 +163,7 @@ struct CircleButton: View {
             Image(systemName: systemImage)
                 .font(.system(size: 12, weight: .bold))
                 .frame(width: 30, height: 30)
-                .background(.ultraThinMaterial, in: Circle())
+                .glassChip(Circle())
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
@@ -154,7 +190,7 @@ struct RadarTimeLabel: View {
         .font(compact ? .caption.weight(.semibold) : .callout.weight(.semibold))
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(.ultraThinMaterial, in: Capsule())
+        .glassChip(Capsule())
     }
 
     private func label(_ frame: RadarFrame) -> String {
@@ -191,7 +227,7 @@ struct RadarOpacityControl: View {
         .padding(.horizontal, compact ? 8 : 0)
         .padding(.vertical, compact ? 4 : 0)
         .background {
-            if compact { Capsule().fill(.ultraThinMaterial) }
+            if compact { Capsule().fill(Glass.chipTint).background(.ultraThinMaterial, in: Capsule()) }
         }
         .help("Radar opacity: lower it to see the map underneath")
     }
@@ -209,6 +245,18 @@ struct RadarOptions: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .frame(width: 280)
+            if radar.provider == .nexrad {
+                HStack(spacing: 6) {
+                    Text("Loop").font(.caption2.weight(.semibold)).foregroundStyle(Glass.secondaryText)
+                    Picker("Loop length", selection: Binding(get: { radar.range }, set: { radar.setRange($0) })) {
+                        ForEach(RadarRange.allCases) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 160)
+                }
+                .help("How far back the radar loop goes")
+            }
             VStack(alignment: .trailing, spacing: 2) {
                 Text("Radar opacity").font(.caption2.weight(.semibold)).opacity(0.75)
                 RadarOpacityControl(opacity: $opacity)
@@ -218,13 +266,15 @@ struct RadarOptions: View {
             }
         }
         .padding(10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .glassChip(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 }
 
 struct RadarTimeline: View {
     let radar: RadarPlayback
     let timeZone: TimeZone
+    @Environment(WeatherStore.self) private var store
+    @State private var showCallout = false
 
     var body: some View {
         HStack(spacing: 14) {
@@ -236,7 +286,6 @@ struct RadarTimeline: View {
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .keyboardShortcut(.space, modifiers: [])
             .disabled(radar.frames.count < 2)
             .help(radar.isPlaying ? "Pause (Space)" : "Play (Space)")
 
@@ -244,10 +293,29 @@ struct RadarTimeline: View {
                 Slider(value: Binding(get: { Double(radar.index) },
                                       set: { radar.crossfade = false; radar.scrub(to: Int($0.rounded())) }),
                        in: 0...Double(max(radar.frames.count - 1, 1)),
-                       onEditingChanged: { editing in radar.crossfade = !editing })
+                       onEditingChanged: { editing in
+                           radar.crossfade = !editing
+                           if store.isScrubbing != editing { store.isScrubbing = editing }
+                           showCallout = editing
+                       })
                     .disabled(radar.frames.count < 2)
+                    .overlay(alignment: .topLeading) {
+                        // Same callout as the charts while scrubbing (drawn, never measured back into state).
+                        if showCallout, let frame = radar.currentFrame, radar.frames.count > 1 {
+                            GeometryReader { geo in
+                                let f = Double(radar.index) / Double(radar.frames.count - 1)
+                                ScrubCallout(title: Fmt.time(frame.time, timeZone))
+                                    .position(x: 8 + (geo.size.width - 16) * f, y: -18)
+                            }
+                            .allowsHitTesting(false)
+                        }
+                    }
+                    .onKeyPress(.leftArrow) { radar.crossfade = false; radar.scrub(to: radar.index - 1); radar.crossfade = true; return .handled }
+                    .onKeyPress(.rightArrow) { radar.crossfade = false; radar.scrub(to: radar.index + 1); radar.crossfade = true; return .handled }
                 HStack {
                     Text(radar.frames.first.map { Fmt.time($0.time, timeZone) } ?? "")
+                    Spacer()
+                    Text("← → step · Space play").opacity(0.8)
                     Spacer()
                     Text("Now")
                 }
@@ -259,41 +327,62 @@ struct RadarTimeline: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .glassChip(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }
 
+/// Legend. NEXRAD uses the standard NWS reflectivity scale (what the IEM N0Q tiles are coloured with),
+/// labelled in dBZ with plain-English intensity.
 struct RadarLegend: View {
     let provider: RadarProvider
 
+    static let nexradStops: [(dbz: Int, color: Color)] = [
+        (5, Color(red: 0.25, green: 0.91, blue: 0.91)), (10, Color(red: 0.0, green: 0.62, blue: 0.96)),
+        (15, Color(red: 0.0, green: 0.0, blue: 0.96)), (20, Color(red: 0.0, green: 0.96, blue: 0.0)),
+        (25, Color(red: 0.0, green: 0.78, blue: 0.0)), (30, Color(red: 0.0, green: 0.56, blue: 0.0)),
+        (35, Color(red: 1.0, green: 1.0, blue: 0.0)), (40, Color(red: 0.91, green: 0.75, blue: 0.0)),
+        (45, Color(red: 1.0, green: 0.56, blue: 0.0)), (50, Color(red: 1.0, green: 0.0, blue: 0.0)),
+        (55, Color(red: 0.84, green: 0.0, blue: 0.0)), (60, Color(red: 0.75, green: 0.0, blue: 0.0)),
+        (65, Color(red: 1.0, green: 0.0, blue: 1.0)), (70, Color(red: 0.6, green: 0.33, blue: 0.79)),
+    ]
+
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text("PRECIPITATION").font(.caption2.weight(.semibold)).opacity(0.7)
-            LinearGradient(colors: colors, startPoint: .leading, endPoint: .trailing)
-                .frame(width: 170, height: 6)
-                .clipShape(Capsule())
-            HStack {
-                Text("Light")
-                Spacer()
-                Text("Heavy")
+            Text(provider == .nexrad ? "REFLECTIVITY (dBZ)" : "PRECIPITATION")
+                .font(.caption2.weight(.semibold)).foregroundStyle(Glass.secondaryText)
+            if provider == .nexrad {
+                HStack(spacing: 0) {
+                    ForEach(Self.nexradStops, id: \.dbz) { stop in
+                        Rectangle().fill(stop.color).frame(width: 14, height: 8)
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 2))
+                HStack(spacing: 0) {
+                    ForEach([5, 20, 35, 50, 65], id: \.self) { v in
+                        Text("\(v)").frame(width: 42, alignment: .leading)
+                    }
+                }
+                .font(.system(size: 9, weight: .medium)).monospacedDigit()
+                HStack(spacing: 0) {
+                    Text("Light").frame(width: 70, alignment: .leading)
+                    Text("Moderate").frame(width: 56, alignment: .leading)
+                    Text("Heavy · hail").frame(width: 70, alignment: .leading)
+                }
+                .font(.system(size: 9)).foregroundStyle(Glass.secondaryText)
+            } else {
+                LinearGradient(colors: rainViewerColors, startPoint: .leading, endPoint: .trailing)
+                    .frame(width: 196, height: 8)
+                    .clipShape(Capsule())
+                HStack { Text("Light"); Spacer(); Text("Heavy") }
+                    .font(.caption2).frame(width: 196).foregroundStyle(Glass.secondaryText)
             }
-            .font(.caption2)
-            .frame(width: 170)
-            .opacity(0.8)
-            Text(provider.attribution).font(.system(size: 9)).opacity(0.6)
+            Text(provider.attribution).font(.system(size: 9)).foregroundStyle(Glass.secondaryText)
         }
     }
 
-    private var colors: [Color] {
-        switch provider {
-        case .nexrad:
-            return [Color(red: 0.0, green: 0.9, blue: 0.95), Color(red: 0.0, green: 0.8, blue: 0.0),
-                    Color(red: 1.0, green: 0.95, blue: 0.0), Color(red: 1.0, green: 0.55, blue: 0.0),
-                    Color(red: 0.9, green: 0.0, blue: 0.0), Color(red: 0.8, green: 0.0, blue: 0.8)]
-        case .rainViewer:
-            return [Color(red: 0.55, green: 0.8, blue: 1.0), Color(red: 0.1, green: 0.4, blue: 0.95),
-                    Color(red: 1.0, green: 0.85, blue: 0.0), Color(red: 1.0, green: 0.3, blue: 0.0),
-                    Color(red: 0.75, green: 0.0, blue: 0.4)]
-        }
+    private var rainViewerColors: [Color] {
+        [Color(red: 0.55, green: 0.8, blue: 1.0), Color(red: 0.1, green: 0.4, blue: 0.95),
+         Color(red: 1.0, green: 0.85, blue: 0.0), Color(red: 1.0, green: 0.3, blue: 0.0),
+         Color(red: 0.75, green: 0.0, blue: 0.4)]
     }
 }

@@ -55,6 +55,7 @@ struct AlertsCard: View {
 struct AlertDetailView: View {
     let alert: WeatherAlert
     let timeZone: TimeZone
+    var onShowOnMap: (() -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -64,6 +65,9 @@ struct AlertDetailView: View {
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(AlertsCard.color(alert.severity))
                 Spacer()
+                if let onShowOnMap, !alert.polygons.isEmpty {
+                    Button("Show on Map") { dismiss(); onShowOnMap() }
+                }
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }
             .padding()

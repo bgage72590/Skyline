@@ -45,18 +45,24 @@ struct ModuleSelection: Identifiable, Equatable {
 private struct ChartPoint: Identifiable {
     let time: Date
     let value: Double
+    /// Model spread in display units (temperature charts only): shaded as value ± spread/2.
+    var spread: Double? = nil
     var id: Date { time }
 }
 
-/// In-window detail panel over the forecast (Apple Weather's module "expand").
+/// Module detail. Wide windows show it as an inspector column beside the radar (`inspector: true`);
+/// narrow windows show it as a sheet-style panel over the forecast.
 struct ModuleDetailView: View {
     let report: WeatherReport
+    var inspector = false
     @Environment(WeatherStore.self) private var store
     @State private var module: DetailModule
     @State private var day: Date
+    @State private var scrub: Date?
 
-    init(report: WeatherReport, selection: ModuleSelection) {
+    init(report: WeatherReport, selection: ModuleSelection, inspector: Bool = false) {
         self.report = report
+        self.inspector = inspector
         _module = State(initialValue: selection.module)
         _day = State(initialValue: selection.day ?? report.daily.first?.date ?? Date())
     }
@@ -66,6 +72,21 @@ struct ModuleDetailView: View {
     private var selectedDay: DailyForecast? { report.daily.first { $0.date == day } ?? report.daily.first }
 
     var body: some View {
+        if inspector {
+            ScrollView { panel.padding(.bottom, 8) }
+                .scrollIndicators(.automatic)
+                .frame(maxHeight: .infinity, alignment: .top)
+                .glassPanel(cornerRadius: 16)
+        } else {
+            panel
+                .frame(maxWidth: 760)
+                .fixedSize(horizontal: false, vertical: true)
+                .glassPanel()
+                .shadow(color: .black.opacity(0.3), radius: 30, y: 10)
+        }
+    }
+
+    private var panel: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
                 Menu {
@@ -78,7 +99,8 @@ struct ModuleDetailView: View {
                 .menuStyle(.borderlessButton)
                 .fixedSize()
                 Spacer()
-                CircleButton(systemImage: "xmark", help: "Close (Esc)") { close() }
+                CircleButton(systemImage: inspector ? "sidebar.trailing" : "xmark",
+                             help: inspector ? "Close inspector (Esc)" : "Close (Esc)") { close() }
                     .keyboardShortcut(.cancelAction)
             }
             dayStrip
@@ -91,19 +113,15 @@ struct ModuleDetailView: View {
                 }
                 Text(summary(d))
                     .font(.callout)
-                    .foregroundStyle(.white.opacity(0.9))
+                    .foregroundStyle(.white)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
         }
-        .padding(20)
+        .padding(inspector ? 16 : 20)
         .foregroundStyle(.white)
-        .frame(maxWidth: 760)
-        .fixedSize(horizontal: false, vertical: true)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .shadow(color: .black.opacity(0.3), radius: 30, y: 10)
     }
 
     private func close() {
@@ -118,6 +136,7 @@ struct ModuleDetailView: View {
                 let selected = d.date == day
                 Button {
                     day = d.date
+                    scrub = nil
                 } label: {
                     VStack(spacing: 4) {
                         Text(String(Fmt.weekday(d.date, tz).prefix(1))).font(.caption2.weight(.semibold)).opacity(0.7)
@@ -188,59 +207,135 @@ struct ModuleDetailView: View {
             case .pressure: v = h.pressure.map { units.isImperialDisplay ? $0 * 0.0295299830714 : $0 }
             case .confidence: v = nil
             }
-            return v.map { ChartPoint(time: h.time, value: $0) }
+            let spread = (module == .conditions) ? h.temperatureSpread.map(units.temperatureDelta) : nil
+            return v.map { ChartPoint(time: h.time, value: $0, spread: spread) }
+        }
+    }
+
+    /// Y range from this day's own data (with a minimum span, so a steady day reads as gentle, not
+    /// flat on a fixed 0–100 scale and not noise blown up to full height).
+    private func domain(_ pts: [ChartPoint]) -> ClosedRange<Double> {
+        if module == .precipitation || module == .humidity { return 0...100 }
+        let lows = pts.map { $0.value - ($0.spread ?? 0) / 2 }
+        let highs = pts.map { $0.value + ($0.spread ?? 0) / 2 }
+        var lo = lows.min() ?? 0, hi = highs.max() ?? 1
+        let minSpan: Double = switch module {
+        case .conditions, .feelsLike: 8
+        case .uv: 4
+        case .pressure: units.isImperialDisplay ? 0.2 : 6
+        default: 4
+        }
+        if hi - lo < minSpan { let mid = (hi + lo) / 2; lo = mid - minSpan / 2; hi = mid + minSpan / 2 }
+        let pad = (hi - lo) * 0.18
+        if module == .uv || module == .wind || module == .visibility { return max(0, lo - pad)...(hi + pad * 1.6) }
+        return (lo - pad)...(hi + pad * 1.6) // extra headroom for the scrubber callout
+    }
+
+    private func valueText(_ v: Double) -> String {
+        switch module {
+        case .conditions, .feelsLike: "\(Int(v.rounded()))°"
+        case .uv: "\(Int(v.rounded())) \(UVScale.category(v))"
+        case .wind: "\(Int(v.rounded())) \(units.speedUnit)"
+        case .precipitation: "\(Int(v.rounded()))% chance"
+        case .humidity: "\(Int(v.rounded()))%"
+        case .visibility: String(format: "%.1f", v)
+        case .pressure: units.isImperialDisplay ? String(format: "%.2f inHg", v) : "\(Int(v.rounded())) hPa"
+        case .confidence: ""
         }
     }
 
     @ViewBuilder
     private func chart(_ d: DailyForecast) -> some View {
         let pts = points(d)
-        let lo = pts.map(\.value).min() ?? 0
-        let hi = pts.map(\.value).max() ?? 1
-        let pad = max((hi - lo) * 0.15, module == .uv ? 1 : 0.5)
-        let domain = module == .precipitation || module == .humidity ? 0...100 : (lo - pad)...(hi + pad)
+        let domain = domain(pts)
+        let now = report.current.time
         let isToday = d.date == report.daily.first?.date
+        // Past hours dotted, forecast solid; the forecast series starts at the last past point so they join.
+        let past = pts.filter { $0.time <= now }
+        let future = pts.filter { $0.time >= (past.last?.time ?? .distantPast) }
+        let selected = scrub.flatMap { s in pts.first { $0.time == s } }
         if pts.isEmpty {
             Text("No hourly data for this day.").frame(maxWidth: .infinity, minHeight: 240)
         } else {
             Chart {
-                ForEach(pts) { p in
-                    if module == .precipitation {
+                if module == .precipitation {
+                    ForEach(pts) { p in
                         BarMark(x: .value("Hour", p.time, unit: .hour), y: .value(module.title, p.value))
-                            .foregroundStyle(Color(red: 0.4, green: 0.75, blue: 1.0))
-                    } else {
+                            .foregroundStyle(Color(red: 0.4, green: 0.75, blue: 1.0).opacity(p.time < now ? 0.55 : 1))
+                    }
+                } else {
+                    ForEach(pts) { p in
+                        if let spread = p.spread, spread > 0 {
+                            AreaMark(x: .value("Hour", p.time),
+                                     yStart: .value("Low", p.value - spread / 2),
+                                     yEnd: .value("High", p.value + spread / 2),
+                                     series: .value("Layer", "Model spread"))
+                                .interpolationMethod(.catmullRom)
+                                .foregroundStyle(.white.opacity(0.16))
+                        }
+                    }
+                    ForEach(pts) { p in
                         AreaMark(x: .value("Hour", p.time), yStart: .value("Base", domain.lowerBound),
-                                 yEnd: .value(module.title, p.value))
+                                 yEnd: .value(module.title, p.value), series: .value("Layer", "Fill"))
                             .interpolationMethod(.catmullRom)
-                            .foregroundStyle(LinearGradient(colors: [lineColors.last!.opacity(0.35), .clear],
+                            .foregroundStyle(LinearGradient(colors: [lineColors.last!.opacity(0.28), .clear],
                                                             startPoint: .top, endPoint: .bottom))
-                        LineMark(x: .value("Hour", p.time), y: .value(module.title, p.value))
+                    }
+                    ForEach(past) { p in
+                        LineMark(x: .value("Hour", p.time), y: .value(module.title, p.value), series: .value("Part", "Past"))
+                            .interpolationMethod(.catmullRom)
+                            .lineStyle(StrokeStyle(lineWidth: 3, lineCap: .round, dash: [0.5, 6]))
+                            .foregroundStyle(.white.opacity(0.75))
+                    }
+                    ForEach(future) { p in
+                        LineMark(x: .value("Hour", p.time), y: .value(module.title, p.value), series: .value("Part", "Forecast"))
                             .interpolationMethod(.catmullRom)
                             .lineStyle(StrokeStyle(lineWidth: 3, lineCap: .round))
                             .foregroundStyle(LinearGradient(colors: lineColors, startPoint: .bottom, endPoint: .top))
                     }
                 }
-                if isToday {
-                    RuleMark(x: .value("Now", report.current.time))
-                        .foregroundStyle(.white.opacity(0.6))
+                if isToday && selected == nil {
+                    RuleMark(x: .value("Now", now))
+                        .foregroundStyle(.white.opacity(0.5))
                         .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                }
+                if let selected {
+                    RuleMark(x: .value("Selected", selected.time))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .lineStyle(StrokeStyle(lineWidth: 1))
+                        .annotation(position: .top, spacing: 2,
+                                    overflowResolution: .init(x: .fit(to: .chart), y: .fit(to: .chart))) {
+                            ScrubCallout(title: Fmt.time(selected.time, tz) + (selected.time < now ? " · past" : ""),
+                                         value: valueText(selected.value) + (selected.spread.map { $0 >= 1 ? " ±\(Int(($0 / 2).rounded()))°" : "" } ?? ""))
+                        }
+                    if module != .precipitation {
+                        PointMark(x: .value("Selected", selected.time), y: .value(module.title, selected.value))
+                            .symbolSize(70)
+                            .foregroundStyle(.white)
+                    }
                 }
             }
             .chartYScale(domain: domain)
+            .chartXScale(domain: (pts.first!.time)...(pts.last!.time))
             .chartXAxis {
                 AxisMarks(values: .stride(by: .hour, count: 6)) { _ in
                     AxisGridLine().foregroundStyle(.white.opacity(0.15))
-                    AxisValueLabel(format: .dateTime.hour()).foregroundStyle(.white.opacity(0.75))
+                    AxisValueLabel(format: .dateTime.hour()).foregroundStyle(Glass.secondaryText)
                 }
             }
             .chartYAxis {
                 AxisMarks(position: .trailing) { _ in
                     AxisGridLine().foregroundStyle(.white.opacity(0.15))
-                    AxisValueLabel().foregroundStyle(.white.opacity(0.75))
+                    AxisValueLabel().foregroundStyle(Glass.secondaryText)
                 }
             }
+            .chartScrubber(times: pts.map(\.time), selection: $scrub)
             .environment(\.timeZone, tz)
-            .frame(height: 260)
+            .frame(height: inspector ? 230 : 260)
+            if module == .conditions, pts.contains(where: { ($0.spread ?? 0) > 0 }) {
+                Label("Shaded band: spread between forecast models. Wider = less certain.", systemImage: "square.fill")
+                    .font(.caption).foregroundStyle(Glass.secondaryText)
+            }
         }
     }
 

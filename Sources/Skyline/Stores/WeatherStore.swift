@@ -2,6 +2,7 @@ import AppKit
 import CoreLocation
 import Foundation
 import Observation
+import SwiftUI
 import SkylineCore
 
 /// App-wide state: saved locations, current location, cached reports and refresh scheduling.
@@ -35,6 +36,12 @@ final class WeatherStore {
     var radarExpanded = false
     /// Module detail panel shown over the detail area (tap a module to open).
     var activeModule: ModuleSelection?
+    /// Alert whose outline the radar map should frame and highlight ("Show on Map").
+    var focusedAlertID: String?
+    /// True while the user drags a chart or radar scrubber (the living background pauses).
+    var isScrubbing = false
+    /// Bumped to ask the detail area to take keyboard focus (⌘⇧F); views move @FocusState on change.
+    var focusContentRequest = 0
 
     private(set) var isMainWindowVisible = false
 
@@ -126,6 +133,7 @@ final class WeatherStore {
         do {
             var report = try await service.report(for: location, forceRefresh: force)
             report.location = location
+            if defaults.bool(forKey: "SkylineDemoAlert"), report.alerts.isEmpty { report.alerts = [Self.demoAlert(near: location)] }
             reports[location.id] = report
             errors[location.id] = nil
         } catch is CancellationError {
@@ -233,6 +241,51 @@ final class WeatherStore {
                 persistLastFix(location)
             }
             await load(location, force: true)
+        }
+    }
+
+    /// QA hook (`-SkylineDemoAlert YES`): a clearly labelled fake alert so the banner/map outline can be
+    /// tested when no real alert is active. Never shown without the launch argument.
+    static func demoAlert(near location: WeatherLocation) -> WeatherAlert {
+        let c = location.coordinate
+        var alert = WeatherAlert(id: "demo-\(location.id)", event: "Test Alert (demo, not real)",
+                                 headline: "Demo alert drawn for QA screenshots. This is not an NWS product.",
+                                 severity: .severe, urgency: "Expected", areaDescription: "Demo area",
+                                 description: "This alert exists only because Skyline was launched with -SkylineDemoAlert YES.",
+                                 instruction: nil, effective: Date(), expires: Date().addingTimeInterval(3 * 3600),
+                                 ends: nil, senderName: "Skyline QA")
+        alert.polygons = [[Coordinate(latitude: c.latitude + 0.35, longitude: c.longitude - 0.55),
+                           Coordinate(latitude: c.latitude + 0.25, longitude: c.longitude + 0.5),
+                           Coordinate(latitude: c.latitude - 0.3, longitude: c.longitude + 0.45),
+                           Coordinate(latitude: c.latitude - 0.2, longitude: c.longitude - 0.6)]]
+        return alert
+    }
+
+    // MARK: Keyboard navigation
+
+    /// ↑/↓ (⌘↑/⌘↓ from anywhere): previous/next location in sidebar order.
+    func selectLocation(offset: Int) {
+        let all = allLocations
+        guard !all.isEmpty else { return }
+        let i = all.firstIndex { $0.id == selectedLocation?.id } ?? 0
+        let j = min(max(i + offset, 0), all.count - 1)
+        if all[j].id != selectedID { selectedID = all[j].id }
+    }
+
+    /// ⌘1–⌘9: the n-th location (1-based) in sidebar order.
+    func selectLocation(number n: Int) {
+        let all = allLocations
+        guard n >= 1, n <= all.count, all[n - 1].id != selectedID else { return }
+        selectedID = all[n - 1].id
+    }
+
+    func showAlertOnMap(_ alert: WeatherAlert, wideLayout: Bool) {
+        focusedAlertID = alert.id
+        if !wideLayout && !radarExpanded {
+            withAnimation(.spring(response: 0.45, dampingFraction: 0.88)) {
+                activeModule = nil
+                radarExpanded = true
+            }
         }
     }
 

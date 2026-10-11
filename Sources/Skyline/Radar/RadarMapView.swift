@@ -30,6 +30,10 @@ struct RadarMapView: NSViewRepresentable {
     var followsPlayback: Bool
     /// Only one map at a time reports prefetch progress to the playback.
     var reportsProgress: Bool
+    /// NWS alert outlines drawn above the radar (CAShapeLayers, repositioned with the map).
+    var alerts: [WeatherAlert] = []
+    /// When this changes to an alert with an outline, the map frames that outline.
+    var focusedAlertID: String?
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -50,6 +54,15 @@ struct RadarMapView: NSViewRepresentable {
 
     private func apply(to container: RadarMapContainer, coordinator c: Coordinator) {
         container.pin.text = pinText
+        container.alertOverlay.setAlerts(alerts.map { AlertOverlayView.Shape(alert: $0) }, focused: focusedAlertID)
+        if focusedAlertID != c.lastFocusedAlertID {
+            c.lastFocusedAlertID = focusedAlertID
+            if let id = focusedAlertID, let alert = alerts.first(where: { $0.id == id }), !alert.polygons.isEmpty {
+                // Deferred: never move the map (→ delegate callbacks → layer layout) inside a SwiftUI update.
+                let rings = alert.polygons
+                DispatchQueue.main.async { [weak c] in c?.frame(rings) }
+            }
+        }
         let radar = container.radar
         radar.connect(playback: playback, follows: followsPlayback, reportsProgress: reportsProgress)
         radar.setFrames(frames, maxZ: maxNativeZoom)
@@ -68,6 +81,24 @@ struct RadarMapView: NSViewRepresentable {
     final class Coordinator: NSObject, MKMapViewDelegate {
         weak var container: RadarMapContainer?
         var center: Coordinate?
+        var lastFocusedAlertID: String?
+
+        /// Zooms the map to fit an alert outline.
+        func frame(_ rings: [[Coordinate]]) {
+            guard let map = container?.map else { return }
+            var rect = MKMapRect.null
+            for ring in rings {
+                for c in ring {
+                    let p = MKMapPoint(CLLocationCoordinate2D(latitude: c.latitude, longitude: c.longitude))
+                    rect = rect.union(MKMapRect(x: p.x, y: p.y, width: 0, height: 0))
+                }
+            }
+            guard !rect.isNull else { return }
+            let minSide = 60_000.0 // keep some context around tiny storm polygons
+            if rect.size.width < minSide { rect = rect.insetBy(dx: -(minSide - rect.size.width) / 2, dy: 0) }
+            if rect.size.height < minSide { rect = rect.insetBy(dx: 0, dy: -(minSide - rect.size.height) / 2) }
+            map.setVisibleMapRect(rect, edgePadding: NSEdgeInsets(top: 90, left: 60, bottom: 140, right: 60), animated: true)
+        }
 
         func recenter(on c: Coordinate, span: Double) {
             guard let container else { return }
@@ -104,6 +135,7 @@ struct RadarMapView: NSViewRepresentable {
 final class RadarMapContainer: NSView {
     let map = MKMapView()
     let radar = RadarLayerView()
+    let alertOverlay = AlertOverlayView()
     let pin = PinView()
     var pinCoordinate: CLLocationCoordinate2D?
 
@@ -127,8 +159,10 @@ final class RadarMapContainer: NSView {
         }
         addSubview(map)
         addSubview(radar)
+        addSubview(alertOverlay)
         addSubview(pin)
         radar.map = map
+        alertOverlay.map = map
     }
 
     @available(*, unavailable)
@@ -138,12 +172,15 @@ final class RadarMapContainer: NSView {
         super.layout()
         map.frame = bounds
         radar.frame = bounds
+        alertOverlay.frame = bounds
         radar.updateTiles(allowZoomChange: true)
+        alertOverlay.relayout()
         layoutPin()
     }
 
     func regionChanged(settled: Bool) {
         radar.updateTiles(allowZoomChange: settled)
+        alertOverlay.relayout()
         layoutPin()
     }
 
@@ -156,6 +193,92 @@ final class RadarMapContainer: NSView {
         let frame = CGRect(x: (point.x - size.width / 2).rounded(), y: (point.y - 4).rounded(),
                            width: size.width, height: size.height)
         if pin.frame != frame { pin.frame = frame }
+    }
+}
+
+/// NWS alert outlines (severity-coloured stroke + light fill) drawn above the radar. Pure CA:
+/// paths are recomputed from the map's current projection on layout / region change.
+final class AlertOverlayView: NSView {
+    struct Shape: Equatable {
+        let id: String
+        let rings: [[Coordinate]]
+        let color: CGColor
+
+        init(alert: WeatherAlert) {
+            id = alert.id
+            rings = alert.polygons
+            color = switch alert.severity {
+            case .extreme: NSColor.systemRed.cgColor
+            case .severe: NSColor.systemOrange.cgColor
+            case .moderate: NSColor.systemYellow.cgColor
+            case .minor, .unknown: NSColor.white.cgColor
+            }
+        }
+        static func == (a: Shape, b: Shape) -> Bool { a.id == b.id && a.rings == b.rings }
+    }
+
+    weak var map: MKMapView?
+    private var shapes: [Shape] = []
+    private var focused: String?
+    private var layers: [String: CAShapeLayer] = [:]
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func setAlerts(_ new: [Shape], focused newFocus: String?) {
+        let withOutlines = new.filter { !$0.rings.isEmpty }
+        guard withOutlines != shapes || newFocus != focused else { return }
+        shapes = withOutlines
+        focused = newFocus
+        let ids = Set(shapes.map(\.id))
+        for (id, l) in layers where !ids.contains(id) { l.removeFromSuperlayer(); layers[id] = nil }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for shape in shapes {
+            let l = layers[shape.id] ?? {
+                let l = CAShapeLayer()
+                l.actions = ["path": NSNull(), "lineWidth": NSNull(), "fillColor": NSNull()]
+                layer?.addSublayer(l)
+                layers[shape.id] = l
+                return l
+            }()
+            let isFocused = shape.id == focused
+            l.strokeColor = shape.color
+            l.fillColor = shape.color.copy(alpha: isFocused ? 0.22 : 0.10)
+            l.lineWidth = isFocused ? 3 : 1.6
+            l.lineJoin = .round
+            l.lineDashPattern = isFocused ? nil : [6, 3]
+            l.zPosition = isFocused ? 1 : 0
+        }
+        CATransaction.commit()
+        relayout()
+    }
+
+    func relayout() {
+        guard let map, bounds.width > 0, !shapes.isEmpty else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for shape in shapes {
+            let path = CGMutablePath()
+            for ring in shape.rings {
+                for (i, c) in ring.enumerated() {
+                    let p = map.convert(CLLocationCoordinate2D(latitude: c.latitude, longitude: c.longitude), toPointTo: self)
+                    if i == 0 { path.move(to: p) } else { path.addLine(to: p) }
+                }
+                path.closeSubpath()
+            }
+            layers[shape.id]?.frame = bounds
+            layers[shape.id]?.path = path
+        }
+        CATransaction.commit()
     }
 }
 

@@ -1,65 +1,37 @@
 import SwiftUI
 import SkylineCore
 
-/// Detail page laid out like Apple Weather on the Mac: centred hero over a condition gradient,
-/// full-width hourly module, 10-day module on the left, map + square tiles on the right.
-/// The map expands in place to fill this area; other modules open an in-window detail panel.
+/// Detail area.
+///
+/// * Wide windows (detail ≥ 1000 pt, hysteresis 960/1000): a large always-visible radar beside a
+///   scrolling forecast column (the sidebar holds the locations, so the window reads as three columns).
+///   Module detail opens as an inspector in place of the forecast column.
+/// * Narrow windows: one scrolling column with the inline radar card (expand button) and module
+///   detail as a sheet-style panel.
+///
+/// The width breakpoint is applied on the next main-queue turn and only when it actually flips, so a
+/// geometry change can never write observed state inside a layout pass.
 struct LocationDetailView: View {
     let location: WeatherLocation
     @Environment(WeatherStore.self) private var store
     @Namespace private var radarNamespace
     @State private var isWide = true
+    @FocusState private var contentFocused: Bool
+
+    static let wideOn: CGFloat = 1000
+    static let wideOff: CGFloat = 960
 
     var body: some View {
         let report = store.reports[location.id]
         ZStack {
-            SkyPalette.gradient(for: report).ignoresSafeArea()
+            LivingBackground(report: report)
             if let report {
-                ScrollView {
-                    content(report)
-                        .padding(.horizontal, 22)
-                        .padding(.bottom, 26)
-                        .frame(maxWidth: 1120)
-                        .frame(maxWidth: .infinity)
-                        .background(GeometryReader { geo in
-                            Color.clear.preference(key: WidthKey.self, value: geo.size.width)
-                        })
-                }
-                .onPreferenceChange(WidthKey.self) { w in
-                    // Hysteresis + no-op guard so a width near the breakpoint can't flip the layout back
-                    // and forth (each flip changes layout, which re-reports the width).
-                    // Applied on the next main-queue turn, outside the layout pass that reported it.
-                    let wide = isWide ? w >= 800 : w >= 840
-                    guard wide != isWide else { return }
-                    DispatchQueue.main.async { if isWide != wide { isWide = wide } }
-                }
-                .opacity(store.radarExpanded ? 0 : 1)
-                .scrollDisabled(store.radarExpanded || store.activeModule != nil)
-
-                if store.radarExpanded {
-                    ExpandedRadarView(location: location, pinText: store.units.temperatureString(report.current.temperature),
-                                      namespace: radarNamespace)
-                        .padding(14)
-                        .transition(.opacity)
-                        .zIndex(2)
-                }
-                if let selection = store.activeModule {
-                    Color.black.opacity(0.35)
-                        .ignoresSafeArea()
-                        .onTapGesture { withAnimation(.spring(response: 0.38, dampingFraction: 0.9)) { store.activeModule = nil } }
-                        .transition(.opacity)
-                        .zIndex(3)
-                    ModuleDetailView(report: report, selection: selection)
-                        .id(selection.id + (selection.day.map { "\($0.timeIntervalSince1970)" } ?? ""))
-                        .padding(30)
-                        .transition(.scale(scale: 0.94).combined(with: .opacity))
-                        .zIndex(4)
-                }
+                if isWide { wideLayout(report) } else { narrowLayout(report) }
             } else if let error = store.errors[location.id] {
                 VStack(spacing: 12) {
                     Image(systemName: "wifi.exclamationmark").font(.system(size: 44))
                     Text("Couldn’t load weather for \(location.name)").font(.title3)
-                    Text(error).font(.caption).foregroundStyle(.white.opacity(0.8))
+                    Text(error).font(.caption).foregroundStyle(Glass.secondaryText)
                     Button("Try Again") { Task { await store.load(location, force: true) } }
                 }
                 .foregroundStyle(.white)
@@ -67,40 +39,88 @@ struct LocationDetailView: View {
                 ProgressView().controlSize(.large)
             }
         }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { w in
+            if UserDefaults.standard.bool(forKey: "SkylineLogLayout") { NSLog("SkylineLayout width=%.0f wide=%d", w, isWide ? 1 : 0) }
+            let wide = isWide ? w >= Self.wideOff : w >= Self.wideOn
+            guard wide != isWide else { return }
+            DispatchQueue.main.async { if isWide != wide { isWide = wide } }
+        }
         .environment(\.colorScheme, .dark)
+        .environment(\.isWideLayout, isWide)
         .navigationTitle(location.isCurrentLocation ? "My Location" : location.name)
         .task(id: location.id) { await store.load(location) }
-        .onChange(of: location.id) { _, _ in store.radarExpanded = false; store.activeModule = nil }
+        .onChange(of: location.id) { _, _ in
+            store.radarExpanded = false; store.activeModule = nil; store.focusedAlertID = nil
+        }
+        // Keyboard: the detail area can take focus (⌘⇧F) and handles Space for the radar loop,
+        // so typing a space in the search field never toggles playback.
+        .focusable()
+        .focused($contentFocused)
+        .focusEffectDisabled()
+        .onKeyPress(.space) {
+            store.radar.togglePlay()
+            return .handled
+        }
+        .onChange(of: store.focusContentRequest) { _, _ in contentFocused = true }
     }
 
-    @ViewBuilder
-    private func content(_ report: WeatherReport) -> some View {
-        let units = store.units
-        VStack(spacing: 14) {
-            HeroView(report: report, units: units)
-            if !report.alerts.isEmpty {
-                AlertsCard(alerts: report.alerts, timeZone: report.timeZone)
-            }
-            HourlyCard(report: report, units: units) { open(.conditions, day: nil) }
-            if isWide {
-                HStack(alignment: .top, spacing: 14) {
-                    DailyCard(report: report, units: units) { open(.conditions, day: $0) }
-                        .frame(width: 350)
-                    VStack(spacing: 14) {
-                        RadarCard(location: location, pinText: units.temperatureString(report.current.temperature),
-                                  namespace: radarNamespace)
-                        DetailTilesGrid(report: report, units: units) { open($0, day: nil) }
+    // MARK: Wide
+
+    private func wideLayout(_ report: WeatherReport) -> some View {
+        let pin = store.units.temperatureString(report.current.temperature)
+        let showColumn = !store.radarExpanded
+        return HStack(spacing: 14) {
+            RadarPanel(location: location, pinText: pin, alerts: report.alerts)
+                .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
+            if showColumn {
+                Group {
+                    if let selection = store.activeModule {
+                        ModuleDetailView(report: report, selection: selection, inspector: true)
+                            .id(selection.id + (selection.day.map { "\($0.timeIntervalSince1970)" } ?? ""))
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
+                    } else {
+                        ForecastColumn(report: report, location: location, radarNamespace: radarNamespace,
+                                       showsRadarCard: false, onOpen: open)
+                            .transition(.opacity)
                     }
                 }
-            } else {
-                DailyCard(report: report, units: units) { open(.conditions, day: $0) }
-                RadarCard(location: location, pinText: units.temperatureString(report.current.temperature),
-                          namespace: radarNamespace)
-                DetailTilesGrid(report: report, units: units) { open($0, day: nil) }
+                .frame(width: 420)
             }
-            SourcesFooter(report: report)
         }
+        .padding(14)
         .foregroundStyle(.white)
+    }
+
+    // MARK: Narrow
+
+    @ViewBuilder
+    private func narrowLayout(_ report: WeatherReport) -> some View {
+        ForecastColumn(report: report, location: location, radarNamespace: radarNamespace,
+                       showsRadarCard: true, onOpen: open)
+            .frame(maxWidth: 760)
+            .frame(maxWidth: .infinity)
+            .opacity(store.radarExpanded ? 0 : 1)
+            .scrollDisabled(store.radarExpanded || store.activeModule != nil)
+
+        if store.radarExpanded {
+            ExpandedRadarView(location: location, pinText: store.units.temperatureString(report.current.temperature),
+                              alerts: report.alerts, namespace: radarNamespace)
+                .padding(14)
+                .transition(.opacity)
+                .zIndex(2)
+        }
+        if let selection = store.activeModule {
+            Color.black.opacity(0.45)
+                .ignoresSafeArea()
+                .onTapGesture { withAnimation(.spring(response: 0.38, dampingFraction: 0.9)) { store.activeModule = nil } }
+                .transition(.opacity)
+                .zIndex(3)
+            ModuleDetailView(report: report, selection: selection)
+                .id(selection.id + (selection.day.map { "\($0.timeIntervalSince1970)" } ?? ""))
+                .padding(30)
+                .transition(.scale(scale: 0.94).combined(with: .opacity))
+                .zIndex(4)
+        }
     }
 
     private func open(_ module: DetailModule, day: Date?) {
@@ -110,9 +130,63 @@ struct LocationDetailView: View {
     }
 }
 
-private struct WidthKey: PreferenceKey {
-    static let defaultValue: CGFloat = 900
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+private struct IsWideLayoutKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues {
+    /// True when the detail area uses the wide radar + forecast-column layout.
+    var isWideLayout: Bool {
+        get { self[IsWideLayoutKey.self] }
+        set { self[IsWideLayoutKey.self] = newValue }
+    }
+}
+
+/// The scrolling forecast: hero (shrinks as you scroll), a pinned plain-English summary, alert banner,
+/// next-hour rain (only when rain is due), hourly, daily, radar card (narrow only) and tiles.
+struct ForecastColumn: View {
+    let report: WeatherReport
+    let location: WeatherLocation
+    var radarNamespace: Namespace.ID
+    let showsRadarCard: Bool
+    let onOpen: (DetailModule, Date?) -> Void
+    @Environment(WeatherStore.self) private var store
+
+    var body: some View {
+        let units = store.units
+        ScrollView {
+            LazyVStack(spacing: 14, pinnedViews: [.sectionHeaders]) {
+                HeroView(report: report, units: units)
+                    // Shrinks and fades as it scrolls under the pinned summary (no state writes).
+                    .visualEffect { content, proxy in
+                        let y = proxy.frame(in: .scrollView).minY
+                        let t = min(max(-y / 220, 0), 1)
+                        return content
+                            .scaleEffect(1 - 0.25 * t, anchor: .top)
+                            .opacity(1 - Double(t) * 0.9)
+                    }
+                Section {
+                    if !report.alerts.isEmpty {
+                        AlertBanner(alerts: report.alerts, timeZone: report.timeZone)
+                    }
+                    if Briefing.rainDueSoon(report, now: report.current.time) {
+                        NowcastCard(report: report, units: units)
+                    }
+                    HourlyCard(report: report, units: units) { onOpen(.conditions, nil) }
+                    DailyCard(report: report, units: units) { onOpen(.conditions, $0) }
+                    if showsRadarCard {
+                        RadarCard(location: location, pinText: units.temperatureString(report.current.temperature),
+                                  alerts: report.alerts, namespace: radarNamespace)
+                    }
+                    DetailTilesGrid(report: report, units: units) { onOpen($0, nil) }
+                    SourcesFooter(report: report)
+                } header: {
+                    BriefingBar(report: report, units: units)
+                }
+            }
+            .padding(.horizontal, showsRadarCard ? 22 : 0)
+            .padding(.bottom, 26)
+        }
+        .scrollIndicators(.never)
+        .foregroundStyle(.white)
+    }
 }
 
 struct HeroView: View {

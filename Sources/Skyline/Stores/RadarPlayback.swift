@@ -15,6 +15,8 @@ import SkylineCore
 final class RadarPlayback {
     private(set) var provider: RadarProvider = .nexrad
     private(set) var frames: [RadarFrame] = []
+    /// Loop length (NEXRAD). Persisted; RainViewer ignores it (its free tier is fixed at ~2 h).
+    private(set) var range: RadarRange = RadarRange(rawValue: UserDefaults.standard.string(forKey: "radarRange") ?? "") ?? .oneHour
     /// Observed only by the small time label / scrubber. Map layers are driven directly (see `sinks`),
     /// so a frame change never re-renders the map's SwiftUI parent or touches layout.
     var index: Int = 0 {
@@ -65,14 +67,27 @@ final class RadarPlayback {
         Task { await loadFrames(force: true) }
     }
 
+    func setRange(_ r: RadarRange) {
+        guard r != range else { return }
+        range = r
+        UserDefaults.standard.set(r.rawValue, forKey: "radarRange")
+        guard provider == .nexrad else { return }
+        setPlaying(false)
+        frames = []
+        progress = 0
+        progressGate.reset()
+        loadedAt = nil
+        Task { await loadFrames(force: true) }
+    }
+
     func loadFrames(force: Bool = false) async {
         if !force, let loadedAt, Date().timeIntervalSince(loadedAt) < Self.indexMaxAge, !frames.isEmpty { return }
         isLoadingIndex = true
         defer { isLoadingIndex = false }
-        let requested = provider
+        let requested = provider, requestedRange = range
         do {
-            let new = try await service.radarFrames(requested, forceRefresh: force)
-            guard requested == provider else { return }
+            let new = try await service.radarFrames(requested, range: requestedRange, forceRefresh: force)
+            guard requested == provider, requestedRange == range else { return }
             loadedAt = Date()
             errorMessage = new.isEmpty ? "No radar frames available." : nil
             if new.map(\.id) != frames.map(\.id) {
