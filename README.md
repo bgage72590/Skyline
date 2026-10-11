@@ -37,11 +37,11 @@ Sources/SkylineCore/      Foundation-only, Sendable, fully unit-tested (also bui
   Services/               HTTPClient protocol + URLSession impl, ResponseCache (disk, TTL, stale
                           fallback), Endpoints, WeatherService (actor; concurrent fetch, de-dupe)
 Sources/Skyline/          macOS app (SwiftUI + MapKit + CoreLocation)
-  App/                    @main App: Window "main", Window "radar", MenuBarExtra, Settings
+  App/                    @main App: Window "main", MenuBarExtra, Settings (no separate radar window)
   Stores/                 WeatherStore (@Observable, refresh policy), RadarPlayback (timeline)
-  Radar/                  RadarMapView (MKMapView + MKTileOverlay per frame), RadarTileLoader
+  Radar/                  RadarMapView (MKMapView + one CALayer per frame), RadarImageCache
                           (URLCache, over-zoom crop/upscale beyond native zoom)
-  Views/                  Sidebar, detail (hero, hourly, 10-day, tiles), alerts, radar, menu bar
+  Views/                  Sidebar, detail (hero, hourly, 10-day, tiles), module detail panels, alerts, radar, menu bar
   Support/                LocationProvider, WindowVisibilityReader, formatting & palettes
 Tests/SkylineCoreTests/   XCTest with real fixture JSON captured from each API
 ```
@@ -87,6 +87,28 @@ is kept and shown as a "Confidence" tile and per-day "model spread".
   also refreshes after wake.
 * All API responses are cached on disk with TTLs (forecast 10 min, NWS 15 min, alerts 5 min, NWS point
   metadata 7 days); stale cache is served when offline. Concurrent requests for a location are de-duplicated.
-* Radar: frame timer exists only while playing **and** the radar window is visible; animation just flips
-  overlay alpha (tiles come from URLCache, no re-download). The radar preview on the main page is static.
+* Radar: frame timer exists only while playing **and** the main window is visible and not occluded,
+  and only after every frame's tiles are prefetched. Frames cross-fade by animating CALayer opacity on
+  the GPU; tiles are decoded once into memory (disk URLCache behind it) and never re-downloaded per frame.
+  Collapsing the expanded map pauses playback, so the inline map tile is idle by default.
+
+## Radar design
+
+The radar lives inline as Apple-Weather-style map module. Click it (or the expand button, the toolbar
+map button, or ⇧⌘M) and it grows in place to fill the detail area with a matched-geometry spring;
+Esc or the collapse button shrinks it back. The expanded map has pan/zoom, a source picker, opacity,
+a legend, play/pause (Space) and a timeline scrubber; the tile has a compact play button and time.
+
+Why not `MKTileOverlay`: re-alpha-ing or swapping tile overlays makes MapKit re-request and redraw
+tiles, which flashes blank tiles. Instead a click-through layer view sits over the `MKMapView` with
+one `CALayer` per frame (tile sublayers positioned in MapKit map points). On pan the existing tile
+layers just move; on zoom the old zoom level's tiles stay up (scaled) until the new level is complete.
+A new set of scans (every ~5 min) is built hidden and swapped in only once loaded.
+
+## Modules
+
+Tapping the hourly or 10-day module, a day row, or a tile opens an in-window detail panel (Apple's
+module expansion): a 10-day picker, a Swift Charts hourly chart for that metric, and a summary. The
+Confidence module shows each source's high/low and its blend weight for the chosen day. Launch
+arguments for QA screenshots: `-SkylineOpenRadar YES`, `-SkylineOpenModule <conditions|uv|wind|…>`.
 * CoreLocation uses one-shot `requestLocation()` at kilometre accuracy, not continuous updates.

@@ -21,6 +21,8 @@ public enum UnitPreference: String, Codable, Sendable, CaseIterable, Identifiabl
     }
 
     var isImperial: Bool { resolved() == .imperial }
+    /// Whether values are shown in US customary units.
+    public var isImperialDisplay: Bool { isImperial }
 
     public func temperature(_ celsius: Double) -> Double {
         isImperial ? celsius * 9 / 5 + 32 : celsius

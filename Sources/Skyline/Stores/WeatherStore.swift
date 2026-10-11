@@ -29,8 +29,10 @@ final class WeatherStore {
     var searchResults: [PlaceSearchResult] = []
     var isSearching = false
 
-    /// Location shown in the radar window.
-    var radarLocation: WeatherLocation?
+    /// Radar map expanded to fill the detail area (in-window, Apple-Weather style).
+    var radarExpanded = false
+    /// Module detail panel shown over the detail area (tap a module to open).
+    var activeModule: ModuleSelection?
 
     private(set) var isMainWindowVisible = false
 
@@ -171,6 +173,7 @@ final class WeatherStore {
     func setMainWindowVisible(_ visible: Bool) {
         guard visible != isMainWindowVisible else { return }
         isMainWindowVisible = visible
+        radar.isVisible = visible
         if visible { Task { await refreshDue() } }
     }
 

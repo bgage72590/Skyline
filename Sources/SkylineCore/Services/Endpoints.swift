@@ -2,7 +2,7 @@ import Foundation
 
 /// URL builders for every free API Skyline uses. None require keys.
 public enum Endpoints {
-    static let hourlyVars = "temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,is_day,uv_index,wind_speed_10m,wind_direction_10m,relative_humidity_2m"
+    static let hourlyVars = "temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,is_day,uv_index,wind_speed_10m,wind_direction_10m,relative_humidity_2m,dew_point_2m,pressure_msl,visibility"
     static let dailyVars = "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,sunrise,sunset,uv_index_max,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant"
     static let currentVars = "temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,cloud_cover,pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,uv_index,dew_point_2m"
 

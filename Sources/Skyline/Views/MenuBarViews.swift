@@ -54,8 +54,10 @@ struct MenuBarContentView: View {
                     NSApp.activate()
                 }
                 Button("Radar") {
-                    store.radarLocation = store.menuBarLocation
-                    openWindow(id: SceneID.radar)
+                    if let location = store.menuBarLocation { store.selectedID = location.id }
+                    store.activeModule = nil
+                    store.radarExpanded = true
+                    openWindow(id: SceneID.main)
                     NSApp.activate()
                 }
                 Spacer()

@@ -20,15 +20,19 @@ struct SkylineApp: App {
                     Task { await store.refreshAll(force: true) }
                 }
                 .keyboardShortcut("r", modifiers: .command)
+                Button(store.radarExpanded ? "Hide Radar Map" : "Show Radar Map") {
+                    if store.radarExpanded { store.radar.isPlaying = false }
+                    withAnimation(.spring(response: 0.45, dampingFraction: 0.88)) {
+                        store.activeModule = nil
+                        store.radarExpanded.toggle()
+                    }
+                }
+                .keyboardShortcut("m", modifiers: [.command, .shift])
+                .disabled(store.selectedLocation == nil)
+                Button(store.radar.isPlaying ? "Pause Radar" : "Play Radar") { store.radar.togglePlay() }
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
             }
         }
-
-        Window("Radar", id: SceneID.radar) {
-            RadarWindowView()
-                .environment(store)
-                .frame(minWidth: 640, minHeight: 480)
-        }
-        .defaultSize(width: 1000, height: 760)
 
         MenuBarExtra {
             MenuBarContentView()
@@ -47,7 +51,6 @@ struct SkylineApp: App {
 
 enum SceneID {
     static let main = "main"
-    static let radar = "radar"
 }
 
 /// Bridges AppKit lifecycle events that SwiftUI scenes don't expose.

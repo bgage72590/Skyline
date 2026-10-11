@@ -48,6 +48,9 @@ public struct HourlyForecast: Codable, Hashable, Identifiable, Sendable {
     public var humidity: Double?
     /// Max − min temperature across contributing sources (°C). Small = high confidence.
     public var temperatureSpread: Double?
+    public var dewPoint: Double?                 // °C
+    public var pressure: Double?                 // hPa
+    public var visibility: Double?               // metres
 
     public var id: Date { time }
     public var condition: WeatherCondition { WeatherCondition(wmoCode: weatherCode) }
@@ -55,12 +58,26 @@ public struct HourlyForecast: Codable, Hashable, Identifiable, Sendable {
     public init(time: Date, temperature: Double, apparentTemperature: Double? = nil,
                 precipitationProbability: Double? = nil, precipitation: Double? = nil,
                 weatherCode: Int, isDay: Bool, uvIndex: Double? = nil, windSpeed: Double? = nil,
-                windDirection: Double? = nil, humidity: Double? = nil, temperatureSpread: Double? = nil) {
+                windDirection: Double? = nil, humidity: Double? = nil, temperatureSpread: Double? = nil,
+                dewPoint: Double? = nil, pressure: Double? = nil, visibility: Double? = nil) {
         self.time = time; self.temperature = temperature; self.apparentTemperature = apparentTemperature
         self.precipitationProbability = precipitationProbability; self.precipitation = precipitation
         self.weatherCode = weatherCode; self.isDay = isDay; self.uvIndex = uvIndex
         self.windSpeed = windSpeed; self.windDirection = windDirection; self.humidity = humidity
         self.temperatureSpread = temperatureSpread
+        self.dewPoint = dewPoint; self.pressure = pressure; self.visibility = visibility
+    }
+}
+
+/// One source's take on a day (shown in the Confidence detail).
+public struct SourceReading: Codable, Hashable, Sendable, Identifiable {
+    public var name: String
+    public var high: Double?
+    public var low: Double?
+    public var weight: Double
+    public var id: String { name }
+    public init(name: String, high: Double?, low: Double?, weight: Double) {
+        self.name = name; self.high = high; self.low = low; self.weight = weight
     }
 }
 
@@ -82,6 +99,8 @@ public struct DailyForecast: Codable, Hashable, Identifiable, Sendable {
     public var summary: String?
     /// Spread of the daily high across sources (°C).
     public var highSpread: Double?
+    /// Per-source highs/lows that went into the blend.
+    public var sources: [SourceReading] = []
 
     public var id: Date { date }
     public var condition: WeatherCondition { WeatherCondition(wmoCode: weatherCode) }
@@ -96,6 +115,14 @@ public struct DailyForecast: Codable, Hashable, Identifiable, Sendable {
         self.sunrise = sunrise; self.sunset = sunset; self.uvIndexMax = uvIndexMax
         self.windSpeedMax = windSpeedMax; self.windGustMax = windGustMax
         self.windDirectionDominant = windDirectionDominant; self.summary = summary; self.highSpread = highSpread
+    }
+
+    /// Hours of `hourly` that fall on this day in `timeZone`.
+    public func hours(from hourly: [HourlyForecast], timeZone: TimeZone) -> [HourlyForecast] {
+        let end = date.addingTimeInterval(36 * 3600)
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+        return hourly.filter { $0.time >= date && $0.time < end && cal.isDate($0.time, inSameDayAs: date) }
     }
 }
 

@@ -43,7 +43,7 @@ struct Tile<Content: View>: View {
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .frame(height: 168)
+        .frame(height: 172)
     }
 }
 
@@ -124,6 +124,8 @@ struct ScaleBar: View {
 /// Wind compass: arrow points where the wind is blowing *to*.
 struct CompassView: View {
     let degrees: Double?
+    var centerText: String? = nil
+    var centerUnit: String? = nil
 
     private struct Cardinal { let label: String; let x: CGFloat; let y: CGFloat }
     private static let cardinals = [Cardinal(label: "N", x: 0, y: -33), Cardinal(label: "E", x: 33, y: 0),
@@ -139,9 +141,21 @@ struct CompassView: View {
                     .offset(x: point.x, y: point.y)
             }
             if let degrees {
-                Image(systemName: "location.north.fill")
-                    .font(.system(size: 22))
-                    .rotationEffect(.degrees(degrees + 180))
+                // Arrow shaft across the dial, pointing where the wind blows to.
+                VStack(spacing: 0) {
+                    Image(systemName: "arrowtriangle.up.fill").font(.system(size: 10))
+                    Rectangle().frame(width: 2, height: 22)
+                    Spacer().frame(height: 26)
+                    Rectangle().frame(width: 2, height: 14)
+                    Circle().frame(width: 6, height: 6)
+                }
+                .rotationEffect(.degrees(degrees + 180))
+            }
+            if let centerText {
+                VStack(spacing: -2) {
+                    Text(centerText).font(.system(size: 17, weight: .semibold))
+                    if let centerUnit { Text(centerUnit).font(.system(size: 9, weight: .medium)).opacity(0.8) }
+                }
             }
         }
         .frame(width: 84, height: 84)

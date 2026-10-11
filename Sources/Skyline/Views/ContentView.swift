@@ -22,14 +22,17 @@ struct ContentView: View {
         .onChange(of: store.searchText) { _, _ in store.searchTextChanged() }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                if let location = store.selectedLocation {
+                if store.selectedLocation != nil {
                     Button {
-                        store.radarLocation = location
-                        openWindow(id: SceneID.radar)
+                        if store.radarExpanded { store.radar.isPlaying = false }
+                        withAnimation(.spring(response: 0.45, dampingFraction: 0.88)) {
+                            store.activeModule = nil
+                            store.radarExpanded.toggle()
+                        }
                     } label: {
-                        Label("Radar", systemImage: "map")
+                        Label("Map", systemImage: store.radarExpanded ? "list.bullet" : "map")
                     }
-                    .help("Open the animated radar map")
+                    .help(store.radarExpanded ? "Back to the forecast" : "Show the radar map")
                 }
                 Button {
                     Task { await store.refreshAll(force: true) }
@@ -40,10 +43,17 @@ struct ContentView: View {
                 .disabled(!store.loadingIDs.isEmpty)
             }
         }
+        .modifier(HiddenWindowTitle())
         .background(WindowVisibilityReader { visible in store.setMainWindowVisible(visible) })
         .onAppear {
             let open = openWindow
             AppActions.openMainWindow = { open(id: SceneID.main) }
+            // Launch arguments for screenshots/QA: `-SkylineOpenRadar YES`, `-SkylineOpenModule uv`.
+            let defaults = UserDefaults.standard
+            if defaults.bool(forKey: "SkylineOpenRadar") { store.radarExpanded = true }
+            if let raw = defaults.string(forKey: "SkylineOpenModule"), let module = DetailModule(rawValue: raw) {
+                store.activeModule = ModuleSelection(module: module, day: nil)
+            }
         }
     }
 }
@@ -63,6 +73,17 @@ struct EmptyStateView: View {
             }
             .foregroundStyle(.white)
             .padding()
+        }
+    }
+}
+
+/// Apple Weather shows no window title; the gradient runs under a transparent toolbar.
+private struct HiddenWindowTitle: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content.toolbar(removing: .title).toolbarBackground(.hidden, for: .windowToolbar)
+        } else {
+            content.toolbarBackground(.hidden, for: .windowToolbar)
         }
     }
 }

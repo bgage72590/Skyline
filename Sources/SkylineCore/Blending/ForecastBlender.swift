@@ -61,7 +61,7 @@ public enum ForecastBlender {
         // Pre-extract columns once.
         let variables = ["temperature_2m", "apparent_temperature", "precipitation_probability", "precipitation",
                          "weather_code", "is_day", "uv_index", "wind_speed_10m", "wind_direction_10m",
-                         "relative_humidity_2m"]
+                         "relative_humidity_2m", "dew_point_2m", "pressure_msl", "visibility"]
         var columns: [ForecastModel: [String: [Double?]]] = [:]
         for m in models { columns[m] = Dictionary(uniqueKeysWithValues: variables.map { ($0, col($0, m)) }) }
 
@@ -103,7 +103,10 @@ public enum ForecastBlender {
                 windSpeed: weightedMean(samples("wind_speed_10m", nwsValue: nws?.windSpeedKmh)),
                 windDirection: models.lazy.compactMap { at(columns[$0]?["wind_direction_10m"] ?? [], i) }.first,
                 humidity: weightedMean(samples("relative_humidity_2m", nwsValue: nws?.relativeHumidity)),
-                temperatureSpread: spread))
+                temperatureSpread: spread,
+                dewPoint: weightedMean(samples("dew_point_2m")),
+                pressure: weightedMean(samples("pressure_msl")),
+                visibility: weightedMean(samples("visibility"))))
         }
         return result
     }
@@ -177,7 +180,18 @@ public enum ForecastBlender {
             let code = reconcile(code: rawCode, precipitationProbability: pop, precipitation: sum,
                                  temperature: (high + low) / 2)
 
-            result.append(DailyForecast(
+            var readings: [SourceReading] = models.compactMap { m in
+                let w = dailyWeight(m, i)
+                let h = at(col("temperature_2m_max", m), i), l = at(col("temperature_2m_min", m), i)
+                guard w > 0, h != nil || l != nil else { return nil }
+                return SourceReading(name: m.displayName, high: h, low: l, weight: w)
+            }
+            if highP != nil || lowP != nil {
+                readings.append(SourceReading(name: "National Weather Service", high: highP?.temperatureC,
+                                              low: lowP?.temperatureC, weight: nwsW))
+            }
+
+            var forecast = DailyForecast(
                 date: day, weatherCode: code, high: high, low: low,
                 precipitationProbability: pop.map { min(100, max(0, $0)) },
                 precipitationSum: sum,
@@ -188,7 +202,9 @@ public enum ForecastBlender {
                 windGustMax: weightedMean(models.map { (value: at(col("wind_gusts_10m_max", $0), i), weight: dailyWeight($0, i)) }),
                 windDirectionDominant: firstValue("wind_direction_10m_dominant", i),
                 summary: (highP ?? lowP).map { $0.detailedForecast.isEmpty ? $0.shortForecast : $0.detailedForecast },
-                highSpread: highValues.count > 1 ? highValues.max()! - highValues.min()! : nil))
+                highSpread: highValues.count > 1 ? highValues.max()! - highValues.min()! : nil)
+            forecast.sources = readings.sorted { $0.weight > $1.weight }
+            result.append(forecast)
         }
         return result
     }
