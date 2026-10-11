@@ -36,6 +36,8 @@ final class WeatherStore {
     var radarExpanded = false
     /// Module detail panel shown over the detail area (tap a module to open).
     var activeModule: ModuleSelection?
+    /// Forecast-verification summary per location id (real data; demo only with -SkylineDemoAccuracy).
+    var accuracy: [String: AccuracyReport] = [:]
     /// Alert whose outline the radar map should frame and highlight ("Show on Map").
     var focusedAlertID: String?
     /// True while the user drags a chart or radar scrubber (the living background pauses).
@@ -137,6 +139,7 @@ final class WeatherStore {
             if defaults.bool(forKey: "SkylineDemoRain") { report.minutely = Self.demoRain(from: report.current.time) }
             reports[location.id] = report
             errors[location.id] = nil
+            await refreshAccuracy(for: location)
         } catch is CancellationError {
         } catch {
             if reports[location.id] == nil { errors[location.id] = error.localizedDescription }
@@ -268,6 +271,17 @@ final class WeatherStore {
         let start = (now.timeIntervalSince1970 / 900).rounded(.down) * 900
         let mm: [Double] = [0, 0, 0.08, 0.3, 0.7, 1.6, 2.4, 1.3, 0.6, 0.35, 0.2, 0.1, 0, 0]
         return mm.enumerated().map { MinutelyPrecipitation(time: Date(timeIntervalSince1970: start + Double($0.offset) * 900), precipitation: $0.element) }
+    }
+
+    /// Pulls the verifier's summary for a location (cheap: cached until new pairs arrive).
+    func refreshAccuracy(for location: WeatherLocation) async {
+        let new: AccuracyReport?
+        if defaults.bool(forKey: "SkylineDemoAccuracy") {
+            new = AccuracyDemo.report()
+        } else {
+            new = await service.verifier?.report(VerificationKey.key(for: location))
+        }
+        if let new, accuracy[location.id] != new { accuracy[location.id] = new }
     }
 
     // MARK: Keyboard navigation

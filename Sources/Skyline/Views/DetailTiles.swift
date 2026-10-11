@@ -22,6 +22,7 @@ struct DetailTilesGrid: View {
             if let aq = report.airQuality { AirQualityTile(airQuality: aq, report: report) }
             MoonTile(date: report.current.time)
             tappable(.confidence) { ConfidenceTile(report: report, units: units) }
+            tappable(.accuracy) { AccuracyTile(location: report.location, units: units) }
         }
     }
 
@@ -442,7 +443,7 @@ struct ConfidenceTile: View {
         Tile(title: "Confidence", systemImage: "checkmark.seal.fill") {
             TileValue(value: level,
                       label: spread.map { "±\(Int((units.temperatureDelta($0) / 2).rounded()))° between sources" },
-                      detail: "\(report.sources.count) sources blended. Tap for the breakdown.")
+                      detail: "\(report.sources.count) sources blended. Tap for the breakdown; see Accuracy for how they verify.")
         }
     }
 }

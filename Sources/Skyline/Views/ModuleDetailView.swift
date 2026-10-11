@@ -4,7 +4,7 @@ import SkylineCore
 
 /// Modules that open a detail panel when tapped (as in Apple Weather).
 enum DetailModule: String, CaseIterable, Identifiable {
-    case conditions, uv, wind, precipitation, feelsLike, humidity, visibility, pressure, confidence
+    case conditions, uv, wind, precipitation, feelsLike, humidity, visibility, pressure, confidence, accuracy
     var id: String { rawValue }
 
     var title: String {
@@ -18,6 +18,7 @@ enum DetailModule: String, CaseIterable, Identifiable {
         case .visibility: "Visibility"
         case .pressure: "Pressure"
         case .confidence: "Forecast Confidence"
+        case .accuracy: "Forecast Accuracy"
         }
     }
 
@@ -32,6 +33,7 @@ enum DetailModule: String, CaseIterable, Identifiable {
         case .visibility: "eye.fill"
         case .pressure: "gauge.with.dots.needle.33percent"
         case .confidence: "checkmark.seal.fill"
+        case .accuracy: "scope"
         }
     }
 }
@@ -106,6 +108,9 @@ struct ModuleDetailView: View {
                              help: inspector ? "Close inspector (Esc)" : "Close (Esc)") { close() }
                     .keyboardShortcut(.cancelAction)
             }
+            if module == .accuracy {
+                AccuracyPanel(location: report.location, units: units)
+            } else {
             dayStrip
             if let d = selectedDay {
                 headline(d)
@@ -121,6 +126,7 @@ struct ModuleDetailView: View {
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
             }
         }
         .padding(inspector ? 16 : 20)
@@ -187,6 +193,8 @@ struct ModuleDetailView: View {
             case .pressure:
                 Text(units.pressureString(d.hours(from: report.hourly, timeZone: tz).compactMap(\.pressure).first ?? report.current.pressure))
                     .font(.system(size: 40, weight: .medium))
+            case .accuracy:
+                EmptyView()
             case .confidence:
                 Text(confidenceLevel(d.highSpread)).font(.system(size: 40, weight: .medium))
                 if let s = d.highSpread {
@@ -208,7 +216,7 @@ struct ModuleDetailView: View {
             case .humidity: v = h.humidity
             case .visibility: v = h.visibility.map(units.distance)
             case .pressure: v = h.pressure.map { units.isImperialDisplay ? $0 * 0.0295299830714 : $0 }
-            case .confidence: v = nil
+            case .confidence, .accuracy: v = nil
             }
             let spread = (module == .conditions) ? h.temperatureSpread.map(units.temperatureDelta) : nil
             return v.map { ChartPoint(time: h.time, value: $0, spread: spread) }
@@ -243,7 +251,7 @@ struct ModuleDetailView: View {
         case .humidity: "\(Int(v.rounded()))%"
         case .visibility: String(format: "%.1f", v)
         case .pressure: units.isImperialDisplay ? String(format: "%.2f inHg", v) : "\(Int(v.rounded())) hPa"
-        case .confidence: ""
+        case .confidence, .accuracy: ""
         }
     }
 
@@ -409,6 +417,8 @@ struct ModuleDetailView: View {
             return "Visibility through the day. Below 1 mi (1.6 km) usually means fog or heavy precipitation."
         case .pressure:
             return "Falling pressure often signals unsettled weather; rising pressure, clearing."
+        case .accuracy:
+            return ""
         case .confidence:
             return "Skyline weights each source by its typical skill: HRRR dominates the first 18 hours in the US, the NWS official forecast and ECMWF carry the most weight after that. When sources disagree, confidence drops."
         }

@@ -41,6 +41,14 @@ struct SkylineApp: App {
                     Button(location.isCurrentLocation ? "My Location" : location.name) { store.selectLocation(number: i + 1) }
                         .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: .command)
                 }
+                Button("Forecast Accuracy") {
+                    withAnimation(.spring(response: 0.4, dampingFraction: 0.86)) {
+                        store.radarExpanded = false
+                        store.activeModule = ModuleSelection(module: .accuracy, day: nil)
+                    }
+                }
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+                .disabled(store.selectedLocation == nil)
                 Divider()
                 Button("Focus Forecast") { store.focusContentRequest += 1 }
                     .keyboardShortcut("f", modifiers: [.command, .shift])
