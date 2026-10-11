@@ -56,8 +56,9 @@ final class BlendingTests: XCTestCase {
         XCTAssertEqual(daily.count, 10)
         for d in daily { XCTAssertGreaterThanOrEqual(d.high, d.low) }
 
-        // Day 0 high: best_match 18.4 (w2), HRRR 18.4 (w3), ECMWF 16.1 (w1.5), GFS 18.4 (w1), ICON 14.9 (w1), NWS 66 °F (w2.5).
-        let expected = wmean([(18.4, 2), (18.4, 3), (16.1, 1.5), (18.4, 1), (14.9, 1), (fToC(66), 2.5)])
+        // Day 0 high: best_match, HRRR and GFS are all 18.4 (one NOAA value, counted once at the largest
+        // weight, HRRR's 3), ECMWF 16.1 (w1.5), ICON 14.9 (w1), NWS 66 °F (w2.5).
+        let expected = wmean([(18.4, 3), (16.1, 1.5), (14.9, 1), (fToC(66), 2.5)])
         XCTAssertEqual(daily[0].high, expected, accuracy: 1e-6)
         XCTAssertEqual(daily[0].highSpread ?? 0, fToC(66) - 14.9, accuracy: 1e-6)
         XCTAssertTrue(daily[0].summary?.contains("high near 66") ?? false)
@@ -76,7 +77,8 @@ final class BlendingTests: XCTestCase {
 
         // Hour 0 (local midnight, before NWS hourly starts): models only.
         let h0 = hourly[0]
-        let expected0 = wmean([(14.2, 2), (14.2, 3), (13.9, 1.5), (14.2, 1), (14.9, 1)])
+        // best_match, HRRR and GFS are the same NOAA value (14.2): counted once, at HRRR's weight 3.
+        let expected0 = wmean([(14.2, 3), (13.9, 1.5), (14.9, 1)])
         XCTAssertEqual(h0.temperature, expected0, accuracy: 1e-6)
         XCTAssertEqual(h0.temperatureSpread ?? 0, 1.0, accuracy: 1e-6)
 

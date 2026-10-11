@@ -68,7 +68,9 @@ public enum AccuracyScorer {
         if let lo = used.map(\.r.valid).min(), let hi = used.map(\.r.valid).max() {
             s.days = hi.timeIntervalSince(lo) / 86400
         }
-        for rec in used {
+        for raw in used {
+            // Duplicate NOAA columns are one source (also for records saved before de-duplication).
+            let rec = VerifiedRecord(raw.r.dedupingNOAAFamily(), raw.o)
             let ageDays = max(0, now.timeIntervalSince(rec.r.valid) / 86400)
             let weight = halfLifeDays > 0 ? pow(0.5, ageDays / halfLifeDays) : 1
             let bucket = rec.r.bucket

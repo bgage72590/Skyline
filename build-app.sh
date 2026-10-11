@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Build Skyline.app, sign ad-hoc, install to /Applications, relaunch, and zip to iCloud Drive.
+# Build Skyline.app, sign with the local signing identity, install to /Applications, relaunch, and
+# zip to iCloud Drive. Other Macs install the zip with scripts/install-verified.sh (copied to each Mac
+# once, never run from iCloud), which refuses anything not signed by this Mac's certificate.
 #
 #   ./build-app.sh              # build + install + launch + zip to iCloud
 #   ./build-app.sh --no-launch  # install but don't launch
@@ -121,9 +123,12 @@ if [[ $ZIP -eq 1 ]]; then
     mkdir -p "$ICLOUD_DIR"
     rm -f "$ICLOUD_DIR/$APP_NAME.zip"
     ditto -c -k --sequesterRsrc --keepParent "$APP" "$ICLOUD_DIR/$APP_NAME.zip"
-    cp "$ROOT/scripts/install-from-icloud.sh" "$ICLOUD_DIR/install.sh"
-    chmod +x "$ICLOUD_DIR/install.sh"
+    # No installer script goes into iCloud any more: anything in that folder can be changed by whoever
+    # can edit it. Install with a local copy of scripts/install-verified.sh (see README).
     echo "    $ICLOUD_DIR/$APP_NAME.zip"
+    if [[ -e "$ICLOUD_DIR/install.sh" ]]; then
+      echo "    note: an old iCloud Drive/$APP_NAME/install.sh is still there (unverified installer); delete it by hand." >&2
+    fi
   else
     echo "    iCloud Drive not found; skipping zip"
   fi

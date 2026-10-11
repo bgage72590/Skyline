@@ -40,6 +40,17 @@ struct LocationDetailView: View {
                 ProgressView().controlSize(.large)
             }
         }
+        // Old or offline data says so (overlay: never resizes the forecast column or the map).
+        .overlay(alignment: .top) {
+            if let report, store.isStale(report) {
+                StaleDataBanner(report: report, offline: store.isOffline(report), error: store.errors[location.id],
+                                isLoading: store.isLoading(location)) {
+                    Task { await store.load(location, force: true) }
+                }
+                .padding(.top, 8)
+                .transition(.opacity)
+            }
+        }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { w in
             if UserDefaults.standard.bool(forKey: "SkylineLogLayout") { NSLog("SkylineLayout width=%.0f wide=%d", w, isWide ? 1 : 0) }
             // Record the latest width (unobserved), then decide on the next main-queue turn from the
@@ -104,7 +115,7 @@ struct LocationDetailView: View {
             .transaction(value: showColumn) { $0.animation = nil }
             .opacity(showColumn ? 1 : 0)
             .allowsHitTesting(showColumn)
-            RadarPanel(location: location, pinText: pin, alerts: report.alerts,
+            RadarPanel(location: location, pinText: pin, alerts: report.activeAlerts(),
                        mapOverscan: showColumn ? (420 + 14) / 2 : 0)
                 .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
                 .transaction(value: showColumn) { $0.animation = nil }
@@ -130,7 +141,7 @@ struct LocationDetailView: View {
                 ZStack {
                     if store.radarExpanded {
                         ExpandedRadarView(location: location, pinText: store.units.temperatureString(report.current.temperature),
-                                          alerts: report.alerts, namespace: radarNamespace)
+                                          alerts: report.activeAlerts(), namespace: radarNamespace)
                             .padding(14)
                             .transition(.opacity.combined(with: .scale(scale: 0.96)))
                             .zIndex(2)
@@ -198,8 +209,8 @@ struct ForecastColumn: View {
                             .opacity(1 - Double(t) * 0.9)
                     }
                 Section {
-                    if !report.alerts.isEmpty {
-                        AlertBanner(alerts: report.alerts, timeZone: report.timeZone)
+                    if !report.activeAlerts().isEmpty {
+                        AlertBanner(alerts: report.activeAlerts(), timeZone: report.timeZone)
                     }
                     if Briefing.rainDueSoon(report, now: report.current.time) {
                         NowcastCard(report: report, units: units)
@@ -209,7 +220,7 @@ struct ForecastColumn: View {
                         .id(ScrollProbe.dailyID)
                     if showsRadarCard {
                         RadarCard(location: location, pinText: units.temperatureString(report.current.temperature),
-                                  alerts: report.alerts, namespace: radarNamespace)
+                                  alerts: report.activeAlerts(), namespace: radarNamespace)
                     }
                     DetailTilesGrid(report: report, units: units) { onOpen($0, nil) }
                     SourcesFooter(report: report)
@@ -481,12 +492,43 @@ struct SourcesFooter: View {
             if let office = report.nwsOffice, !office.isEmpty {
                 Text("Official forecast & alerts: National Weather Service (\(office))")
             }
-            Text("Updated \(Fmt.dayTime(report.fetchedAt, .current)) · Weather data by Open-Meteo.com (CC BY 4.0)")
+            Text("Data from \(Fmt.dayTime(report.dataAsOf, .current)) · Weather data by Open-Meteo.com (CC BY 4.0)")
         }
         .font(.caption2)
         .multilineTextAlignment(.center)
         .opacity(0.7)
         .frame(maxWidth: .infinity)
         .padding(.top, 6)
+    }
+}
+
+/// Slim "Offline · showing data from 2:10 PM [Retry]" capsule over the top of the detail area.
+struct StaleDataBanner: View {
+    let report: WeatherReport
+    let offline: Bool
+    let error: String?
+    let isLoading: Bool
+    let retry: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: offline ? "wifi.slash" : "clock.arrow.circlepath")
+            Text((offline ? "Offline · showing data from " : "Showing data from ") + Fmt.dataTime(report.dataAsOf))
+                .lineLimit(1)
+            if isLoading {
+                ProgressView().controlSize(.mini)
+            } else {
+                Button("Retry", action: retry)
+                    .buttonStyle(.borderless)
+                    .fontWeight(.semibold)
+            }
+        }
+        .font(.callout.weight(.medium))
+        .foregroundStyle(.white)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.black.opacity(0.6), in: Capsule())
+        .overlay(Capsule().strokeBorder(.orange.opacity(0.7), lineWidth: 1))
+        .help(error ?? "The forecast hasn’t been refreshed recently.")
     }
 }

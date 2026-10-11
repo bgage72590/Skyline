@@ -35,7 +35,8 @@ final class RadarPlayback {
     @ObservationIgnored var debugZoomHandler: ((Double) -> Void)?
 
     @ObservationIgnored private let service: WeatherService
-    @ObservationIgnored private var clock: Task<Void, Never>?
+    /// The play clock. A TaskSlot so a clock task that resumes after being replaced can't orphan its successor.
+    @ObservationIgnored private let clock = TaskSlot()
     @ObservationIgnored private var loadedAt: Date?
 
     static let frameInterval: Duration = .milliseconds(550)
@@ -49,7 +50,7 @@ final class RadarPlayback {
 
     var currentFrame: RadarFrame? { frames.indices.contains(index) ? frames[index] : nil }
     var isReady: Bool { !frames.isEmpty && progress >= 0.98 }
-    var isRunning: Bool { clock != nil }
+    var isRunning: Bool { clock.isOccupied }
 
     /// Picks the right provider for a location and loads the frame index if stale.
     func configure(for coordinate: Coordinate) {
@@ -145,20 +146,21 @@ final class RadarPlayback {
 
     private func updateClock() {
         let shouldRun = isPlaying && isVisible && isReady && frames.count > 1
-        if shouldRun == (clock != nil) { return }
-        clock?.cancel()
-        clock = nil
+        if shouldRun == clock.isOccupied { return }
+        clock.cancel()
         guard shouldRun else { return }
-        clock = Task { [weak self] in
+        clock.start { [weak self] token in
             while !Task.isCancelled {
                 guard let self else { return }
                 let atLatest = self.index >= self.frames.count - 1
                 try? await Task.sleep(for: atLatest ? Self.holdOnLatest : Self.frameInterval)
-                if Task.isCancelled { return }
+                if Task.isCancelled || !self.clock.owns(token) { return }
                 if atLatest, let loadedAt = self.loadedAt, Date().timeIntervalSince(loadedAt) > Self.indexMaxAge {
                     // New scans: the map keeps showing the old frames until the new ones are prefetched.
                     await self.loadFrames(force: true)
-                    if !self.isReady { self.clock = nil; return }
+                    // Paused, hidden or replaced while reloading: stop, and never touch a successor's slot.
+                    if Task.isCancelled || !self.clock.owns(token) { return }
+                    if !self.isReady { self.clock.clear(token: token); return }
                 }
                 self.step(1)
             }

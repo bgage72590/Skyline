@@ -3,18 +3,47 @@ import SwiftUI
 import SkylineCore
 
 /// Status item: icon + temperature. Re-renders only when the report changes.
+/// When the data is stale or offline the temperature is drawn dimmed (a half-transparent template image,
+/// which the menu bar tints like any other item but at reduced strength).
 struct MenuBarLabel: View {
     let store: WeatherStore
 
     var body: some View {
         if let report = store.menuBarReport {
-            Label(store.units.temperatureString(report.current.temperature),
-                  systemImage: report.current.condition.symbolName(isDay: report.current.isDay))
-                .labelStyle(.titleAndIcon)
+            let text = store.units.temperatureString(report.current.temperature)
+            let symbol = report.current.condition.symbolName(isDay: report.current.isDay)
+            if store.isStale(report), let dimmed = Self.dimmedImage(symbol: symbol, text: text) {
+                Image(nsImage: dimmed)
+            } else {
+                Label(text, systemImage: symbol)
+                    .labelStyle(.titleAndIcon)
+            }
         } else {
             Label("Skyline", systemImage: "cloud.sun")
                 .labelStyle(.iconOnly)
         }
+    }
+
+    @MainActor private static var dimmedCache: [String: NSImage] = [:]
+
+    /// Renders "symbol + temperature" once per distinct value into a template image at 45 % alpha.
+    @MainActor static func dimmedImage(symbol: String, text: String) -> NSImage? {
+        let key = symbol + "|" + text
+        if let cached = dimmedCache[key] { return cached }
+        let content = HStack(spacing: 4) {
+            Image(systemName: symbol)
+            Text(text)
+        }
+        .font(.system(size: 13, weight: .regular))
+        .foregroundStyle(Color.black.opacity(0.45))
+        .padding(.horizontal, 1)
+        let renderer = ImageRenderer(content: content)
+        renderer.scale = NSScreen.main?.backingScaleFactor ?? 2
+        guard let image = renderer.nsImage else { return nil }
+        image.isTemplate = true
+        if dimmedCache.count > 64 { dimmedCache.removeAll() }
+        dimmedCache[key] = image
+        return image
     }
 }
 
@@ -27,8 +56,9 @@ struct MenuBarContentView: View {
         VStack(alignment: .leading, spacing: 10) {
             if let report {
                 header(report)
-                if let alert = report.alerts.first {
-                    Label("\(alert.event)\(report.alerts.count > 1 ? " +\(report.alerts.count - 1)" : "")",
+                if let alert = report.activeAlerts().first {
+                    let alertCount = report.activeAlerts().count
+                    Label("\(alert.event)\(alertCount > 1 ? " +\(alertCount - 1)" : "")",
                           systemImage: "exclamationmark.triangle.fill")
                         .font(.callout.weight(.semibold))
                         .foregroundStyle(AlertsCard.color(alert.severity))
@@ -45,12 +75,28 @@ struct MenuBarContentView: View {
                 chips(report)
                 daily(report)
                 otherLocations(report)
+                updatedLine(report)
             } else if let location = store.menuBarLocation {
-                HStack {
-                    ProgressView().controlSize(.small)
-                    Text("Loading \(location.name)…")
+                if let error = store.errors[location.id], !store.isLoading(location) {
+                    // First load failed (e.g. started offline): say so and offer a retry, like the main window.
+                    VStack(spacing: 8) {
+                        Image(systemName: "wifi.exclamationmark").font(.system(size: 26))
+                        Text("Couldn’t load \(location.isCurrentLocation ? "My Location" : location.name)")
+                            .font(.headline)
+                        Text(error).font(.caption).opacity(0.8)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(3)
+                        Button("Try Again") { Task { await store.load(location, force: true) } }
+                            .buttonStyle(.borderedProminent)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 80)
+                } else {
+                    HStack {
+                        ProgressView().controlSize(.small)
+                        Text("Loading \(location.name)…")
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 80)
                 }
-                .frame(maxWidth: .infinity, minHeight: 80)
             } else {
                 Text("Open Skyline to add a location.").frame(maxWidth: .infinity, minHeight: 80)
             }
@@ -94,6 +140,21 @@ struct MenuBarContentView: View {
         .onAppear {
             let open = openWindow
             AppActions.openMainWindow = { open(id: SceneID.main) }
+        }
+    }
+
+    /// "Updated 5 min ago" (ticks while the dropdown is open), or "Offline · Updated 2 h ago".
+    private func updatedLine(_ report: WeatherReport) -> some View {
+        let offline = store.isOffline(report)
+        let stale = store.isStale(report)
+        return TimelineView(.periodic(from: .now, by: 30)) { context in
+            HStack(spacing: 4) {
+                if offline { Image(systemName: "wifi.slash") }
+                Text((offline ? "Offline · " : "") + DataAge.updatedText(report, now: context.date))
+            }
+            .font(.caption.weight(stale ? .semibold : .regular))
+            .foregroundStyle(stale ? Color.orange : Color.white.opacity(0.75))
+            .help(store.errors[report.location.id] ?? "Data from \(Fmt.dataTime(report.dataAsOf))")
         }
     }
 

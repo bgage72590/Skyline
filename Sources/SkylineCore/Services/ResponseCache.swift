@@ -36,6 +36,13 @@ public actor ResponseCache {
     /// Returns cached data of any age.
     public func stale(_ key: String) -> Data? { entry(key)?.data }
 
+    /// Returns the cached entry (data plus when it was downloaded) if it's at most `maxAge` old.
+    /// Used for the offline fallback, so the caller knows (and can show) how old the data really is.
+    public func entry(_ key: String, maxAge: TimeInterval) -> Entry? {
+        guard let e = entry(key), now().timeIntervalSince(e.storedAt) <= maxAge else { return nil }
+        return e
+    }
+
     public func store(_ data: Data, for key: String) {
         let e = Entry(storedAt: now(), data: data)
         memory[key] = e

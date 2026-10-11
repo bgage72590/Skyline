@@ -14,6 +14,22 @@ public actor WeatherService {
         public static let radarIndex: TimeInterval = 2 * 60
     }
 
+    /// The oldest cached copy that may stand in when the network fails ("offline fallback").
+    /// Older than this, the data is too old to show as weather and the request fails instead.
+    public enum MaxStale {
+        public static let forecast: TimeInterval = 12 * 3600
+        public static let nwsForecast: TimeInterval = NWSPeriod.maxForecastAge
+        public static let alerts: TimeInterval = 1 * 3600
+        public static let airQuality: TimeInterval = 6 * 3600
+    }
+
+    /// A response plus when it was actually downloaded, and whether it is an offline fallback.
+    struct Fetched: Sendable {
+        var data: Data
+        var storedAt: Date
+        var isFallback: Bool
+    }
+
     private let client: HTTPClient
     private let cache: ResponseCache
     private let now: @Sendable () -> Date
@@ -68,11 +84,14 @@ public actor WeatherService {
         let coord = location.coordinate.rounded
         let models = ForecastModel.models(for: coord)
 
-        async let omData = fetch(Endpoints.openMeteoForecast(coord, models: models), ttl: TTL.forecast, force: force)
-        async let aqData = optionalFetch(Endpoints.openMeteoAirQuality(coord), ttl: TTL.airQuality, force: force)
+        async let omFetch = fetchEntry(Endpoints.openMeteoForecast(coord, models: models), ttl: TTL.forecast,
+                                       force: force, maxStale: MaxStale.forecast)
+        async let aqData = optionalFetch(Endpoints.openMeteoAirQuality(coord), ttl: TTL.airQuality, force: force,
+                                         maxStale: MaxStale.airQuality)
         async let nwsBundle = coord.isLikelyInNWSCoverage ? fetchNWS(coord, force: force) : nil
 
-        let om = try OpenMeteoResponse.decode(try await omData)
+        let omEntry = try await omFetch
+        let om = try OpenMeteoResponse.decode(omEntry.data)
         guard let current = om.currentConditions() else { throw HTTPError.invalidResponse }
         let nws = await nwsBundle
         let air = await aqData.flatMap { try? OpenMeteoAirQualityResponse.decode($0) }
@@ -84,7 +103,7 @@ public actor WeatherService {
         let hourly = ForecastBlender.blendHourly(openMeteo: om, nwsHourly: nws?.hourly ?? [], now: current.time,
                                                  weights: learned, minutely: minutely)
         let daily = ForecastBlender.blendDaily(openMeteo: om, nwsPeriods: nws?.periods ?? [], timeZone: tz,
-                                               weights: learned)
+                                               weights: learned, hourly: hourly)
 
         // Verification runs detached at utility priority: never delays the report.
         if let verifier {
@@ -108,11 +127,14 @@ public actor WeatherService {
         var loc = location
         if loc.timeZoneIdentifier == nil { loc.timeZoneIdentifier = om.timezone }
 
+        // The data is as old as its oldest forecast input (a cached copy keeps its download time).
+        let dataAsOf = ([omEntry.storedAt] + (nws?.forecastStoredAt ?? [])).min() ?? omEntry.storedAt
         return WeatherReport(location: loc, fetchedAt: now(), timeZoneIdentifier: om.timezone,
                              current: current, hourly: hourly, daily: daily,
                              minutely: minutely, alerts: nws?.alerts ?? [],
                              airQuality: air, sources: sources,
-                             nwsOffice: nws.map { [$0.point.city, $0.point.state].compactMap { $0 }.joined(separator: ", ") })
+                             nwsOffice: nws.map { [$0.point.city, $0.point.state].compactMap { $0 }.joined(separator: ", ") },
+                             dataAsOf: dataAsOf, isOfflineFallback: omEntry.isFallback)
     }
 
     struct NWSBundle: Sendable {
@@ -120,6 +142,8 @@ public actor WeatherService {
         var periods: [NWSPeriod]
         var hourly: [NWSPeriod]
         var alerts: [WeatherAlert]
+        /// Download times of the NWS forecasts that were used.
+        var forecastStoredAt: [Date] = []
     }
 
     /// Everything NWS for a point; nil when the point is outside NWS coverage or the API is down.
@@ -127,14 +151,27 @@ public actor WeatherService {
         guard let pointData = await optionalFetch(Endpoints.nwsPoint(c), ttl: TTL.nwsPoint, force: false),
               let point = try? NWSPoint.decode(pointData) else { return nil }
         let headers = ["Accept": "application/geo+json"]
-        async let f = optionalFetch(point.forecastURL, ttl: TTL.nwsForecast, force: force, headers: headers)
-        async let h = optionalFetch(point.forecastHourlyURL, ttl: TTL.nwsForecast, force: force, headers: headers)
-        async let a = optionalFetch(Endpoints.nwsAlerts(c), ttl: TTL.alerts, force: force, headers: headers)
-        let periods = await f.flatMap { try? NWSPeriod.decodeList($0) } ?? []
-        let hourly = await h.flatMap { try? NWSPeriod.decodeList($0) } ?? []
-        var alerts = await a.flatMap { try? NWSAlertParser.decode($0) } ?? []
+        async let f = optionalFetchEntry(point.forecastURL, ttl: TTL.nwsForecast, force: force, headers: headers,
+                                         maxStale: MaxStale.nwsForecast)
+        async let h = optionalFetchEntry(point.forecastHourlyURL, ttl: TTL.nwsForecast, force: force, headers: headers,
+                                         maxStale: MaxStale.nwsForecast)
+        async let a = optionalFetch(Endpoints.nwsAlerts(c), ttl: TTL.alerts, force: force, headers: headers,
+                                    maxStale: MaxStale.alerts)
+        let t = now()
+        // Out-of-date NWS forecasts (old cached copies, or a "stuck" NWS grid) are ignored, not blended.
+        func recentPeriods(_ e: Fetched?) -> [NWSPeriod]? {
+            guard let e, NWSPeriod.isRecent(NWSPeriod.issuance(e.data), downloadedAt: e.storedAt, now: t) else { return nil }
+            return try? NWSPeriod.decodeList(e.data)
+        }
+        let fEntry = await f, hEntry = await h
+        let periods = recentPeriods(fEntry) ?? []
+        let hourly = recentPeriods(hEntry) ?? []
+        var alerts = await a.flatMap { try? NWSAlertParser.decode($0, now: t) } ?? []
         alerts = await withZoneOutlines(alerts)
-        return NWSBundle(point: point, periods: periods, hourly: hourly, alerts: alerts)
+        var storedAt: [Date] = []
+        if !periods.isEmpty, let fEntry { storedAt.append(fEntry.storedAt) }
+        if !hourly.isEmpty, let hEntry { storedAt.append(hEntry.storedAt) }
+        return NWSBundle(point: point, periods: periods, hourly: hourly, alerts: alerts, forecastStoredAt: storedAt)
     }
 
     /// Zone-based alerts (no polygon of their own) get their forecast zones' outlines, so the map can
@@ -164,21 +201,38 @@ public actor WeatherService {
 
     // MARK: Fetch with cache
 
-    /// Fresh cache → network → stale cache (offline fallback) → error.
-    func fetch(_ url: URL, ttl: TimeInterval, force: Bool = false, headers: [String: String] = [:]) async throws -> Data {
+    /// Fresh cache → network → stale cache no older than `maxStale` (offline fallback) → error.
+    /// The result carries the data's real download time, so a cached copy is never passed off as new.
+    func fetchEntry(_ url: URL, ttl: TimeInterval, force: Bool = false, headers: [String: String] = [:],
+                    maxStale: TimeInterval = .infinity) async throws -> Fetched {
         let key = url.absoluteString
-        if !force, let hit = await cache.fresh(key, maxAge: ttl) { return hit }
+        if !force, let hit = await cache.entry(key, maxAge: ttl), now().timeIntervalSince(hit.storedAt) < ttl {
+            return Fetched(data: hit.data, storedAt: hit.storedAt, isFallback: false)
+        }
         do {
             let data = try await client.get(url, headers: headers)
             await cache.store(data, for: key)
-            return data
+            return Fetched(data: data, storedAt: now(), isFallback: false)
         } catch {
-            if let stale = await cache.stale(key) { return stale }
+            if let stale = await cache.entry(key, maxAge: maxStale) {
+                return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true)
+            }
             throw error
         }
     }
 
-    func optionalFetch(_ url: URL, ttl: TimeInterval, force: Bool, headers: [String: String] = [:]) async -> Data? {
-        try? await fetch(url, ttl: ttl, force: force, headers: headers)
+    func fetch(_ url: URL, ttl: TimeInterval, force: Bool = false, headers: [String: String] = [:],
+               maxStale: TimeInterval = .infinity) async throws -> Data {
+        try await fetchEntry(url, ttl: ttl, force: force, headers: headers, maxStale: maxStale).data
+    }
+
+    func optionalFetch(_ url: URL, ttl: TimeInterval, force: Bool, headers: [String: String] = [:],
+                       maxStale: TimeInterval = .infinity) async -> Data? {
+        try? await fetch(url, ttl: ttl, force: force, headers: headers, maxStale: maxStale)
+    }
+
+    func optionalFetchEntry(_ url: URL, ttl: TimeInterval, force: Bool, headers: [String: String] = [:],
+                            maxStale: TimeInterval = .infinity) async -> Fetched? {
+        try? await fetchEntry(url, ttl: ttl, force: force, headers: headers, maxStale: maxStale)
     }
 }

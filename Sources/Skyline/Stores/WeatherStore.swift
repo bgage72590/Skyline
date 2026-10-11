@@ -46,12 +46,20 @@ final class WeatherStore {
     var focusContentRequest = 0
 
     private(set) var isMainWindowVisible = false
+    /// Bumped when a report crosses its staleness deadline or an alert ends, so views that show data age
+    /// (menu-bar dimming, the offline banner) re-render without polling.
+    private(set) var staleTick = 0
 
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let locationProvider = LocationProvider()
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var searchTask: Task<Void, Never>?
     @ObservationIgnored private var wakeObserver: NSObjectProtocol?
+    /// Quick retries after a failed refresh (1, 2, 4… min, capped at the refresh interval), per location.
+    @ObservationIgnored private var retryTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var retryAttempts: [String: Int] = [:]
+    /// One sleeping task that wakes at the next staleness deadline / alert end.
+    @ObservationIgnored private var housekeepingTask: Task<Void, Never>?
 
     private enum Keys {
         static let locations = "savedLocations.v1"
@@ -65,7 +73,7 @@ final class WeatherStore {
     /// A report younger than this is shown without refetching.
     private let staleAfter: TimeInterval = 10 * 60
 
-    init(service: WeatherService = WeatherService(verifier: ForecastVerifier()), defaults: UserDefaults = .standard) {
+    init(service: WeatherService = WeatherStore.makeService(), defaults: UserDefaults = .standard) {
         self.service = service
         self.radar = RadarPlayback(service: service)
         self.defaults = defaults
@@ -122,10 +130,25 @@ final class WeatherStore {
 
     func isLoading(_ location: WeatherLocation) -> Bool { loadingIDs.contains(location.id) }
 
+    /// Data older than this is flagged as stale (see `DataAge.staleAfter`).
+    var staleDataAge: TimeInterval { DataAge.staleAfter(refreshMinutes: refreshMinutes) }
+
+    /// True when the report's data is old, came from the offline cache, or its last refresh failed.
+    /// Reads `staleTick`, so callers re-render when the report goes stale with no other change.
+    func isStale(_ report: WeatherReport, now: Date = Date()) -> Bool {
+        _ = staleTick
+        return isOffline(report) || report.dataAge(at: now) > staleDataAge
+    }
+
+    /// True when the last refresh for this report's location failed (network or service error).
+    func isOffline(_ report: WeatherReport) -> Bool {
+        report.isOfflineFallback || errors[report.location.id] != nil
+    }
+
     // MARK: Loading
 
     func load(_ location: WeatherLocation, force: Bool = false) async {
-        if !force, let existing = reports[location.id],
+        if !force, let existing = reports[location.id], errors[location.id] == nil, !existing.isOfflineFallback,
            Date().timeIntervalSince(existing.fetchedAt) < staleAfter,
            existing.location.coordinate == location.coordinate {
             return
@@ -138,11 +161,111 @@ final class WeatherStore {
             if defaults.bool(forKey: "SkylineDemoAlert"), report.alerts.isEmpty { report.alerts = [Self.demoAlert(near: location)] }
             if defaults.bool(forKey: "SkylineDemoRain") { report.minutely = Self.demoRain(from: report.current.time) }
             reports[location.id] = report
-            errors[location.id] = nil
+            if report.isOfflineFallback {
+                // Old data is better than none, but it must say so, and we try again soon.
+                setError("Couldn’t reach the weather service; showing saved data.", for: location.id)
+                scheduleRetry(location)
+            } else {
+                if errors[location.id] != nil { errors[location.id] = nil }
+                retryTasks.removeValue(forKey: location.id)?.cancel()
+                retryAttempts[location.id] = nil
+            }
+            scheduleHousekeeping()
             await refreshAccuracy(for: location)
         } catch is CancellationError {
         } catch {
-            if reports[location.id] == nil { errors[location.id] = error.localizedDescription }
+            // Keep the error visible even when older data is on screen (shown as the offline banner),
+            // withdraw data that is too old to pass for weather, and retry soon.
+            setError(Self.describe(error), for: location.id)
+            if let existing = reports[location.id], existing.dataAge() > DataAge.maxDisplayAge {
+                reports[location.id] = nil
+            }
+            scheduleRetry(location)
+            scheduleHousekeeping()
+        }
+    }
+
+    private func setError(_ message: String, for id: String) {
+        if errors[id] != message { errors[id] = message }
+    }
+
+    /// Short readable text for a refresh failure.
+    static func describe(_ error: Error) -> String {
+        if let u = error as? URLError {
+            switch u.code {
+            case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed: return "You’re offline."
+            case .timedOut: return "The weather service didn’t respond."
+            case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed: return "Couldn’t reach the weather service."
+            default: return u.localizedDescription
+            }
+        }
+        if let h = error as? HTTPError, case .status(let code, _) = h {
+            return code == 429 ? "The weather service is busy (rate limited)." : "The weather service returned an error (\(code))."
+        }
+        return error.localizedDescription
+    }
+
+    /// After a failure, try again in about a minute instead of waiting for the next refresh cycle
+    /// (backing off 1 → 2 → 4 … minutes up to the refresh interval while it keeps failing). Only for
+    /// locations the user can currently see (menu-bar location, or any when the window is visible).
+    private func scheduleRetry(_ location: WeatherLocation) {
+        let id = location.id
+        guard retryTasks[id] == nil else { return }
+        let attempt = retryAttempts[id, default: 0]
+        retryAttempts[id] = attempt + 1
+        let delay = min(60 * pow(2, Double(min(attempt, 6))), Double(refreshMinutes) * 60)
+        retryTasks[id] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay), tolerance: .seconds(10))
+            guard !Task.isCancelled, let self else { return }
+            self.retryTasks[id] = nil
+            guard let current = self.allLocations.first(where: { $0.id == id }),
+                  self.isMainWindowVisible || self.menuBarLocation?.id == id else { return }
+            await self.load(current)
+        }
+    }
+
+    /// Sleeps until the earliest moment something on screen changes meaning by itself (a report turns
+    /// stale, an alert ends), then drops ended alerts and bumps `staleTick`. One wake per deadline, no polling.
+    private func scheduleHousekeeping() {
+        housekeepingTask?.cancel()
+        let now = Date()
+        var deadlines: [Date] = []
+        for report in reports.values {
+            let staleAt = report.dataAsOf.addingTimeInterval(staleDataAge)
+            if staleAt > now { deadlines.append(staleAt) }
+            deadlines += report.alerts.compactMap(\.endTime).filter { $0 > now }
+        }
+        guard let next = deadlines.min() else { return }
+        housekeepingTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(next.timeIntervalSinceNow + 1), tolerance: .seconds(20))
+            guard !Task.isCancelled, let self else { return }
+            self.pruneEndedAlerts()
+            self.staleTick &+= 1
+            self.scheduleHousekeeping()
+        }
+    }
+
+    private func pruneEndedAlerts() {
+        let now = Date()
+        for (id, report) in reports where report.alerts.contains(where: { !$0.isActive(at: now) }) {
+            var r = report
+            r.alerts = report.activeAlerts(at: now)
+            reports[id] = r
+        }
+    }
+
+    /// The real service, or (QA hook `-SkylineSimulateOffline YES|cold`) one whose network always fails:
+    /// `YES` keeps the on-disk cache (offline fallback, stale banner), `cold` starts with an empty cache
+    /// (error states). Nothing is recorded for verification in either mode.
+    nonisolated static func makeService() -> WeatherService {
+        let mode = UserDefaults.standard.string(forKey: "SkylineSimulateOffline")?.lowercased()
+        switch mode {
+        case "yes", "1", "true":
+            return WeatherService(client: OfflineHTTPClient())
+        case "cold":
+            return WeatherService(client: OfflineHTTPClient(), cache: ResponseCache(directory: nil))
+        default:
+            return WeatherService(verifier: ForecastVerifier())
         }
     }
 

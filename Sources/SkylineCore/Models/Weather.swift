@@ -171,6 +171,12 @@ public struct WeatherAlert: Codable, Hashable, Identifiable, Sendable {
         self.instruction = instruction; self.effective = effective; self.expires = expires
         self.ends = ends; self.senderName = senderName
     }
+
+    /// When the hazard is over: `ends` if given, else when the message `expires`. Nil = open-ended.
+    public var endTime: Date? { ends ?? expires }
+
+    /// False once the alert has ended (an expired warning must never stay on screen).
+    public func isActive(at now: Date) -> Bool { endTime.map { $0 > now } ?? true }
 }
 
 /// One timestamped value of an hourly series (AQI forecast etc.).
@@ -222,17 +228,30 @@ public struct WeatherReport: Codable, Hashable, Sendable {
     public var sources: [String]
     /// NWS forecast office / city label when NWS contributed.
     public var nwsOffice: String?
+    /// When the forecast data was actually downloaded (the oldest forecast input). Differs from
+    /// `fetchedAt` (when this report was assembled) whenever cached data was used.
+    public var dataAsOf: Date
+    /// True when the network failed and the forecast came from Skyline's offline cache.
+    public var isOfflineFallback: Bool
 
     public init(location: WeatherLocation, fetchedAt: Date, timeZoneIdentifier: String,
                 current: CurrentConditions, hourly: [HourlyForecast], daily: [DailyForecast],
                 minutely: [MinutelyPrecipitation] = [], alerts: [WeatherAlert] = [],
-                airQuality: AirQuality? = nil, sources: [String] = [], nwsOffice: String? = nil) {
+                airQuality: AirQuality? = nil, sources: [String] = [], nwsOffice: String? = nil,
+                dataAsOf: Date? = nil, isOfflineFallback: Bool = false) {
         self.location = location; self.fetchedAt = fetchedAt; self.timeZoneIdentifier = timeZoneIdentifier
         self.current = current; self.hourly = hourly; self.daily = daily; self.minutely = minutely
         self.alerts = alerts; self.airQuality = airQuality; self.sources = sources; self.nwsOffice = nwsOffice
+        self.dataAsOf = dataAsOf ?? fetchedAt; self.isOfflineFallback = isOfflineFallback
     }
 
     public var timeZone: TimeZone { TimeZone(identifier: timeZoneIdentifier) ?? .current }
+
+    /// How old the forecast data is at `now` (seconds).
+    public func dataAge(at now: Date = Date()) -> TimeInterval { max(0, now.timeIntervalSince(dataAsOf)) }
+
+    /// Alerts that haven't ended yet at `now` (display-time filter; the parser already drops ended ones).
+    public func activeAlerts(at now: Date = Date()) -> [WeatherAlert] { alerts.filter { $0.isActive(at: now) } }
 
     /// Hourly entries from the current hour onward.
     public func upcomingHours(from now: Date = Date(), count: Int = 24) -> [HourlyForecast] {

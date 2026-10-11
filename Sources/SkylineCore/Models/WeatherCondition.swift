@@ -83,3 +83,42 @@ public struct WeatherCondition: Hashable, Sendable {
         }
     }
 }
+
+extension WeatherCondition {
+    /// Reads an NWS `shortForecast` ("Chance Light Rain then Mostly Sunny", "Rain Showers Likely", "Sunny")
+    /// into WMO codes: the precipitation it mentions (if any) and its sky cover (if any).
+    /// Used for US daily icons, so they follow the forecaster's wording instead of one model's worst hour.
+    public static func nwsCodes(_ shortForecast: String) -> (precipitation: Int?, sky: Int?)? {
+        let t = shortForecast.lowercased()
+        guard !t.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        func has(_ words: String...) -> Bool { words.contains { t.contains($0) } }
+
+        var precipitation: Int?
+        if has("thunder", "t-storm", "tstorm") {
+            precipitation = 95
+        } else if has("freezing rain", "freezing drizzle", "sleet", "ice pellets", "wintry mix", "rain and snow", "snow and rain") {
+            precipitation = 66
+        } else if has("snow", "flurries", "blizzard") {
+            if has("snow showers", "flurries") { precipitation = 85 }
+            else if has("heavy snow", "blizzard") { precipitation = 75 }
+            else if has("light snow") { precipitation = 71 }
+            else { precipitation = 73 }
+        } else if has("showers") {
+            precipitation = 80
+        } else if has("rain") {
+            precipitation = has("heavy rain") ? 65 : (has("light rain") ? 61 : 63)
+        } else if has("drizzle") {
+            precipitation = 51
+        }
+
+        var sky: Int?
+        if has("mostly sunny", "mostly clear") { sky = 1 }
+        else if has("partly sunny", "partly cloudy") { sky = 2 }
+        else if has("mostly cloudy", "cloudy", "overcast") { sky = 3 }
+        else if has("sunny", "clear", "fair") { sky = 0 }
+        else if has("fog") { sky = 45 }
+
+        if precipitation == nil && sky == nil { return nil }
+        return (precipitation, sky)
+    }
+}

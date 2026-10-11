@@ -29,6 +29,10 @@ enum Fmt {
     static func weekday(_ date: Date, _ tz: TimeZone) -> String { string(date, template: "EEE", timeZone: tz) }
     /// "Mon 3:42 PM"
     static func dayTime(_ date: Date, _ tz: TimeZone) -> String { string(date, template: "EEEjmm", timeZone: tz) }
+    /// "2:10 PM" today, else "Sat 2:10 PM" (Mac's time zone): when shown data was downloaded.
+    static func dataTime(_ date: Date, now: Date = Date()) -> String {
+        Calendar.current.isDate(date, inSameDayAs: now) ? time(date, .current) : dayTime(date, .current)
+    }
 }
 
 /// Apple-Weather-like sky gradients. Static (no animation) to keep the GPU idle.

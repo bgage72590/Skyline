@@ -127,3 +127,44 @@ public struct VerifiedRecord: Codable, Hashable, Sendable {
 
     public init(_ r: ForecastRecord, _ o: ObservedHour) { self.r = r; self.o = o }
 }
+
+extension ForecastRecord {
+    /// One model, one score: Open-Meteo's `best_match`, `gfs_seamless` and `gfs_hrrr` often carry the very
+    /// same NOAA numbers, and scoring each copy as its own source would triple-count one model in the
+    /// accuracy tracker and the learned weights. For each variable, a NOAA-family value equal to that of a
+    /// higher-weighted family member is dropped (the blender collapses them the same way), and HRRR's
+    /// "probability" (really the GFS-family one) is never scored as HRRR. Applied when recording and when
+    /// scoring, so history saved before this rule is scored the same way.
+    public func dedupingNOAAFamily() -> ForecastRecord {
+        let lead = leadHours
+        let family: [ForecastModel] = [.hrrr, .bestMatch, .gfs]
+        var out = self
+        if var h = out.f[VerificationSource.hrrr.rawValue] {
+            h.pop = nil
+            out.f[VerificationSource.hrrr.rawValue] = h.isEmpty ? nil : h
+        }
+        func dedupe(_ path: WritableKeyPath<SourceValues, Double?>, variable: String) {
+            let ranked = family.enumerated().sorted { a, b in
+                let wa = ForecastBlender.weight(.model(a.element), variable: variable, leadHours: lead)
+                let wb = ForecastBlender.weight(.model(b.element), variable: variable, leadHours: lead)
+                return wa == wb ? a.offset < b.offset : wa > wb
+            }.map(\.element)
+            var seen: Set<Double> = []
+            for m in ranked {
+                let key = VerificationSource(m).rawValue
+                guard var v = out.f[key], let value = v[keyPath: path] else { continue }
+                if seen.contains(value) {
+                    v[keyPath: path] = nil
+                    out.f[key] = v.isEmpty ? nil : v
+                } else {
+                    seen.insert(value)
+                }
+            }
+        }
+        dedupe(\.t, variable: "temperature_2m")
+        dedupe(\.pop, variable: "precipitation_probability")
+        dedupe(\.p, variable: "precipitation")
+        dedupe(\.w, variable: "wind_speed_10m")
+        return out
+    }
+}

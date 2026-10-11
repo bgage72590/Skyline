@@ -87,6 +87,35 @@ public struct NWSPeriod: Codable, Hashable, Sendable {
         }
     }
 
+    /// When NWS produced this forecast: `generatedAt` (API render time) and `updateTime` (last forecaster
+    /// edit of the grid). Both nil when the response doesn't carry them.
+    public struct Issuance: Sendable, Equatable {
+        public var generatedAt: Date?
+        public var updateTime: Date?
+    }
+
+    public static func issuance(_ data: Data) -> Issuance {
+        struct Raw: Decodable {
+            struct Props: Decodable { var generatedAt: String?; var updateTime: String? }
+            var properties: Props
+        }
+        guard let p = try? JSONDecoder().decode(Raw.self, from: data).properties else { return Issuance() }
+        return Issuance(generatedAt: p.generatedAt.flatMap(NWSDate.parse), updateTime: p.updateTime.flatMap(NWSDate.parse))
+    }
+
+    /// NWS forecasts older than this (since NWS generated them, or since Skyline downloaded them) are ignored.
+    public static let maxForecastAge: TimeInterval = 6 * 3600
+    /// A grid whose forecaster `updateTime` is older than this is a known NWS "stuck grid" hiccup: ignored too.
+    public static let maxGridAge: TimeInterval = 24 * 3600
+
+    /// True when a forecast downloaded at `downloadedAt` is still recent enough to blend at `now`.
+    public static func isRecent(_ issuance: Issuance, downloadedAt: Date, now: Date) -> Bool {
+        let produced = min(downloadedAt, issuance.generatedAt ?? downloadedAt)
+        guard now.timeIntervalSince(produced) <= maxForecastAge else { return false }
+        if let updated = issuance.updateTime, now.timeIntervalSince(updated) > maxGridAge { return false }
+        return true
+    }
+
     /// Parses "13 mph" or "13 to 17 mph" (takes the upper bound) into km/h.
     public static func parseWindSpeedKmh(_ s: String) -> Double? {
         let numbers = s.split(whereSeparator: { !$0.isNumber && $0 != "." }).compactMap { Double($0) }
@@ -119,8 +148,9 @@ public enum NWSAlertParser {
         var features: [Feature]
     }
 
-    /// Parses `/alerts/active` GeoJSON. Drops test/exercise messages, sorts most severe first.
-    public static func decode(_ data: Data) throws -> [WeatherAlert] {
+    /// Parses `/alerts/active` GeoJSON. Drops test/exercise messages and alerts that have already ended
+    /// at `now` (a cached response can outlive its warnings), sorts most severe first.
+    public static func decode(_ data: Data, now: Date = Date()) throws -> [WeatherAlert] {
         let raw = try JSONDecoder().decode(Raw.self, from: data)
         return raw.features
             .filter { ($0.properties.status ?? "Actual") == "Actual" }
@@ -137,6 +167,7 @@ public enum NWSAlertParser {
                 alert.affectedZones = (p.affectedZones ?? []).compactMap(URL.init(string:))
                 return alert
             }
+            .filter { $0.isActive(at: now) }
             .sorted { $0.severity == $1.severity ? ($0.effective ?? .distantPast) > ($1.effective ?? .distantPast)
                                                   : $0.severity > $1.severity }
     }

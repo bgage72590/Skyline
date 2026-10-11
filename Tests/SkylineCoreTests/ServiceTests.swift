@@ -8,7 +8,10 @@ final class ServiceTests: XCTestCase {
 
     func testUSReportBlendsAllSources() async throws {
         let client = MockHTTPClient()
-        let service = WeatherService(client: client, cache: ResponseCache(directory: nil))
+        // Fixed clock at the fixtures' time (09:30 ET Oct 11): NWS data is recent and the fixture Tornado
+        // Warning (ends 10:00 ET) is still active. With the wall clock this test used to rely on an expired alert.
+        let clock = TestClock(Date(timeIntervalSince1970: 1_791_725_400))
+        let service = WeatherService(client: client, cache: ResponseCache(directory: nil, now: { clock.now }), now: { clock.now })
         let report = try await service.report(for: nyc)
 
         XCTAssertEqual(report.timeZoneIdentifier, "America/New_York")

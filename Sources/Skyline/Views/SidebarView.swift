@@ -172,7 +172,7 @@ struct SidebarRow: View {
                     .foregroundStyle(Glass.secondaryText)
                     .lineLimit(1)
                 Spacer(minLength: 2)
-                if let alert = report?.alerts.first {
+                if let alert = report?.activeAlerts().first {
                     Label(alert.event, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(AlertsCard.color(alert.severity))

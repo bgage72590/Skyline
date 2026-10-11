@@ -81,7 +81,9 @@ final class ParsingTests: XCTestCase {
     }
 
     func testNWSAlertsSortedBySeverity() throws {
-        let alerts = try NWSAlertParser.decode(try Fixture.data("nws_alerts"))
+        // 09:30 ET Oct 11, before the fixture Tornado Warning ends at 10:00 ET (expired alerts are dropped,
+        // so a fixed time keeps this test stable; see Batch1Tests.testExpiredAlertsDropped).
+        let alerts = try NWSAlertParser.decode(try Fixture.data("nws_alerts"), now: Date(timeIntervalSince1970: 1_791_725_400))
         XCTAssertEqual(alerts.count, 2)
         XCTAssertEqual(alerts[0].event, "Tornado Warning")
         XCTAssertEqual(alerts[0].severity, .extreme)

@@ -8,7 +8,7 @@ interactive MapKit map with an animated timeline. No API keys, nothing paid.
 ## Build / install
 
 ```bash
-./build-app.sh            # swift build (release) → build/Skyline.app → ad-hoc sign →
+./build-app.sh            # swift build (release) → build/Skyline.app → sign ("Skyline Local Signing") →
                           # quit running copy → replace /Applications/Skyline.app → launch →
                           # zip to iCloud Drive/Skyline/Skyline.zip
 swift build && swift test # dev loop
@@ -16,14 +16,35 @@ swift build && swift test # dev loop
 
 Options: `--no-install`, `--no-launch`, `--no-zip`, `--native` (skip the universal arm64+x86_64 attempt).
 
-On another Mac (after iCloud syncs):
+The app is signed with a self-signed certificate kept in the build Mac's login keychain ("Skyline Local
+Signing", created once by `build-app.sh`; no Developer ID). Every build has the same designated
+requirement, so Location permission survives updates.
+
+### Installing on other Macs (verified)
+
+The iCloud zip is only a transport: anyone who can edit that folder could swap it. So other Macs install
+with `scripts/install-verified.sh`, which unzips to a temp folder, checks the app is signed by the build
+Mac's certificate (`identifier "com.briangage.Skyline" and certificate leaf = H"<sha1>"`), and only then
+replaces `/Applications/Skyline.app` and clears quarantine. Anything else (ad-hoc, re-signed, modified) is
+refused and nothing is touched.
+
+One-time setup per Mac. Copy the script there **outside iCloud** (AirDrop, USB stick or `scp`), then:
 
 ```bash
-bash ~/Library/Mobile\ Documents/com~apple~CloudDocs/Skyline/install.sh
+mkdir -p ~/bin && cp install-verified.sh ~/bin/skyline-install && chmod +x ~/bin/skyline-install
 ```
 
-The app is ad-hoc signed (no Developer ID), so every rebuild has a new signature: macOS may ask for
-Location permission again after an update.
+After each new build has synced:
+
+```bash
+~/bin/skyline-install                      # from iCloud Drive/Skyline/Skyline.zip
+~/bin/skyline-install --verify-only ~/Downloads/Skyline.zip   # check only
+```
+
+The pinned certificate hash is the `CERT_SHA1` line in the script (`build-app.sh` prints the current one).
+If the certificate is ever re-created, update that line and copy the script to each Mac again.
+`build-app.sh` no longer puts an `install.sh` into iCloud Drive; an old one left there is unverified,
+so delete it by hand and don't run it.
 
 ## Architecture
 

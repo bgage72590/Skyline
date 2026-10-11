@@ -42,10 +42,12 @@ final class AstronomyAndTileTests: XCTestCase {
         let tz = TimeZone(identifier: "America/New_York")!
         let daily = ForecastBlender.blendDaily(openMeteo: om, nwsPeriods: nws, timeZone: tz)
         let names = daily[0].sources.map(\.name)
-        XCTAssertEqual(names.first, "NOAA HRRR") // highest weight on day 0
+        // Highest weight on day 0. Best Match and GFS carry the same numbers as HRRR that day, so the three
+        // are one row ("one model, one vote"): NOAA, ECMWF, ICON, NWS.
+        XCTAssertEqual(names.first, "NOAA HRRR = Open-Meteo Best Match = NOAA GFS")
         XCTAssertTrue(names.contains("National Weather Service"))
-        XCTAssertEqual(daily[0].sources.count, 6)
-        XCTAssertFalse(daily[5].sources.contains { $0.name == "NOAA HRRR" })
+        XCTAssertEqual(daily[0].sources.count, 4)
+        XCTAssertFalse(daily[5].sources.contains { $0.name.contains("NOAA HRRR") })
         let hourly = ForecastBlender.blendHourly(openMeteo: om, nwsHourly: [], now: Date(timeIntervalSince1970: 1_791_725_400))
         XCTAssertEqual(daily[1].hours(from: hourly, timeZone: tz).count, 24)
     }
