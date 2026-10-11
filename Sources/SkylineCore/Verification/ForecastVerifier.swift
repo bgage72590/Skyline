@@ -177,13 +177,14 @@ public actor ForecastVerifier {
         let candidates = recent.overall.values.filter { $0.source != .blend && $0.tempN >= config.minSamples }
         let winner = candidates.min { ($0.tempMAE ?? .infinity) < ($1.tempMAE ?? .infinity) }
         let days = m?.firstIssued.map { t.timeIntervalSince($0) / 86400 } ?? 0
-        let ready = s.days >= config.minDays && (s.samplesByBucket.values.max() ?? 0) >= Int(config.minSamples)
-        return AccuracyReport(status: ready ? .ready : .collecting, daysCollected: days, verifiedPairs: s.pairs,
+        // "Ready" means exactly "the learned weights are in use" (same thresholds, same weighted n).
+        let w = weights(key)
+        return AccuracyReport(status: w.isNeutral ? .collecting : .ready, daysCollected: days, verifiedPairs: s.pairs,
                               pendingForecasts: pending.filter { $0.loc == key }.count,
                               stationID: m?.stationID, stationName: m?.stationName,
                               overall: s.overall, byBucket: s.byBucket,
                               recentWinner: winner?.source, recentWinnerMAE: winner?.tempMAE,
-                              weights: weights(key), minDays: config.minDays)
+                              weights: w, minDays: config.minDays)
     }
 
     // MARK: Internals

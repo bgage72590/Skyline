@@ -1,6 +1,8 @@
+import AppKit
 import CoreGraphics
 import Foundation
 import ImageIO
+import Network
 import SkylineCore
 
 /// Decoded radar tiles shared by every radar map. Downloads go through a disk-backed URLCache
@@ -11,6 +13,7 @@ final class RadarImageCache {
     static let shared = RadarImageCache()
 
     private let session: URLSession
+    private let urlCache: URLCache
     private let images = NSCache<NSString, CGImage>()
     private struct Waiter {
         /// Still needed? (false once the requesting map/zoom/frame set is gone) — checked before starting.
@@ -19,29 +22,104 @@ final class RadarImageCache {
         let cancelled: () -> Void
     }
     private var waiters: [String: [Waiter]] = [:]
+    /// Tiles the server says don't exist (404, or an empty/undecodable 200): "resolved, nothing to draw"
+    /// for `missingTTL`, then asked again. Pruned by age so it can't grow without bound.
     private var failures: [String: Date] = [:]
+    /// Tiles that failed for a transient reason (offline, timeout, 5xx): retried with back-off
+    /// (5 s, 10 s, 20 s … 60 s), and immediately after wake or when the network comes back.
+    private var transient: [String: (at: Date, attempts: Int)] = [:]
+    static let missingTTL: TimeInterval = 120
+    /// Posted (main queue) when failed tiles should be requested again: wake, network back, back-off over.
+    static let retryNotification = Notification.Name("SkylineRadarRetryTiles")
+    private var retryScheduled = false
+    private let pathMonitor = NWPathMonitor()
+    private var lastPathSatisfied = true
+    private var wakeObserver: NSObjectProtocol?
+
+    /// What a download produced.
+    enum Outcome: Sendable { case image(CGImage), missing, transientFailure }
 
     private init() {
         let config = URLSessionConfiguration.default
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
             .appendingPathComponent("com.briangage.Skyline/radar-tiles", isDirectory: true)
-        config.urlCache = URLCache(memoryCapacity: 16 << 20, diskCapacity: 300 << 20, directory: dir)
+        // Encoded PNGs: the disk cache does the real work; RAM only for the last few bursts (L8 / E1).
+        urlCache = URLCache(memoryCapacity: 4 << 20, diskCapacity: 300 << 20, directory: dir)
+        config.urlCache = urlCache
         config.requestCachePolicy = .useProtocolCachePolicy
         config.httpMaximumConnectionsPerHost = 8
         config.timeoutIntervalForRequest = 15
-        config.httpAdditionalHeaders = ["User-Agent": URLSessionHTTPClient.userAgent]
+        // Tile hosts (IEM, RainViewer) get the plain User-Agent; only api.weather.gov gets the contact.
+        config.httpAdditionalHeaders = ["User-Agent": URLSessionHTTPClient.genericUserAgent]
         session = URLSession(configuration: config)
-        images.totalCostLimit = 32 << 20 // decoded RGBA bytes; live tiles are held by their layers anyway
+        images.totalCostLimit = 24 << 20 // decoded RGBA bytes; live tiles are held by their layers anyway
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let ok = path.status == .satisfied
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.networkChanged(satisfied: ok) } }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "Skyline.radar.path", qos: .utility))
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            // Give Wi-Fi a moment, then re-request anything that failed while asleep.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { MainActor.assumeIsolated { self?.retryFailedNow() } }
+        }
+    }
+
+    private func networkChanged(satisfied: Bool) {
+        defer { lastPathSatisfied = satisfied }
+        if satisfied && !lastPathSatisfied { retryFailedNow() }
+    }
+
+    /// Forget transient failures (and recent "missing" verdicts, which may have been caused by the same
+    /// outage) and tell the radar views to request their missing tiles again.
+    func retryFailedNow() {
+        transient.removeAll()
+        failures.removeAll()
+        NotificationCenter.default.post(name: Self.retryNotification, object: nil)
+    }
+
+    /// Window closed: drop decoded tiles nobody is drawing and the encoded-response RAM cache.
+    func trim() {
+        images.removeAllObjects()
+        // Shrinking the RAM capacity evicts the in-memory copies; the disk cache is untouched.
+        urlCache.memoryCapacity = 0
+        urlCache.memoryCapacity = 4 << 20
+        pruneFailures()
+    }
+
+    private func pruneFailures() {
+        let now = Date()
+        failures = failures.filter { now.timeIntervalSince($0.value) < Self.missingTTL }
+        transient = transient.filter { now.timeIntervalSince($0.value.at) < 600 }
+    }
+
+    /// Seconds before a transiently failed tile may be asked again.
+    private static func backoff(attempts: Int) -> TimeInterval { min(5 * pow(2, Double(max(attempts - 1, 0))), 60) }
+
+    private func scheduleRetryTick(after delay: TimeInterval) {
+        guard !retryScheduled else { return }
+        retryScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.5) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.retryScheduled = false
+                NotificationCenter.default.post(name: Self.retryNotification, object: nil)
+            }
+        }
     }
 
     func image(for url: URL) -> CGImage? {
         images.object(forKey: url.absoluteString as NSString)
     }
 
-    /// True if this tile failed recently (404/blank); callers treat it as "resolved, nothing to draw".
+    /// True if this tile failed recently (404/blank, or a transient failure still inside its back-off);
+    /// callers treat it as "resolved for now" and ask again once this turns false.
     func recentlyFailed(_ url: URL) -> Bool {
-        guard let at = failures[url.absoluteString] else { return false }
-        return Date().timeIntervalSince(at) < 120
+        let key = url.absoluteString
+        let now = Date()
+        if let at = failures[key], now.timeIntervalSince(at) < Self.missingTTL { return true }
+        if let t = transient[key], now.timeIntervalSince(t.at) < Self.backoff(attempts: t.attempts) { return true }
+        return false
     }
 
     func load(_ url: URL, wanted: @escaping () -> Bool = { true },
@@ -88,25 +166,46 @@ final class RadarImageCache {
         let key = url.absoluteString
         let session = self.session
         Task {
-            let image = await Self.fetchDecoded(session: session, url: url)
+            let outcome = await Self.fetchDecoded(session: session, url: url)
             inFlight -= 1
             defer { pump() }
-            if let image {
-                images.setObject(image, forKey: key as NSString, cost: image.bytesPerRow * image.height)
+            var image: CGImage?
+            switch outcome {
+            case .image(let decoded):
+                image = decoded
+                images.setObject(decoded, forKey: key as NSString, cost: decoded.bytesPerRow * decoded.height)
                 failures[key] = nil
-            } else {
+                transient[key] = nil
+            case .missing:
                 failures[key] = Date()
+            case .transientFailure:
+                // Not a hole: the tile exists, the network/server hiccupped. Ask again after a back-off.
+                let attempts = (transient[key]?.attempts ?? 0) + 1
+                transient[key] = (Date(), attempts)
+                scheduleRetryTick(after: Self.backoff(attempts: attempts))
             }
+            if failures.count + transient.count > 2_000 { pruneFailures() }
             let callbacks = waiters.removeValue(forKey: key) ?? []
             callbacks.forEach { $0.completion(image) }
         }
     }
 
-    nonisolated private static func fetchDecoded(session: URLSession, url: URL) async -> CGImage? {
-        guard let (data, response) = try? await session.data(from: url),
-              let http = response as? HTTPURLResponse, http.statusCode == 200,
-              let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
-        let options = [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
-        return CGImageSourceCreateImageAtIndex(source, 0, options)
+    nonisolated private static func fetchDecoded(session: URLSession, url: URL) async -> Outcome {
+        let data: Data, response: URLResponse
+        do { (data, response) = try await session.data(from: url) } catch { return .transientFailure }
+        guard let http = response as? HTTPURLResponse else { return .transientFailure }
+        switch http.statusCode {
+        case 200: break
+        case 404, 410: return .missing
+        default: return .transientFailure // 5xx, 429, odd redirects: retry later
+        }
+        // Decode inside an autorelease pool so ImageIO's temporaries are freed per tile, not per burst
+        // (less heap growth/fragmentation while a loop of ~100 tiles decodes).
+        let image: CGImage? = autoreleasepool {
+            guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+            let options = [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
+            return CGImageSourceCreateImageAtIndex(source, 0, options)
+        }
+        return image.map(Outcome.image) ?? .missing
     }
 }

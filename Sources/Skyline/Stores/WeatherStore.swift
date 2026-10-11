@@ -10,6 +10,8 @@ import SkylineCore
 /// Power policy: one background loop wakes every `refreshMinutes` (default 15, with timer tolerance so
 /// macOS can coalesce wake-ups). It refreshes only the menu-bar location unless the main window is
 /// actually visible (not occluded/minimised), in which case the sidebar locations are refreshed too.
+/// With the window closed (menu bar only) it wakes at most every `menuBarOnlyMinutes`, refreshes only
+/// the menu-bar location, and the window's heavy content (map, radar layers, background) is torn down.
 @MainActor
 @Observable
 final class WeatherStore {
@@ -46,6 +48,9 @@ final class WeatherStore {
     var focusContentRequest = 0
 
     private(set) var isMainWindowVisible = false
+    /// False while the main window is closed (menu bar only): ContentView then drops its content, which
+    /// frees the MKMapView, radar layers and living background; it's rebuilt when the window reopens.
+    private(set) var isMainWindowOpen = true
     /// Bumped when a report crosses its staleness deadline or an alert ends, so views that show data age
     /// (menu-bar dimming, the offline banner) re-render without polling.
     private(set) var staleTick = 0
@@ -72,6 +77,8 @@ final class WeatherStore {
 
     /// A report younger than this is shown without refetching.
     private let staleAfter: TimeInterval = 10 * 60
+    /// Refresh cadence while only the menu bar is in use (at least twice the normal interval, ≥ 30 min).
+    var menuBarOnlyMinutes: Int { max(refreshMinutes * 2, 30) }
 
     init(service: WeatherService = WeatherStore.makeService(), defaults: UserDefaults = .standard) {
         self.service = service
@@ -100,13 +107,23 @@ final class WeatherStore {
         // row never goes missing at launch while the first fix is slow.
         if let data = defaults.data(forKey: Keys.lastFix),
            let last = try? JSONDecoder().decode(WeatherLocation.self, from: data) {
-            currentLocation = last
+            // Fixes saved by older builds were ~11 m precise; keep only ~1 km (T7).
+            var coarse = last
+            coarse.coordinate = last.coordinate.coarse
+            currentLocation = coarse
+            if coarse != last { persistLastFix(coarse) }
         } else {
             isLocating = true
         }
         setUpLocation()
         observeWake()
         startRefreshLoop()
+        // Download-cache clean-up (entries older than 14 days), off the launch path.
+        let service = self.service
+        Task.detached(priority: .utility) {
+            try? await Task.sleep(for: .seconds(20))
+            await service.pruneCache()
+        }
     }
 
     // MARK: Derived
@@ -180,7 +197,7 @@ final class WeatherStore {
             if let existing = reports[location.id], existing.dataAge() > DataAge.maxDisplayAge {
                 reports[location.id] = nil
             }
-            scheduleRetry(location)
+            scheduleRetry(location, notBefore: Self.retryNotBefore(error))
             scheduleHousekeeping()
         }
     }
@@ -190,30 +207,28 @@ final class WeatherStore {
     }
 
     /// Short readable text for a refresh failure.
-    static func describe(_ error: Error) -> String {
-        if let u = error as? URLError {
-            switch u.code {
-            case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed: return "You’re offline."
-            case .timedOut: return "The weather service didn’t respond."
-            case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed: return "Couldn’t reach the weather service."
-            default: return u.localizedDescription
-            }
+    static func describe(_ error: Error) -> String { UserFacingError.message(error) }
+
+    /// When the service asked us to slow down (429/503 Retry-After, or a back-off in progress), the
+    /// retry waits at least that long.
+    static func retryNotBefore(_ error: Error) -> Date? {
+        switch error {
+        case HTTPError.throttled(_, _, let after): return after.map { Date().addingTimeInterval($0) }
+        case HTTPError.backingOff(_, let until): return until
+        default: return nil
         }
-        if let h = error as? HTTPError, case .status(let code, _) = h {
-            return code == 429 ? "The weather service is busy (rate limited)." : "The weather service returned an error (\(code))."
-        }
-        return error.localizedDescription
     }
 
     /// After a failure, try again in about a minute instead of waiting for the next refresh cycle
     /// (backing off 1 → 2 → 4 … minutes up to the refresh interval while it keeps failing). Only for
     /// locations the user can currently see (menu-bar location, or any when the window is visible).
-    private func scheduleRetry(_ location: WeatherLocation) {
+    private func scheduleRetry(_ location: WeatherLocation, notBefore: Date? = nil) {
         let id = location.id
         guard retryTasks[id] == nil else { return }
         let attempt = retryAttempts[id, default: 0]
         retryAttempts[id] = attempt + 1
-        let delay = min(60 * pow(2, Double(min(attempt, 6))), Double(refreshMinutes) * 60)
+        var delay = min(60 * pow(2, Double(min(attempt, 6))), Double(refreshMinutes) * 60)
+        if let notBefore { delay = max(delay, notBefore.timeIntervalSinceNow + 2) }
         retryTasks[id] = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay), tolerance: .seconds(10))
             guard !Task.isCancelled, let self else { return }
@@ -290,15 +305,17 @@ final class WeatherStore {
                 group.addTask { await self.load(location, force: force) }
             }
         }
+        MemoryRelief.soon() // the decoded JSON for every location is garbage now
     }
 
     private func startRefreshLoop() {
         refreshTask?.cancel()
-        let interval = Double(refreshMinutes) * 60
         refreshTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refreshDue()
-                try? await Task.sleep(for: .seconds(interval), tolerance: .seconds(90))
+                // Menu bar only: a slower cadence (the window reopening refreshes immediately).
+                guard let minutes = self.map({ $0.isMainWindowOpen ? $0.refreshMinutes : $0.menuBarOnlyMinutes }) else { return }
+                try? await Task.sleep(for: .seconds(Double(minutes) * 60), tolerance: .seconds(90))
             }
         }
     }
@@ -323,6 +340,24 @@ final class WeatherStore {
         if visible { Task { await refreshDue() } }
     }
 
+    /// Window closed → menu bar only: stop radar playback, drop the window content (ContentView swaps it
+    /// for an empty view, deallocating the map and layers), trim radar caches, and slow the refresh loop.
+    /// Reopened → rebuild and refresh. Called on the main queue's next turn (never inside layout).
+    func setMainWindowOpen(_ open: Bool) {
+        guard open != isMainWindowOpen else { return }
+        isMainWindowOpen = open
+        if !open {
+            setMainWindowVisible(false)
+            radar.setPlaying(false)
+            isScrubbing = false
+            RadarImageCache.shared.trim()
+            MemoryRelief.soon(after: 5) // after SwiftUI has deallocated the window content
+            // Window gone: retries are only for the menu-bar location.
+            for (id, task) in retryTasks where id != menuBarLocation?.id { task.cancel(); retryTasks[id] = nil }
+        }
+        startRefreshLoop() // re-arms with the cadence for the new state (and refreshes what's due now)
+    }
+
     // MARK: Current location
 
     private func setUpLocation() {
@@ -342,10 +377,12 @@ final class WeatherStore {
 
     private func handleLocation(_ c: CLLocationCoordinate2D) {
         if isLocating { isLocating = false }
-        let coordinate = Coordinate(latitude: c.latitude, longitude: c.longitude)
+        // ~1 km from here on: this is what goes to the weather services, Apple's place-name lookup, the
+        // saved "last fix" and the verification key (T7). Saved cities keep their own coordinates.
+        let coordinate = Coordinate(latitude: c.latitude, longitude: c.longitude).coarse
         if let existing = currentLocation,
            CLLocation(latitude: existing.coordinate.latitude, longitude: existing.coordinate.longitude)
-            .distance(from: CLLocation(latitude: c.latitude, longitude: c.longitude)) < 2_000 {
+            .distance(from: CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)) < 2_000 {
             return
         }
         let isFirstFix = currentLocation == nil
@@ -359,7 +396,8 @@ final class WeatherStore {
         }
         Task {
             var location = location
-            if let placemark = try? await CLGeocoder().reverseGeocodeLocation(CLLocation(latitude: c.latitude, longitude: c.longitude)).first {
+            let coarse = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+            if let placemark = try? await CLGeocoder().reverseGeocodeLocation(coarse).first {
                 location.name = placemark.locality ?? placemark.name ?? "My Location"
                 location.region = placemark.administrativeArea
                 location.country = placemark.country

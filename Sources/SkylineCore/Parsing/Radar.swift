@@ -94,22 +94,16 @@ public enum IEMNexrad {
         return f.date(from: raw.meta.valid)
     }
 
-    /// IEM keeps 11 cached composites at 5-minute steps: `m50m` (oldest) … `m05m`, then the bare layer.
-    /// A `?v=<latest>` cache-buster is appended because each layer name is a *relative* time slot
-    /// whose content changes every 5 minutes.
-    public static func frames(latest: Date) -> [RadarFrame] {
-        let version = Int(latest.timeIntervalSince1970)
-        return stride(from: 50, through: 0, by: -5).map { minutesAgo in
-            let layer = minutesAgo == 0 ? "nexrad-n0q-900913" : String(format: "nexrad-n0q-900913-m%02dm", minutesAgo)
-            return RadarFrame(time: latest.addingTimeInterval(-Double(minutesAgo) * 60),
-                              urlTemplate: "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/\(layer)/{z}/{x}/{y}.png?v=\(version)")
-        }
-    }
+    /// The 1-hour loop: 11 frames at 5-minute steps ending at the latest scan.
+    public static func frames(latest: Date) -> [RadarFrame] { frames(latest: latest, range: .oneHour) }
 
-    /// Longer loops use IEM's archived composites, addressed by their UTC scan time
-    /// (`ridge::USCOMP-N0Q-YYYYMMDDHHMM`). Those URLs never change content, so they cache well.
+    /// Every loop uses IEM's archived composites, addressed by their UTC scan time
+    /// (`ridge::USCOMP-N0Q-YYYYMMDDHHMM`). Those URLs never change content, so they cache well: when a new
+    /// scan arrives only the newest frame is new. (The 1-hour loop used IEM's *relative* layers,
+    /// `m05m` … `m50m` with `?v=<latest>`, so every scan changed all 11 URLs and the whole loop was
+    /// downloaded and decoded again every 5 minutes. IEM publishes the archived name for the latest
+    /// scan by the time `n0q_0.json` reports it; checked live Oct 11, 2026.)
     public static func frames(latest: Date, range: RadarRange) -> [RadarFrame] {
-        guard range != .oneHour else { return frames(latest: latest) }
         let step = Double(range.stepMinutes * 60)
         let base = (latest.timeIntervalSince1970 / 300).rounded(.down) * 300
         let count = range.totalMinutes / range.stepMinutes

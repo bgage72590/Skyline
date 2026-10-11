@@ -86,7 +86,7 @@ final class BlendingTests: XCTestCase {
         let nws = nwsHourly[5]
         let blended = try XCTUnwrap(hourly.first { $0.time == nws.startTime })
         let modelOnly = ForecastBlender.blendHourly(openMeteo: om, nwsHourly: [], now: now).first { $0.time == nws.startTime }!
-        XCTAssertLessThanOrEqual(abs(blended.temperature - nws.temperatureC), abs(modelOnly.temperature - nws.temperatureC) + 1e-9)
+        XCTAssertLessThanOrEqual(abs(blended.temperature - nws.temperatureC!), abs(modelOnly.temperature - nws.temperatureC!) + 1e-9)
         for h in hourly {
             if let p = h.precipitationProbability { XCTAssertTrue((0...100).contains(p)) }
         }

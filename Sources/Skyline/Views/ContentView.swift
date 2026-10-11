@@ -7,6 +7,25 @@ struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
+        Group {
+            if store.isMainWindowOpen {
+                windowContent
+            } else {
+                // Window closed (menu bar only): nothing heavy stays alive. SwiftUI keeps the closed
+                // window and this root view; the map, radar layers and backgrounds are rebuilt on reopen.
+                Color.black
+            }
+        }
+        .background(WindowVisibilityReader(onChange: { visible in store.setMainWindowVisible(visible) },
+                                           onOpenChange: { open in store.setMainWindowOpen(open) }))
+        .onAppear {
+            let open = openWindow
+            AppActions.openMainWindow = { open(id: SceneID.main) }
+            AppActions.installSpaceShortcut(store: store)
+        }
+    }
+
+    @ViewBuilder private var windowContent: some View {
         @Bindable var store = store
         NavigationSplitView {
             SidebarView()
@@ -45,13 +64,11 @@ struct ContentView: View {
             }
         }
         .modifier(HiddenWindowTitle())
-        .background(WindowVisibilityReader { visible in store.setMainWindowVisible(visible) })
         .onAppear {
-            let open = openWindow
-            AppActions.openMainWindow = { open(id: SceneID.main) }
-            AppActions.installSpaceShortcut(store: store)
             // Launch arguments for screenshots/QA: `-SkylineOpenRadar YES`, `-SkylineOpenModule uv`.
             let defaults = UserDefaults.standard
+            guard !QAHooksRan.done else { return } // once per launch, not again when the window reopens
+            QAHooksRan.done = true
             if defaults.bool(forKey: "SkylineOpenRadar") { store.radarExpanded = true }
             StressTest.runIfRequested(store: store)
             OverscanHitProbe.runIfRequested(store: store)
@@ -106,3 +123,6 @@ private struct HiddenWindowTitle: ViewModifier {
         }
     }
 }
+
+@MainActor
+private enum QAHooksRan { static var done = false }

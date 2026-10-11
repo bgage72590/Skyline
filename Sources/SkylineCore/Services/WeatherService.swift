@@ -34,6 +34,9 @@ public actor WeatherService {
     private let cache: ResponseCache
     private let now: @Sendable () -> Date
     private var inFlight: [String: Task<WeatherReport, Error>] = [:]
+    /// Hosts that answered 429/503: no requests to them until this time (Retry-After, else 1 → 2 → 4 … min).
+    private var backoffUntil: [String: Date] = [:]
+    private var backoffStrikes: [String: Int] = [:]
     /// Forecast verification + adaptive weights (nil = fixed weights, nothing recorded; used by tests).
     public nonisolated let verifier: ForecastVerifier?
 
@@ -81,7 +84,8 @@ public actor WeatherService {
     // MARK: Assembly
 
     private func buildReport(for location: WeatherLocation, forceRefresh force: Bool) async throws -> WeatherReport {
-        let coord = location.coordinate.rounded
+        // "My Location" goes out at ~1 km (the store already coarsens the fix; this is defense in depth).
+        let coord = location.isCurrentLocation ? location.coordinate.coarse : location.coordinate.rounded
         let models = ForecastModel.models(for: coord)
 
         async let omFetch = fetchEntry(Endpoints.openMeteoForecast(coord, models: models), ttl: TTL.forecast,
@@ -92,7 +96,7 @@ public actor WeatherService {
 
         let omEntry = try await omFetch
         let om = try OpenMeteoResponse.decode(omEntry.data)
-        guard let current = om.currentConditions() else { throw HTTPError.invalidResponse }
+        guard var current = om.currentConditions() else { throw HTTPError.invalidResponse }
         let nws = await nwsBundle
         let air = await aqData.flatMap { try? OpenMeteoAirQualityResponse.decode($0) }
 
@@ -104,6 +108,12 @@ public actor WeatherService {
                                                  weights: learned, minutely: minutely)
         let daily = ForecastBlender.blendDaily(openMeteo: om, nwsPeriods: nws?.periods ?? [], timeZone: tz,
                                                weights: learned, hourly: hourly)
+        // The headline temperature is the blend (models + NWS) at the current time, not one model's value.
+        // "Feels like" keeps its offset from the air temperature.
+        if let blended = ForecastBlender.temperature(at: current.time, hourly: hourly) {
+            current.apparentTemperature += blended.temperature - current.temperature
+            current.temperature = blended.temperature
+        }
 
         // Verification runs detached at utility priority: never delays the report.
         if let verifier {
@@ -209,16 +219,40 @@ public actor WeatherService {
         if !force, let hit = await cache.entry(key, maxAge: ttl), now().timeIntervalSince(hit.storedAt) < ttl {
             return Fetched(data: hit.data, storedAt: hit.storedAt, isFallback: false)
         }
+        let host = url.host ?? ""
         do {
+            if let until = backoffUntil[host], until > now() { throw HTTPError.backingOff(host: host, until: until) }
             let data = try await client.get(url, headers: headers)
+            backoffUntil[host] = nil
+            backoffStrikes[host] = nil
             await cache.store(data, for: key)
             return Fetched(data: data, storedAt: now(), isFallback: false)
         } catch {
+            if case HTTPError.throttled(_, _, let retryAfter) = error { noteThrottled(host, retryAfter: retryAfter) }
             if let stale = await cache.entry(key, maxAge: maxStale) {
                 return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true)
             }
             throw error
         }
+    }
+
+    /// A host said "slow down": honour its Retry-After (5 s – 1 h), else back off 1, 2, 4 … 30 min.
+    private func noteThrottled(_ host: String, retryAfter: TimeInterval?) {
+        let strikes = backoffStrikes[host, default: 0]
+        backoffStrikes[host] = strikes + 1
+        let delay = retryAfter.map { min(max($0, 5), 3600) } ?? min(60 * pow(2, Double(min(strikes, 5))), 1800)
+        backoffUntil[host] = now().addingTimeInterval(delay)
+    }
+
+    /// When requests to `host` may resume (nil = not backing off). Lets the store time its retry.
+    public func backoff(for host: String) -> Date? {
+        guard let until = backoffUntil[host], until > now() else { return nil }
+        return until
+    }
+
+    /// Drops download-cache entries older than `maxAge` (memory and disk). Called once at launch.
+    public func pruneCache(olderThan maxAge: TimeInterval = 14 * 86400) async {
+        await cache.prune(olderThan: maxAge)
     }
 
     func fetch(_ url: URL, ttl: TimeInterval, force: Bool = false, headers: [String: String] = [:],

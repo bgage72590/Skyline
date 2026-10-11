@@ -32,9 +32,7 @@ struct RadarCard: View {
                     }
                     Spacer()
                     HStack(spacing: 8) {
-                        CircleButton(systemImage: radar.isPlaying ? "pause.fill" : "play.fill",
-                                     help: radar.isPlaying ? "Pause" : "Play radar loop") { radar.togglePlay() }
-                            .disabled(radar.frames.count < 2)
+                        RadarPlayButton(radar: radar, compact: true)
                         RadarTimeLabel(radar: radar, timeZone: location.timeZone, compact: true)
                         Spacer()
                         RadarOpacityControl(opacity: $opacity, compact: true)
@@ -189,26 +187,76 @@ struct CircleButton: View {
     }
 }
 
+/// Play/pause for the radar loop. While the loop is still loading, Play is accepted and *queued*: the
+/// button shows a progress ring and "Starts when loaded" instead of flipping to Pause and doing nothing (R2).
+struct RadarPlayButton: View {
+    let radar: RadarPlayback
+    var compact = false
+
+    var body: some View {
+        let size: CGFloat = compact ? 30 : 34
+        Button { radar.togglePlay() } label: {
+            ZStack {
+                if radar.isWaitingToPlay {
+                    Circle().stroke(.white.opacity(0.25), lineWidth: 2.5)
+                    Circle().trim(from: 0, to: max(0.04, radar.progress))
+                        .stroke(.white, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                    Image(systemName: "hourglass").font(.system(size: compact ? 11 : 13, weight: .bold))
+                } else {
+                    Image(systemName: radar.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: compact ? 12 : 16, weight: .bold))
+                }
+            }
+            .frame(width: size, height: size)
+            .background {
+                if compact { Circle().fill(Glass.chipTint).background(.ultraThinMaterial, in: Circle()) }
+                else { Circle().fill(.white.opacity(0.18)) }
+            }
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(radar.frames.count < 2)
+        .help(radar.isWaitingToPlay ? "Starts when the loop has loaded (click to cancel)"
+              : radar.isPlaying ? "Pause (Space)" : "Play (Space)")
+    }
+}
+
 struct RadarTimeLabel: View {
     let radar: RadarPlayback
     let timeZone: TimeZone
     var compact = false
 
     var body: some View {
-        Group {
-            if !radar.isReady && !radar.frames.isEmpty {
+        if !radar.isReady && !radar.frames.isEmpty {
+            // Loading is a state you can't miss (R2): an accent-tinted chip with a bar, saying what
+            // happens next, instead of a small grey "Loading 30%".
+            let pct = Int((radar.progress * 100).rounded())
+            VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    ProgressView(value: radar.progress).progressViewStyle(.circular).controlSize(.mini)
-                    Text("Loading \(Int(radar.progress * 100))%")
+                    ProgressView().controlSize(.mini)
+                    Text(radar.isWaitingToPlay ? "Loading loop · starts at 100%" : "Loading radar")
+                    Spacer(minLength: 4)
+                    Text("\(pct)%").monospacedDigit()
                 }
-            } else if let frame = radar.currentFrame {
-                Text(label(frame)).monospacedDigit()
+                ProgressView(value: radar.progress)
+                    .progressViewStyle(.linear)
+                    .tint(.white)
+                    .frame(width: compact ? 130 : 170)
             }
+            .font(compact ? .caption.weight(.semibold) : .callout.weight(.semibold))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Capsule(style: .continuous).fill(Color.accentColor.opacity(0.55)))
+            .overlay(Capsule(style: .continuous).stroke(.white.opacity(0.35), lineWidth: 1))
+            .fixedSize()
+        } else if let frame = radar.currentFrame {
+            Text(label(frame)).monospacedDigit()
+                .font(compact ? .caption.weight(.semibold) : .callout.weight(.semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .glassChip(Capsule())
         }
-        .font(compact ? .caption.weight(.semibold) : .callout.weight(.semibold))
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .glassChip(Capsule())
     }
 
     private func label(_ frame: RadarFrame) -> String {
@@ -219,11 +267,13 @@ struct RadarTimeLabel: View {
     }
 }
 
-/// Persisted radar-layer opacity (default ~70 % so roads, labels and coastlines show through).
+/// Persisted radar-layer opacity. Default 60 % (normal source-over compositing since batch 2, so the
+/// old screen-blend value doesn't carry over: a new key gives everyone the new default once), and it
+/// goes down to 5 % to check a road or town under heavy rain.
 enum RadarOpacity {
-    static let key = "radarOpacity"
-    static let defaultValue = 0.7
-    static let range: ClosedRange<Double> = 0.2...1.0
+    static let key = "radarOpacity.v2"
+    static let defaultValue = 0.6
+    static let range: ClosedRange<Double> = 0.05...1.0
 }
 
 /// Opacity slider for the radar layer: compact capsule in the map tile, labelled in the expanded map.
@@ -296,16 +346,7 @@ struct RadarTimeline: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            Button { radar.togglePlay() } label: {
-                Image(systemName: radar.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 16, weight: .bold))
-                    .frame(width: 34, height: 34)
-                    .background(.white.opacity(0.18), in: Circle())
-                    .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .disabled(radar.frames.count < 2)
-            .help(radar.isPlaying ? "Pause (Space)" : "Play (Space)")
+            RadarPlayButton(radar: radar)
 
             VStack(spacing: 4) {
                 Slider(value: Binding(get: { Double(radar.index) },
@@ -314,9 +355,23 @@ struct RadarTimeline: View {
                        onEditingChanged: { editing in
                            radar.crossfade = !editing
                            if store.isScrubbing != editing { store.isScrubbing = editing }
+                           radar.isScrubbingRadar = editing
                            showCallout = editing
                        })
                     .disabled(radar.frames.count < 2)
+                    // While frames load, the track can't look finished: the slider is dimmed and a
+                    // progress bar fills underneath it (R2).
+                    .opacity(radar.isReady ? 1 : 0.45)
+                    .overlay(alignment: .bottom) {
+                        if !radar.isReady, !radar.frames.isEmpty {
+                            ProgressView(value: radar.progress)
+                                .progressViewStyle(.linear)
+                                .tint(.white)
+                                .padding(.horizontal, 6)
+                                .offset(y: 6)
+                                .allowsHitTesting(false)
+                        }
+                    }
                     .overlay(alignment: .topLeading) {
                         // Same callout as the charts while scrubbing (drawn, never measured back into state).
                         if showCallout, let frame = radar.currentFrame, radar.frames.count > 1 {

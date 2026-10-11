@@ -15,7 +15,10 @@ final class ServiceTests: XCTestCase {
         let report = try await service.report(for: nyc)
 
         XCTAssertEqual(report.timeZoneIdentifier, "America/New_York")
-        XCTAssertEqual(report.current.temperature, 15.6, accuracy: 0.001)
+        // T2: the headline is the blend at the current time (Open-Meteo best_match's own value was 15.6 °C).
+        let blendedNow = try XCTUnwrap(ForecastBlender.temperature(at: report.current.time, hourly: report.hourly))
+        XCTAssertEqual(report.current.temperature, blendedNow.temperature, accuracy: 1e-9)
+        XCTAssertNotEqual(report.current.temperature, 15.6, accuracy: 0.01)
         XCTAssertEqual(report.daily.count, 10)
         XCTAssertEqual(report.hourly.count, 240)
         XCTAssertEqual(report.alerts.count, 2)

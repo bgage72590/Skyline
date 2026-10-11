@@ -55,7 +55,7 @@ final class ParsingTests: XCTestCase {
         let periods = try NWSPeriod.decodeList(try Fixture.data("nws_hourly"))
         XCTAssertEqual(periods.count, 60)
         let first = try XCTUnwrap(periods.first)
-        XCTAssertEqual(first.temperatureC, fToC(62), accuracy: 0.001)
+        XCTAssertEqual(first.temperatureC ?? .nan, fToC(62), accuracy: 0.001)
         XCTAssertEqual(first.probabilityOfPrecipitation, 54)
         XCTAssertEqual(first.relativeHumidity, 87)
         XCTAssertEqual(first.windSpeedKmh ?? 0, 13 * 1.609344, accuracy: 0.001)
@@ -68,13 +68,13 @@ final class ParsingTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(periods.count, 13)
         XCTAssertEqual(periods[0].name, "Today")
         XCTAssertTrue(periods[0].isDaytime)
-        XCTAssertEqual(periods[0].temperatureC, fToC(66), accuracy: 0.001)
+        XCTAssertEqual(periods[0].temperatureC ?? .nan, fToC(66), accuracy: 0.001)
         XCTAssertFalse(periods[1].isDaytime)
         XCTAssertTrue(periods[0].detailedForecast.contains("high near 66"))
     }
 
     func testWindSpeedParsing() {
-        XCTAssertEqual(NWSPeriod.parseWindSpeedKmh("13 to 17 mph") ?? 0, 17 * 1.609344, accuracy: 0.001)
+        XCTAssertEqual(NWSPeriod.parseWindSpeedKmh("13 to 17 mph") ?? 0, 15 * 1.609344, accuracy: 0.001, "range → midpoint")
         XCTAssertEqual(NWSPeriod.parseWindSpeedKmh("5 mph") ?? 0, 5 * 1.609344, accuracy: 0.001)
         XCTAssertEqual(NWSPeriod.parseWindSpeedKmh("10 kt") ?? 0, 18.52, accuracy: 0.001)
         XCTAssertNil(NWSPeriod.parseWindSpeedKmh("calm"))
@@ -124,8 +124,11 @@ final class ParsingTests: XCTestCase {
         XCTAssertEqual(frames.last?.time, latest)
         XCTAssertEqual(frames.first?.time, latest.addingTimeInterval(-50 * 60))
         let url = try XCTUnwrap(frames.first?.url(z: 7, x: 37, y: 48)?.absoluteString)
-        XCTAssertTrue(url.contains("nexrad-n0q-900913-m50m/7/37/48.png?v="), url)
-        XCTAssertTrue(frames.last!.urlTemplate.contains("/nexrad-n0q-900913/"))
+        // Absolute scan-time names (L6): a newer scan shifts the loop by one frame instead of changing
+        // every URL, so 10 of 11 frames come from cache after each refresh.
+        XCTAssertTrue(url.contains("/ridge::USCOMP-N0Q-") && url.hasSuffix("/7/37/48.png") && !url.contains("?v="), url)
+        let next = IEMNexrad.frames(latest: latest.addingTimeInterval(300))
+        XCTAssertEqual(Set(frames.map(\.urlTemplate)).intersection(next.map(\.urlTemplate)).count, 10)
     }
 
     func testWeatherConditionMapping() {

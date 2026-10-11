@@ -8,6 +8,12 @@ public struct SourceScore: Codable, Hashable, Sendable {
     public var windN = 0.0, windAbs = 0.0
     public var hits = 0.0, misses = 0.0, falseAlarms = 0.0, correctNegatives = 0.0
     public var brierN = 0.0, brierSum = 0.0
+    /// Rain judged the same way for every source (amount ≥ 0.2 mm in the hour, which every model gives):
+    /// the learned rain weight compares like with like. Age-weighted count of hours and of wrong calls.
+    public var amountRainN = 0.0, amountRainWrong = 0.0
+    /// Distinct UTC days with a verified pair, per kind. Hours from one afternoon are strongly correlated,
+    /// so learning requires several *days* of evidence per bucket and source, not just many hours.
+    public var tempDays: Set<Int> = [], windDays: Set<Int> = [], rainDays: Set<Int> = []
 
     public init(source: VerificationSource) { self.source = source }
 
@@ -24,12 +30,19 @@ public struct SourceScore: Codable, Hashable, Sendable {
     public var rainAccuracy: Double? { rainN > 0 ? (hits + correctNegatives) / rainN : nil }
     public var brier: Double? { brierN > 0 ? brierSum / brierN : nil }
 
-    mutating func add(_ f: SourceValues, _ o: ObservedHour, weight: Double) {
+    mutating func add(_ f: SourceValues, _ o: ObservedHour, weight: Double, day: Int = 0) {
         if let ft = f.t, let ot = o.t {
             tempN += weight; tempAbs += weight * abs(ft - ot); tempBias += weight * (ft - ot)
+            tempDays.insert(day)
         }
         if let fw = f.w, let ow = o.w {
             windN += weight; windAbs += weight * abs(fw - ow)
+            windDays.insert(day)
+        }
+        if let wet = o.wet, let amount = f.p {
+            amountRainN += weight
+            if (amount >= 0.2) != wet { amountRainWrong += weight }
+            rainDays.insert(day)
         }
         if let wet = o.wet, let call = f.callsRain {
             switch (call, wet) {
@@ -74,11 +87,13 @@ public enum AccuracyScorer {
             let ageDays = max(0, now.timeIntervalSince(rec.r.valid) / 86400)
             let weight = halfLifeDays > 0 ? pow(0.5, ageDays / halfLifeDays) : 1
             let bucket = rec.r.bucket
+            let day = Int((rec.r.valid.timeIntervalSince1970 / 86400).rounded(.down))
             s.samplesByBucket[bucket, default: 0] += 1
             for (key, values) in rec.r.f {
                 guard let source = VerificationSource(rawValue: key) else { continue }
-                s.overall[source, default: SourceScore(source: source)].add(values, rec.o, weight: weight)
-                s.byBucket[bucket, default: [:]][source, default: SourceScore(source: source)].add(values, rec.o, weight: weight)
+                s.overall[source, default: SourceScore(source: source)].add(values, rec.o, weight: weight, day: day)
+                s.byBucket[bucket, default: [:]][source, default: SourceScore(source: source)]
+                    .add(values, rec.o, weight: weight, day: day)
             }
         }
         return s
@@ -119,7 +134,8 @@ public struct BlendWeights: Codable, Hashable, Sendable {
 
 /// Inverse-error weighting with shrinkage, a floor and a cap.
 ///
-/// For each lead bucket, sources with at least `minSamples` (age-weighted) pairs get
+/// For each lead bucket, sources with at least `minSamples` (age-weighted) pairs on at least
+/// `minDays` distinct days get
 /// `m = (1/err) / mean(1/err)` (so the eligible sources average 1), shrunk toward 1 by
 /// `n / (n + shrink)` and clamped to [`floor`, `cap`]. Ineligible sources, buckets and kinds keep 1,
 /// which is exactly the fixed hand-tuned weighting, so nothing changes until there's enough data.
@@ -141,7 +157,9 @@ public enum AdaptiveWeighting {
                 var errors: [VerificationSource: (err: Double, n: Double)] = [:]
                 for source in VerificationSource.inputs {
                     guard let sc = bySource[source], let e = error(kind, sc) else { continue }
-                    if e.n >= config.minSamples { errors[source] = e }
+                    // The same age-weighted n the Accuracy screen's "ready" uses (see `isReady`), and
+                    // evidence from several distinct days in this bucket, not one correlated afternoon.
+                    if e.n >= config.minSamples, Double(distinctDays(kind, sc)) >= config.minDays { errors[source] = e }
                 }
                 guard errors.count >= 2 else { continue }
                 let inverse = errors.mapValues { 1 / $0.err }
@@ -159,6 +177,20 @@ public enum AdaptiveWeighting {
         return out
     }
 
+    /// True when the learned weights are actually in use: some bucket and kind has at least two
+    /// eligible sources. The Accuracy screen's "ready" uses this, so it can't disagree with the blend.
+    public static func isReady(_ scores: AccuracyScorer.Scores, config: Config = Config()) -> Bool {
+        !weights(from: scores, config: config).isNeutral
+    }
+
+    static func distinctDays(_ kind: BlendWeights.Kind, _ s: SourceScore) -> Int {
+        switch kind {
+        case .temperature: s.tempDays.count
+        case .wind: s.windDays.count
+        case .rain: s.rainDays.count
+        }
+    }
+
     /// The error each kind is weighted on (lower is better), with a small floor so a lucky streak of
     /// perfect scores can't produce an infinite weight.
     static func error(_ kind: BlendWeights.Kind, _ s: SourceScore) -> (err: Double, n: Double)? {
@@ -166,10 +198,11 @@ public enum AdaptiveWeighting {
         case .temperature: return s.tempMAE.map { (max($0, 0.3), s.tempN) }
         case .wind: return s.windMAE.map { (max($0, 1.0), s.windN) }
         case .rain:
-            // One metric for every source (not all of them issue probabilities): the share of hours
-            // called wrong (misses + false alarms), with +1/+2 smoothing.
-            guard s.rainN > 0 else { return nil }
-            return (max((s.misses + s.falseAlarms + 1) / (s.rainN + 2), 0.02), s.rainN)
+            // The same call for every source: forecast amount >= 0.2 mm vs. observed wet hour. (Mixing
+            // "probability >= 50 %" for some sources with "amount" for others compared different things.)
+            // Share of hours called wrong, with +1/+2 smoothing. Sources without amounts (NWS) keep 1x.
+            guard s.amountRainN > 0 else { return nil }
+            return (max((s.amountRainWrong + 1) / (s.amountRainN + 2), 0.02), s.amountRainN)
         }
     }
 }

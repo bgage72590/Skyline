@@ -72,7 +72,7 @@ Tests/SkylineCoreTests/   XCTest with real fixture JSON captured from each API
 | Need | Source | Why |
 | --- | --- | --- |
 | Global forecast | **Open-Meteo** `/v1/forecast` with `models=best_match,gfs_hrrr,ecmwf_ifs025,gfs_seamless,icon_seamless` | Free, no key, one request returns several models side by side. |
-| US official forecast | **NWS api.weather.gov** `/points` → `/forecast` + `/forecast/hourly` | Forecaster-edited National Blend of Models, bias-corrected locally. Requires a User-Agent (set in `URLSessionHTTPClient.userAgent`). |
+| US official forecast | **NWS api.weather.gov** `/points` → `/forecast` + `/forecast/hourly` | Forecaster-edited National Blend of Models, bias-corrected locally. Requires a User-Agent with a contact: `Skyline/1.0 (Brian.gage@gmail.com)` is sent only to api.weather.gov; every other host gets plain `Skyline/1.0` (`URLSessionHTTPClient.userAgent(for:)`). |
 | Alerts | NWS `/alerts/active?point=` | Authoritative US warnings/watches. |
 | Next-2-hours precip | Open-Meteo `minutely_15` | HRRR 15-minute data in the US. |
 | Air quality | Open-Meteo Air Quality (CAMS) | Free US AQI, PM2.5, ozone. |
@@ -136,5 +136,9 @@ Radar stress test (in-process, no synthetic input): `-SkylineOpenRadar YES -Skyl
 -SkylineStressQuit YES` expands/collapses, plays/pauses, scrubs, zooms and changes opacity, logging
 `[stress]` progress and memory to stdout. Overscan hit-test: `-SkylineHitTest YES` (wide layout)
 checks the map ignores scroll over the forecast column (`[hittest] … PASS|FAIL`). The radar opacity slider (card and expanded map) is saved
-as `radarOpacity` (default 70 %); the radar is screen-blended over a muted dark map so labels stay legible.
+as `radarOpacity.v2` (default 60 %, adjustable 5–100 %); the radar is drawn with normal (source-over) compositing over a
+full-emphasis dark map, so roads and town names read through the rain. The idle radar keeps only the shown frame in
+memory; the whole loop is loaded when you press Play or scrub (Play during loading is queued: "starts at 100 %").
+Failed radar tiles are retried after a back-off, after wake and when the network returns. With the main window closed,
+its content (map, radar, background) is torn down and only the menu-bar location refreshes, every 30 min or more.
 * CoreLocation uses one-shot `requestLocation()` at kilometre accuracy, not continuous updates.

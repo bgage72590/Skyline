@@ -22,8 +22,15 @@ final class RadarPlayback {
     var index: Int = 0 {
         didSet { if index != oldValue { notifySinks() } }
     }
-    var isPlaying = false { didSet { updateClock() } }
-    var isVisible = false { didSet { updateClock() } }
+    var isPlaying = false { didSet { updateHoldsLoop(); updateClock() } }
+    var isVisible = false { didSet { updateHoldsLoop(); updateClock() } }
+    /// True while the user drags the radar scrubber (frames are loaded for scrubbing).
+    var isScrubbingRadar = false { didSet { if isScrubbingRadar != oldValue { updateHoldsLoop() } } }
+    /// Whether map views hold every frame of the loop. Only while playing (or queued to play), scrubbing,
+    /// or for `releaseLoopAfter` after that; otherwise just the shown frame's tiles stay in memory.
+    @ObservationIgnored private(set) var holdsLoop = false
+    @ObservationIgnored private var releaseTask: Task<Void, Never>?
+    static let releaseLoopAfter: Duration = .seconds(45)
     /// Fraction (0…1) of all frames' visible tiles that are loaded, reported by the map view.
     private(set) var progress: Double = 0
     private(set) var isLoadingIndex = false
@@ -50,6 +57,8 @@ final class RadarPlayback {
 
     var currentFrame: RadarFrame? { frames.indices.contains(index) ? frames[index] : nil }
     var isReady: Bool { !frames.isEmpty && progress >= 0.98 }
+    /// Play was pressed but the loop is still loading: playback starts by itself when it's ready (R2).
+    var isWaitingToPlay: Bool { isPlaying && !isReady && frames.count > 1 }
     var isRunning: Bool { clock.isOccupied }
 
     /// Picks the right provider for a location and loads the frame index if stale.
@@ -98,7 +107,7 @@ final class RadarPlayback {
                 progressGate.reset()
             }
         } catch {
-            errorMessage = "Radar unavailable: \(error.localizedDescription)"
+            errorMessage = "Radar unavailable: \(UserFacingError.message(error))"
         }
     }
 
@@ -116,6 +125,36 @@ final class RadarPlayback {
 
     func addSink(_ sink: RadarLayerView) { sinks.add(sink) }
     func removeSink(_ sink: RadarLayerView) { sinks.remove(sink) }
+
+    private func updateHoldsLoop() {
+        let wanted = isVisible && (isPlaying || isScrubbingRadar)
+        if wanted {
+            releaseTask?.cancel(); releaseTask = nil
+            guard !holdsLoop else { return }
+            holdsLoop = true
+            // The loop isn't loaded until the map says so: not "ready", so the clock can't step onto
+            // blank frames before the first progress report.
+            progress = 0
+            progressGate.reset()
+            notifyLoopHold()
+        } else if holdsLoop, releaseTask == nil {
+            // Keep the loop briefly (pause → play again is instant), then free all but the shown frame.
+            releaseTask = Task { [weak self] in
+                try? await Task.sleep(for: Self.releaseLoopAfter)
+                guard !Task.isCancelled, let self else { return }
+                self.releaseTask = nil
+                guard !(self.isVisible && (self.isPlaying || self.isScrubbingRadar)) else { return }
+                self.holdsLoop = false
+                self.notifyLoopHold()
+                MemoryRelief.soon()
+            }
+            if !isVisible { releaseTask?.cancel(); releaseTask = nil; holdsLoop = false; notifyLoopHold() }
+        }
+    }
+
+    private func notifyLoopHold() {
+        for case let sink as RadarLayerView in sinks.allObjects { sink.loopHoldChanged() }
+    }
 
     private func notifySinks() {
         let animated = crossfade

@@ -41,7 +41,8 @@ public struct NWSPeriod: Codable, Hashable, Sendable {
     public var startTime: Date
     public var endTime: Date
     public var isDaytime: Bool
-    public var temperatureC: Double
+    /// Nil when NWS sent a blank temperature for this period (its other values are still used).
+    public var temperatureC: Double?
     public var probabilityOfPrecipitation: Double?
     public var relativeHumidity: Double?
     public var windSpeedKmh: Double?
@@ -51,14 +52,14 @@ public struct NWSPeriod: Codable, Hashable, Sendable {
 
     struct Raw: Decodable {
         struct Value: Decodable { var value: Double? }
-        struct Props: Decodable { var periods: [Period] }
+        struct Props: Decodable { var periods: [Lossy<Period>] }
         struct Period: Decodable {
             var name: String?
             var startTime: String
             var endTime: String
             var isDaytime: Bool
-            var temperature: Double
-            var temperatureUnit: String
+            var temperature: Double?
+            var temperatureUnit: String?
             var probabilityOfPrecipitation: Value?
             var relativeHumidity: Value?
             var windSpeed: String?
@@ -70,10 +71,13 @@ public struct NWSPeriod: Codable, Hashable, Sendable {
     }
 
     public static func decodeList(_ data: Data) throws -> [NWSPeriod] {
+        // Per period and per value: a malformed period is skipped and a blank value is nil, instead of
+        // one bad field making the whole forecast fail to decode (NWS then silently vanished from the blend).
         let raw = try JSONDecoder().decode(Raw.self, from: data)
-        return raw.properties.periods.compactMap { p in
-            guard let start = NWSDate.parse(p.startTime), let end = NWSDate.parse(p.endTime) else { return nil }
-            let tempC = p.temperatureUnit.uppercased() == "F" ? (p.temperature - 32) * 5 / 9 : p.temperature
+        return raw.properties.periods.compactMap { lossy in
+            guard let p = lossy.value,
+                  let start = NWSDate.parse(p.startTime), let end = NWSDate.parse(p.endTime) else { return nil }
+            let tempC = p.temperature.map { (p.temperatureUnit ?? "F").uppercased() == "F" ? ($0 - 32) * 5 / 9 : $0 }
             return NWSPeriod(
                 name: p.name ?? "",
                 startTime: start, endTime: end, isDaytime: p.isDaytime,
@@ -116,10 +120,13 @@ public struct NWSPeriod: Codable, Hashable, Sendable {
         return true
     }
 
-    /// Parses "13 mph" or "13 to 17 mph" (takes the upper bound) into km/h.
+    /// Parses "13 mph" or "13 to 17 mph" into km/h. A range gives its midpoint: NWS ranges span the
+    /// period, and the models it's blended and verified against give mean wind, so the upper bound
+    /// biased blended wind high (and NWS's verified wind error up).
     public static func parseWindSpeedKmh(_ s: String) -> Double? {
         let numbers = s.split(whereSeparator: { !$0.isNumber && $0 != "." }).compactMap { Double($0) }
-        guard let v = numbers.max() else { return nil }
+        guard let lo = numbers.min(), let hi = numbers.max() else { return nil }
+        let v = (lo + hi) / 2
         if s.lowercased().contains("km/h") { return v }
         if s.lowercased().contains("kt") { return v * 1.852 }
         return v * 1.609344
@@ -228,4 +235,11 @@ enum NWSDate {
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f.date(from: s)
     }
+}
+
+
+/// Decodes an array element without failing the whole array: a malformed element becomes `value == nil`.
+struct Lossy<T: Decodable>: Decodable {
+    var value: T?
+    init(from decoder: Decoder) throws { value = try? T(from: decoder) }
 }

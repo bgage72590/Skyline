@@ -9,7 +9,10 @@ public actor ResponseCache {
     }
 
     private let directory: URL?
+    /// Recently used entries (the disk holds the rest). Capped so a long session can't grow it forever.
     private var memory: [String: Entry] = [:]
+    private var recency: [String] = []
+    public static let memoryLimit = 48
     private let now: @Sendable () -> Date
 
     /// `directory == nil` gives a memory-only cache (used by tests).
@@ -26,6 +29,27 @@ public actor ResponseCache {
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
         return base.appendingPathComponent("com.briangage.Skyline/responses", isDirectory: true)
     }
+
+    /// Deletes entries older than `maxAge` (default 14 days) so old "My Location" responses don't pile
+    /// up as a timestamped location trail. Unreadable files are deleted too. Call once at launch.
+    public func prune(olderThan maxAge: TimeInterval = 14 * 86400) {
+        let cutoff = now().addingTimeInterval(-maxAge)
+        memory = memory.filter { $0.value.storedAt >= cutoff }
+        recency.removeAll { memory[$0] == nil }
+        guard let directory,
+              let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        else { return }
+        for url in files where url.pathExtension == "plist" {
+            guard let raw = try? Data(contentsOf: url),
+                  let e = try? PropertyListDecoder().decode(Entry.self, from: raw) else {
+                try? FileManager.default.removeItem(at: url); continue
+            }
+            if e.storedAt < cutoff { try? FileManager.default.removeItem(at: url) }
+        }
+    }
+
+    /// Number of entries held in memory (for tests).
+    public var memoryCount: Int { memory.count }
 
     /// Returns cached data younger than `maxAge`, else nil.
     public func fresh(_ key: String, maxAge: TimeInterval) -> Data? {
@@ -45,7 +69,7 @@ public actor ResponseCache {
 
     public func store(_ data: Data, for key: String) {
         let e = Entry(storedAt: now(), data: data)
-        memory[key] = e
+        remember(e, for: key)
         guard let url = fileURL(key) else { return }
         if let encoded = try? PropertyListEncoder().encode(e) {
             try? encoded.write(to: url, options: .atomic)
@@ -53,11 +77,25 @@ public actor ResponseCache {
     }
 
     private func entry(_ key: String) -> Entry? {
-        if let e = memory[key] { return e }
+        if let e = memory[key] { touch(key); return e }
         guard let url = fileURL(key), let raw = try? Data(contentsOf: url),
               let e = try? PropertyListDecoder().decode(Entry.self, from: raw) else { return nil }
-        memory[key] = e
+        remember(e, for: key)
         return e
+    }
+
+    private func remember(_ e: Entry, for key: String) {
+        memory[key] = e
+        touch(key)
+        // Memory-only caches (tests) have nowhere else to keep entries, so only disk-backed ones evict.
+        while directory != nil, recency.count > Self.memoryLimit {
+            memory[recency.removeFirst()] = nil
+        }
+    }
+
+    private func touch(_ key: String) {
+        if let i = recency.lastIndex(of: key) { recency.remove(at: i) }
+        recency.append(key)
     }
 
     private func fileURL(_ key: String) -> URL? {

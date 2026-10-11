@@ -16,6 +16,13 @@ public struct Coordinate: Codable, Hashable, Sendable {
                    longitude: (longitude * 10_000).rounded() / 10_000)
     }
 
+    /// Rounded to 2 decimals (~1.1 km): plenty for weather (HRRR is 3 km, NWS grid 2.5 km) and
+    /// doesn't pinpoint a house. Used for the device location before it leaves the Mac or is stored.
+    public var coarse: Coordinate {
+        Coordinate(latitude: (latitude * 100).rounded() / 100,
+                   longitude: (longitude * 100).rounded() / 100)
+    }
+
     /// True when the point is inside NWS coverage (CONUS, Alaska, Hawaii, Puerto Rico / USVI, Guam).
     /// Coarse bounding boxes; NWS 404s are still handled gracefully for edge cases.
     public var isLikelyInNWSCoverage: Bool {

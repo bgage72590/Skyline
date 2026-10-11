@@ -30,14 +30,20 @@ struct LocationDetailView: View {
                 if isWide { wideLayout(report) } else { narrowLayout(report) }
             } else if let error = store.errors[location.id] {
                 VStack(spacing: 12) {
-                    Image(systemName: "wifi.exclamationmark").font(.system(size: 44))
+                    Image(systemName: error.hasPrefix("You’re offline") ? "wifi.slash" : "exclamationmark.icloud")
+                        .font(.system(size: 44))
                     Text("Couldn’t load weather for \(location.name)").font(.title3)
-                    Text(error).font(.caption).foregroundStyle(Glass.secondaryText)
+                    Text(error).font(.callout)
+                    Text("Skyline will try again automatically.").font(.caption).foregroundStyle(Glass.secondaryText)
                     Button("Try Again") { Task { await store.load(location, force: true) } }
+                        .disabled(store.isLoading(location))
                 }
+                .multilineTextAlignment(.center)
+                .padding(24)
+                .glassCard(cornerRadius: 18)
                 .foregroundStyle(.white)
             } else {
-                ProgressView().controlSize(.large)
+                LoadingStateView(location: location)
             }
         }
         // Old or offline data says so (overlay: never resizes the forecast column or the map).
@@ -109,14 +115,15 @@ struct LocationDetailView: View {
             .frame(width: showColumn ? 420 : 0, alignment: .leading)
             .clipped()
             .padding(.trailing, showColumn ? 14 : 0)
-            // Memory: showing/hiding the column must not resize the MKMapView (each resize reallocates its
-            // Metal drawables and reloads vector tiles: the stress-test peak driver). The radar panel
-            // gives the map a matching overscan instead, and the layout change snaps (the column fades).
+            // Memory: the map is sized to the visible panel (no overscan under the column): its Metal
+            // drawables and MSAA targets scale with its pixel area, and the overscan cost ~40 MB in the
+            // default window (E1). Showing/hiding the column snaps (no animation), so the map is resized
+            // once per toggle, never per animation frame (that was the old memory-peak driver).
             .transaction(value: showColumn) { $0.animation = nil }
             .opacity(showColumn ? 1 : 0)
             .allowsHitTesting(showColumn)
             RadarPanel(location: location, pinText: pin, alerts: report.activeAlerts(),
-                       mapOverscan: showColumn ? (420 + 14) / 2 : 0)
+                       mapOverscan: 0)
                 .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
                 .transaction(value: showColumn) { $0.animation = nil }
         }
@@ -530,5 +537,34 @@ struct StaleDataBanner: View {
         .background(Color.black.opacity(0.6), in: Capsule())
         .overlay(Capsule().strokeBorder(.orange.opacity(0.7), lineWidth: 1))
         .help(error ?? "The forecast hasn’t been refreshed recently.")
+    }
+}
+
+/// First load for a place (T14): what's happening and from where, instead of a bare spinner; after a
+/// while it says it's still waiting, so a slow service doesn't look like a hang.
+struct LoadingStateView: View {
+    let location: WeatherLocation
+    @State private var shownAt = Date()
+
+    var body: some View {
+        TimelineView(.periodic(from: shownAt, by: 4)) { context in
+            let slow = context.date.timeIntervalSince(shownAt) > 8
+            VStack(spacing: 12) {
+                ProgressView().controlSize(.large).tint(.white)
+                Text("Loading weather for \(location.isCurrentLocation ? "your location" : location.name)…")
+                    .font(.title3)
+                Text(slow ? "Still waiting for the weather services. This can take a little longer when they’re busy."
+                     : location.coordinate.isLikelyInNWSCoverage
+                        ? "Blending forecast models with the National Weather Service"
+                        : "Blending forecast models")
+                    .font(.callout)
+                    .foregroundStyle(Glass.secondaryText)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 320)
+            }
+            .padding(28)
+            .glassCard(cornerRadius: 18)
+            .foregroundStyle(.white)
+        }
     }
 }

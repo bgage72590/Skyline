@@ -96,6 +96,10 @@ public enum ForecastBlender {
         guard !times.isEmpty else { return [] }
         let models = om.modelsWithData
         let nwsByHour = Dictionary(nwsHourly.map { (hourKey($0.startTime), $0) }, uniquingKeysWith: { a, _ in a })
+        // Open-Meteo's precipitation fields at time T cover the *preceding* hour (T-1, T]; the NWS hourly
+        // period covering that same hour is the one that *ends* at T. Instantaneous values (temperature,
+        // wind, humidity) pair with the period starting at T as before.
+        let nwsByEndHour = Dictionary(nwsHourly.map { (hourKey($0.endTime), $0) }, uniquingKeysWith: { a, _ in a })
 
         func col(_ v: String, _ m: ForecastModel) -> [Double?] { om.hourlyColumn(v, model: m) ?? [] }
         func at(_ c: [Double?], _ i: Int) -> Double? { i < c.count ? c[i] : nil }
@@ -116,6 +120,7 @@ public enum ForecastBlender {
         for (i, time) in times.enumerated() {
             let lead = max(0, time.timeIntervalSince(now) / 3600)
             let nws = nwsByHour[hourKey(time)]
+            let nwsPrecip = nwsByEndHour[hourKey(time)]
 
             func w(_ source: Source, _ variable: String) -> Double {
                 weight(source, variable: variable, leadHours: lead)
@@ -134,7 +139,7 @@ public enum ForecastBlender {
             let temps = tempSamples.compactMap(\.value)
             let spread = temps.count > 1 ? (temps.max()! - temps.min()!) : nil
 
-            var pop = weightedMean(samples("precipitation_probability", nwsValue: nws?.probabilityOfPrecipitation))
+            var pop = weightedMean(samples("precipitation_probability", nwsValue: nwsPrecip?.probabilityOfPrecipitation))
             var precip = weightedMean(samples("precipitation"))
             // Short range: lean on the 15-minute nowcast for the hour ending at `time`.
             // `time` ends the hour; the hour under way (start before now) counts as lead 0.
@@ -420,6 +425,24 @@ public enum ForecastBlender {
     }
 
     static func hourKey(_ date: Date) -> Int { Int(date.timeIntervalSince1970 / 3600) }
+
+    /// The blended temperature at `date`, linearly interpolated between the surrounding blended hours,
+    /// with the matching apparent temperature. Used for the headline "now" temperature so it benefits from
+    /// the blend and NWS instead of being one model's (Open-Meteo best_match) current value.
+    public static func temperature(at date: Date, hourly: [HourlyForecast]) -> (temperature: Double, apparent: Double?)? {
+        guard let next = hourly.firstIndex(where: { $0.time >= date }) else { return nil }
+        let b = hourly[next]
+        if b.time == date || next == 0 {
+            guard abs(b.time.timeIntervalSince(date)) <= 3600 else { return nil }
+            return (b.temperature, b.apparentTemperature)
+        }
+        let a = hourly[next - 1]
+        let span = b.time.timeIntervalSince(a.time)
+        guard span > 0, span <= 2 * 3600 else { return nil }
+        let f = date.timeIntervalSince(a.time) / span
+        let apparent = a.apparentTemperature.flatMap { x in b.apparentTemperature.map { x + (($0 - x) * f) } }
+        return (a.temperature + (b.temperature - a.temperature) * f, apparent)
+    }
 }
 
 public enum Nowcast {

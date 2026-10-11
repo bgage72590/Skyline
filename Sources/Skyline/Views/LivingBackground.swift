@@ -22,26 +22,36 @@ struct LivingBackground: View {
             SkyPalette.gradient(for: report)
             if let kind = Particles.Kind(category) {
                 let canAnimate = store.isMainWindowVisible && !store.isScrubbing && !reduceMotion && !settled
-                TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !canAnimate)) { context in
-                    let t = min(context.date.timeIntervalSince(armedAt), Self.animateFor)
-                    Canvas(rendersAsynchronously: true) { gc, size in
-                        Particles.draw(kind, in: &gc, size: size, time: t + 1000)
+                Group {
+                    if canAnimate {
+                        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: false)) { context in
+                            let t = min(context.date.timeIntervalSince(armedAt), Self.animateFor)
+                            Canvas(rendersAsynchronously: true) { gc, size in
+                                Particles.draw(kind, in: &gc, size: size, time: t + 1000)
+                            }
+                        }
+                    } else if store.isMainWindowVisible {
+                        // Still: one plain Canvas frame. No display link and no asynchronous-render
+                        // surface stay alive while nothing moves (E1).
+                        let t = min(Date().timeIntervalSince(armedAt), Self.animateFor)
+                        Canvas { gc, size in Particles.draw(kind, in: &gc, size: size, time: t + 1000) }
                     }
+                    // Window hidden or occluded: no particle layer at all.
                 }
                 .opacity(0.32)
                 .allowsHitTesting(false)
-                .task(id: "\(report?.location.id ?? "")-\(category.rawValue)") {
-                    // Re-armed per location/condition; afterwards the timeline is paused (a still frame).
-                    armedAt = Date()
-                    settled = false
-                    try? await Task.sleep(for: .seconds(Self.animateFor))
-                    if !Task.isCancelled { settled = true }
-                }
             }
             // Dim behind text: a soft vignette at the top where the hero sits.
             LinearGradient(colors: [.black.opacity(0.18), .clear, .black.opacity(0.12)], startPoint: .top, endPoint: .bottom)
         }
         .ignoresSafeArea()
+        .task(id: "\(report?.location.id ?? "")-\(category.rawValue)") {
+            // Re-armed per location/condition; afterwards a still frame is shown.
+            armedAt = Date()
+            settled = false
+            try? await Task.sleep(for: .seconds(Self.animateFor))
+            if !Task.isCancelled { settled = true }
+        }
     }
 
     @State private var settled = false

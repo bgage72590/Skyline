@@ -155,9 +155,10 @@ final class RadarMapContainer: NSView {
     init(interactive: Bool) {
         super.init(frame: .zero)
         Self.live += 1
-        // Dark, muted base map: roads, coastlines and labels stay legible through a ~70 % radar layer.
+        // Dark base map at full emphasis (not muted): brighter roads and higher-contrast town labels read
+        // through the ~60 % source-over radar layer (R1), RadarScope/MyRadar style.
         map.appearance = NSAppearance(named: .darkAqua)
-        let config = MKStandardMapConfiguration(elevationStyle: .flat, emphasisStyle: .muted)
+        let config = MKStandardMapConfiguration(elevationStyle: .flat, emphasisStyle: .default)
         config.pointOfInterestFilter = .excludingAll
         map.preferredConfiguration = config
         // Radar is meaningless at street level (NEXRAD's finest tiles are ~1 km) and MapKit's vector
@@ -443,7 +444,8 @@ final class RadarLayerView: NSView {
     private var desired: [TileKey] = []
     private var keep: Set<TileKey> = []
     private var index = 0
-    private var opacity: Float = 0.7
+    private var opacity: Float = Float(RadarOpacity.defaultValue)
+    private var retryObserver: NSObjectProtocol?
 
     private weak var playback: RadarPlayback?
     private var follows = true
@@ -454,9 +456,42 @@ final class RadarLayerView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.masksToBounds = true
-        // Screen-blend the radar over the dark base map: white labels, roads and coastlines can't be
-        // darkened by it, so they stay legible through the radar while precipitation colours show fully.
-        layer?.compositingFilter = CIFilter(name: "CIScreenBlendMode")
+        // Normal source-over compositing (R1). The old screen blend washed the radar out (colours
+        // brightened toward white over light map areas) and still hid the map under heavy echoes. A
+        // ~60 % source-over layer over the higher-contrast base map lets roads and town names read
+        // through the rain, like RadarScope/MyRadar.
+        // Failed tiles are asked for again after a back-off, on wake and when the network returns (T15).
+        retryObserver = NotificationCenter.default.addObserver(forName: RadarImageCache.retryNotification, object: nil,
+                                                               queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.retryMissingTiles() }
+        }
+    }
+
+    deinit {
+        if let retryObserver { NotificationCenter.default.removeObserver(retryObserver) }
+    }
+
+    /// Re-requests tiles marked missing whose failure verdict has expired (back-off over, wake, network
+    /// back). Event-driven from a notification on the main queue: never inside layout.
+    private func retryMissingTiles() {
+        var changed = false
+        for g in [active, pending].compactMap({ $0 }) {
+            for i in g.frames.indices where !g.missing[i].isEmpty {
+                let frame = g.frames[i]
+                let before = g.missing[i].count
+                g.missing[i] = g.missing[i].filter { key in
+                    guard let url = frame.url(z: key.z, x: key.x, y: key.y) else { return true }
+                    return RadarImageCache.shared.recentlyFailed(url)
+                }
+                if g.missing[i].count != before { changed = true }
+            }
+        }
+        if changed { updateTiles(allowZoomChange: false) }
+    }
+
+    /// Playback started/stopped needing the whole loop: load it, or release every frame but the one shown.
+    func loopHoldChanged() {
+        updateTiles(allowZoomChange: false)
     }
 
     @available(*, unavailable)
@@ -561,11 +596,13 @@ final class RadarLayerView: NSView {
         return MapRectValue(x: v.origin.x + dx, y: v.origin.y, width: v.size.width - 2 * dx, height: v.size.height)
     }
 
-    /// Frames this view needs loaded: all of them when following playback, else only the one shown.
+    /// Frames this view needs loaded: all of them while playback needs the loop (playing, scrubbing, or
+    /// just paused), else only the one shown. An idle radar holds one frame of tiles instead of 11-13,
+    /// and frames not in the current loop are released (E1).
     private func neededFrames(_ g: Generation) -> [Int] {
         guard !g.frames.isEmpty else { return [] }
         let shown = min(max(index, 0), g.frames.count - 1)
-        guard follows else { return [shown] }
+        guard follows, playback?.holdsLoop == true else { return [shown] }
         var order = [shown]
         for i in g.frames.indices.reversed() where i != shown { order.append(i) } // newest → oldest
         return order

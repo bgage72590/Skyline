@@ -13,6 +13,10 @@ public enum ForecastSampler {
         let leadSet = Set(leads)
         let nwsByHour = Dictionary(nwsHourly.map { (Int($0.startTime.timeIntervalSince1970 / 3600), $0) },
                                    uniquingKeysWith: { a, _ in a })
+        // Rain chance pairs with the NWS period that ends at the valid time (the observed "wet" hour and
+        // Open-Meteo's precipitation fields cover the hour *ending* then).
+        let nwsByEndHour = Dictionary(nwsHourly.map { (Int($0.endTime.timeIntervalSince1970 / 3600), $0) },
+                                      uniquingKeysWith: { a, _ in a })
         let blendByHour = Dictionary(blended.map { (Int($0.time.timeIntervalSince1970 / 3600), $0) },
                                      uniquingKeysWith: { a, _ in a })
         var columns: [ForecastModel: [String: [Double?]]] = [:]
@@ -36,9 +40,9 @@ public enum ForecastSampler {
                 if !v.isEmpty { f[VerificationSource(m).rawValue] = v }
             }
             let hourKey = Int(time.timeIntervalSince1970 / 3600)
-            if let n = nwsByHour[hourKey] {
-                f[VerificationSource.nws.rawValue] = SourceValues(t: n.temperatureC, pop: n.probabilityOfPrecipitation, w: n.windSpeedKmh)
-            }
+            let n = nwsByHour[hourKey], np = nwsByEndHour[hourKey]
+            let nv = SourceValues(t: n?.temperatureC, pop: np?.probabilityOfPrecipitation, w: n?.windSpeedKmh)
+            if !nv.isEmpty { f[VerificationSource.nws.rawValue] = nv }
             if let b = blendByHour[hourKey] {
                 f[VerificationSource.blend.rawValue] = SourceValues(t: b.temperature, pop: b.precipitationProbability,
                                                                     p: b.precipitation, w: b.windSpeed)
