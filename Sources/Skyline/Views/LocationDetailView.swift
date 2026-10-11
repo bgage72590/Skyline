@@ -223,7 +223,18 @@ struct ForecastColumn: View {
             .onGeometryChange(for: CGFloat.self) { $0.frame(in: .scrollView).minY } action: { ScrollProbe.heroMinY = $0 }
         }
         .scrollIndicators(.never)
-        .task { await ScrollProbe.runIfRequested(store: store, report: report, proxy: proxy) }
+        .task {
+            // Serve overscan hit-test scroll requests; also run the optional scroll-preservation QA.
+            for _ in 0..<120 { // ~30 s
+                if ScrollProbe.pendingScrollToDaily {
+                    ScrollProbe.pendingScrollToDaily = false
+                    proxy.scrollTo(ScrollProbe.dailyID, anchor: .top)
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+                if Task.isCancelled { break }
+            }
+            await ScrollProbe.runIfRequested(store: store, report: report, proxy: proxy)
+        }
         }
         .foregroundStyle(.white)
     }
@@ -237,9 +248,16 @@ enum ScrollProbe {
     static let dailyID = "forecast-daily"
     /// Hero's minY in the scroll view's coordinate space (= −offset). Plain static; never observed.
     static var heroMinY: CGFloat = 0
+    /// Set by OverscanHitProbe; ForecastColumn scrolls to the 10-day card once, then clears it.
+    static var pendingScrollToDaily = false
     private static var ran = false
 
     static func runIfRequested(store: WeatherStore, report: WeatherReport, proxy: ScrollViewProxy) async {
+        // Serve a one-shot scroll request from the overscan hit-test probe (no observed state).
+        if pendingScrollToDaily {
+            pendingScrollToDaily = false
+            proxy.scrollTo(dailyID, anchor: .top)
+        }
         guard UserDefaults.standard.bool(forKey: "SkylineScrollTest"), !ran else { return }
         func log(_ s: String) { print("[scrolltest] \(s)"); fflush(stdout) }
         // Wait for the window/layout to settle; a column replaced meanwhile (wide↔narrow) cancels this.

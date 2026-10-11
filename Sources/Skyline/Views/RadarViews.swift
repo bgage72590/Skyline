@@ -139,6 +139,8 @@ struct ExpandedRadarView: View {
                 .padding(.horizontal, -mapOverscan)
         }
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        // Match clip for hit testing (clipShape alone does not); AppKit overscan is gated in hitTest(_:).
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         // No matched-geometry morph from the card: it resized the MKMapView on every animation frame
         // (~100 MB of transient Metal/IOSurface memory per expand). The overlay scales+fades in instead
         // (a render transform, no re-layout of the map).

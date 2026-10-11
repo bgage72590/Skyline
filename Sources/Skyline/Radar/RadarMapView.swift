@@ -203,6 +203,17 @@ final class RadarMapContainer: NSView {
         }
     }
 
+    /// Visible card is `bounds` inset by `overscan` on each side. SwiftUI `.clipShape` only clips
+    /// drawing; without this, the invisible overscan still receives trackpad scroll/zoom and pans
+    /// the map while the pointer is over the forecast column.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard overscan > 0 else { return super.hitTest(point) }
+        let local = convert(point, from: superview)
+        let visible = bounds.insetBy(dx: overscan, dy: 0)
+        guard visible.contains(local) else { return nil }
+        return super.hitTest(point)
+    }
+
     override func layout() {
         super.layout()
         map.frame = bounds

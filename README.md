@@ -113,6 +113,7 @@ Confidence module shows each source's high/low and its blend weight for the chos
 arguments for QA screenshots: `-SkylineOpenRadar YES`, `-SkylineOpenModule <conditions|uv|wind|…>`.
 Radar stress test (in-process, no synthetic input): `-SkylineOpenRadar YES -SkylineStressTest <seconds>
 -SkylineStressQuit YES` expands/collapses, plays/pauses, scrubs, zooms and changes opacity, logging
-`[stress]` progress and memory to stdout. The radar opacity slider (card and expanded map) is saved
+`[stress]` progress and memory to stdout. Overscan hit-test: `-SkylineHitTest YES` (wide layout)
+checks the map ignores scroll over the forecast column (`[hittest] … PASS|FAIL`). The radar opacity slider (card and expanded map) is saved
 as `radarOpacity` (default 70 %); the radar is screen-blended over a muted dark map so labels stay legible.
 * CoreLocation uses one-shot `requestLocation()` at kilometre accuracy, not continuous updates.
