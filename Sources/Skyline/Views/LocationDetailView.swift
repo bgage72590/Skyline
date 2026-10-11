@@ -76,21 +76,30 @@ struct LocationDetailView: View {
         let pin = store.units.temperatureString(report.current.temperature)
         let showColumn = !store.radarExpanded
         // Forecast column next to the sidebar, the large radar on the far right.
-        return HStack(spacing: 14) {
-            if showColumn {
-                Group {
-                    if let selection = store.activeModule {
-                        ModuleDetailView(report: report, selection: selection, inspector: true)
-                            .id(selection.id + (selection.day.map { "\($0.timeIntervalSince1970)" } ?? ""))
-                            .transition(.move(edge: .leading).combined(with: .opacity))
-                    } else {
-                        ForecastColumn(report: report, location: location, radarNamespace: radarNamespace,
-                                       showsRadarCard: false, onOpen: open)
-                            .transition(.opacity)
-                    }
+        // The forecast column is ALWAYS in the view tree (same identity), so opening/closing a module
+        // detail or expanding the radar never rebuilds its ScrollView and the scroll position survives:
+        // the detail is laid over it, and "expanded radar" collapses the slot to zero width (clipped)
+        // while the column keeps its own fixed 420 pt layout inside.
+        let detailOpen = store.activeModule != nil
+        return HStack(spacing: 0) {
+            ZStack(alignment: .top) {
+                ForecastColumn(report: report, location: location, radarNamespace: radarNamespace,
+                               showsRadarCard: false, onOpen: open)
+                    .opacity(detailOpen ? 0 : 1)
+                    .allowsHitTesting(!detailOpen)
+                    .accessibilityHidden(detailOpen)
+                if let selection = store.activeModule {
+                    ModuleDetailView(report: report, selection: selection, inspector: true)
+                        .id(selection.id + (selection.day.map { "\($0.timeIntervalSince1970)" } ?? ""))
+                        .transition(.move(edge: .leading).combined(with: .opacity))
                 }
-                .frame(width: 420)
             }
+            .frame(width: 420)
+            .frame(width: showColumn ? 420 : 0, alignment: .leading)
+            .clipped()
+            .opacity(showColumn ? 1 : 0)
+            .allowsHitTesting(showColumn)
+            .padding(.trailing, showColumn ? 14 : 0)
             RadarPanel(location: location, pinText: pin, alerts: report.alerts)
                 .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -100,34 +109,40 @@ struct LocationDetailView: View {
 
     // MARK: Narrow
 
-    @ViewBuilder
+    /// The forecast column is the base view; the expanded radar and the module panel live in an
+    /// overlay, so they can never resize the column (a tall panel used to grow the stack, shrink the
+    /// scroll range and reset the scroll position) or change its identity.
     private func narrowLayout(_ report: WeatherReport) -> some View {
         ForecastColumn(report: report, location: location, radarNamespace: radarNamespace,
                        showsRadarCard: true, onOpen: open)
             .frame(maxWidth: 760)
-            .frame(maxWidth: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .opacity(store.radarExpanded ? 0 : 1)
-            .scrollDisabled(store.radarExpanded || store.activeModule != nil)
-
-        if store.radarExpanded {
-            ExpandedRadarView(location: location, pinText: store.units.temperatureString(report.current.temperature),
-                              alerts: report.alerts, namespace: radarNamespace)
-                .padding(14)
-                .transition(.opacity)
-                .zIndex(2)
-        }
-        if let selection = store.activeModule {
-            Color.black.opacity(0.45)
-                .ignoresSafeArea()
-                .onTapGesture { withAnimation(.spring(response: 0.38, dampingFraction: 0.9)) { store.activeModule = nil } }
-                .transition(.opacity)
-                .zIndex(3)
-            ModuleDetailView(report: report, selection: selection)
-                .id(selection.id + (selection.day.map { "\($0.timeIntervalSince1970)" } ?? ""))
-                .padding(30)
-                .transition(.scale(scale: 0.94).combined(with: .opacity))
-                .zIndex(4)
-        }
+            // No .scrollDisabled toggle: the overlay above takes the pointer instead.
+            .allowsHitTesting(!store.radarExpanded && store.activeModule == nil)
+            .overlay {
+                ZStack {
+                    if store.radarExpanded {
+                        ExpandedRadarView(location: location, pinText: store.units.temperatureString(report.current.temperature),
+                                          alerts: report.alerts, namespace: radarNamespace)
+                            .padding(14)
+                            .transition(.opacity)
+                            .zIndex(2)
+                    }
+                    if let selection = store.activeModule {
+                        Color.black.opacity(0.45)
+                            .ignoresSafeArea()
+                            .onTapGesture { withAnimation(.spring(response: 0.38, dampingFraction: 0.9)) { store.activeModule = nil } }
+                            .transition(.opacity)
+                            .zIndex(3)
+                        ModuleDetailView(report: report, selection: selection)
+                            .id(selection.id + (selection.day.map { "\($0.timeIntervalSince1970)" } ?? ""))
+                            .padding(30)
+                            .transition(.scale(scale: 0.94).combined(with: .opacity))
+                            .zIndex(4)
+                    }
+                }
+            }
     }
 
     private func open(_ module: DetailModule, day: Date?) {
@@ -164,6 +179,7 @@ struct ForecastColumn: View {
 
     var body: some View {
         let units = store.units
+        ScrollViewReader { proxy in
         ScrollView {
             LazyVStack(spacing: 14, pinnedViews: [.sectionHeaders]) {
                 HeroView(report: report, units: units)
@@ -184,6 +200,7 @@ struct ForecastColumn: View {
                     }
                     HourlyCard(report: report, units: units) { onOpen(.conditions, nil) }
                     DailyCard(report: report, units: units) { onOpen(.conditions, $0) }
+                        .id(ScrollProbe.dailyID)
                     if showsRadarCard {
                         RadarCard(location: location, pinText: units.temperatureString(report.current.temperature),
                                   alerts: report.alerts, namespace: radarNamespace)
@@ -196,9 +213,50 @@ struct ForecastColumn: View {
             }
             .padding(.horizontal, showsRadarCard ? 22 : 0)
             .padding(.bottom, 26)
+            // QA probe: the content's top in scroll-view space (= −offset) into an unobserved box.
+            .onGeometryChange(for: CGFloat.self) { $0.frame(in: .scrollView).minY } action: { ScrollProbe.heroMinY = $0 }
         }
         .scrollIndicators(.never)
+        .task { await ScrollProbe.runIfRequested(store: store, report: report, proxy: proxy) }
+        }
         .foregroundStyle(.white)
+    }
+}
+
+/// QA hook `-SkylineScrollTest YES`: scrolls the forecast column to the 10-day card, opens and closes a
+/// day's detail, expands and collapses the radar, and prints the offset before/after each step
+/// (`[scrolltest] … PASS|FAIL`). With `-SkylineStressQuit YES` it quits afterwards. Inert otherwise.
+@MainActor
+enum ScrollProbe {
+    static let dailyID = "forecast-daily"
+    /// Hero's minY in the scroll view's coordinate space (= −offset). Plain static; never observed.
+    static var heroMinY: CGFloat = 0
+    private static var ran = false
+
+    static func runIfRequested(store: WeatherStore, report: WeatherReport, proxy: ScrollViewProxy) async {
+        guard UserDefaults.standard.bool(forKey: "SkylineScrollTest"), !ran else { return }
+        func log(_ s: String) { print("[scrolltest] \(s)"); fflush(stdout) }
+        // Wait for the window/layout to settle; a column replaced meanwhile (wide↔narrow) cancels this.
+        try? await Task.sleep(for: .seconds(3))
+        guard !Task.isCancelled, !ran else { return }
+        ran = true
+        proxy.scrollTo(dailyID, anchor: .top)
+        try? await Task.sleep(for: .seconds(1.5))
+        let before = heroMinY
+        store.activeModule = ModuleSelection(module: .conditions, day: report.daily.dropFirst().first?.date)
+        try? await Task.sleep(for: .seconds(2))
+        log(String(format: "duringDetail=%.0f", heroMinY))
+        store.activeModule = nil
+        try? await Task.sleep(for: .seconds(2))
+        let afterDetail = heroMinY
+        store.radarExpanded = true
+        try? await Task.sleep(for: .seconds(2))
+        store.radarExpanded = false
+        try? await Task.sleep(for: .seconds(2))
+        let afterRadar = heroMinY
+        let ok = before < -100 && abs(afterDetail - before) < 2 && abs(afterRadar - before) < 2
+        log(String(format: "before=%.0f afterDetail=%.0f afterRadar=%.0f %@", before, afterDetail, afterRadar, ok ? "PASS" : "FAIL"))
+        if UserDefaults.standard.bool(forKey: "SkylineStressQuit") { NSApp.terminate(nil) }
     }
 }
 

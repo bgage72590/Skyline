@@ -78,11 +78,14 @@ struct ModuleDetailView: View {
                 .frame(maxHeight: .infinity, alignment: .top)
                 .glassPanel(cornerRadius: 16)
         } else {
-            panel
-                .frame(maxWidth: 760)
-                .fixedSize(horizontal: false, vertical: true)
-                .glassPanel()
-                .shadow(color: .black.opacity(0.3), radius: 30, y: 10)
+            // Hugs its content when it fits; scrolls inside the panel when the window is short.
+            ViewThatFits(in: .vertical) {
+                panel.fixedSize(horizontal: false, vertical: true)
+                ScrollView { panel }.scrollIndicators(.automatic)
+            }
+            .frame(maxWidth: 760)
+            .glassPanel()
+            .shadow(color: .black.opacity(0.3), radius: 30, y: 10)
         }
     }
 
