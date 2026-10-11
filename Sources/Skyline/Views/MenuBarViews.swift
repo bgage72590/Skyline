@@ -33,11 +33,18 @@ struct MenuBarContentView: View {
                         .font(.callout.weight(.semibold))
                         .foregroundStyle(AlertsCard.color(alert.severity))
                 }
-                if let nowcast = report.nowcastSummary {
-                    Label(nowcast, systemImage: "umbrella.fill").font(.callout)
+                Text(Briefing.headline(report, now: report.current.time,
+                                       hourLabel: { Fmt.hour($0, report.timeZone) },
+                                       delta: { Int(store.units.temperatureDelta($0).rounded()) }))
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                if Briefing.rainDueSoon(report, now: report.current.time) {
+                    MiniNowcast(report: report).frame(height: 46)
                 }
                 hourly(report)
+                chips(report)
                 daily(report)
+                otherLocations(report)
             } else if let location = store.menuBarLocation {
                 HStack {
                     ProgressView().controlSize(.small)
@@ -128,6 +135,67 @@ struct MenuBarContentView: View {
         .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
+    /// UV, air quality and peak gust at a glance.
+    private func chips(_ report: WeatherReport) -> some View {
+        let tz = report.timeZone
+        let gust = Briefing.peak(report.hourly.compactMap { h in h.windGust.map { (h.time, $0) } }, from: report.current.time, hours: 24)
+        return HStack(spacing: 6) {
+            if let uv = report.current.uvIndex {
+                chip("sun.max.fill", "UV \(Int(uv.rounded()))", UVScale.category(uv))
+            }
+            if let aq = report.airQuality {
+                chip("aqi.medium", "AQI \(aq.usAQI)", aq.category)
+            }
+            if let gust, gust.value > 0 {
+                chip("wind", "Gust \(store.units.speedString(gust.value))", Fmt.hour(gust.time, tz))
+            }
+        }
+    }
+
+    private func chip(_ symbol: String, _ value: String, _ caption: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Label(value, systemImage: symbol).font(.caption.weight(.semibold)).lineLimit(1)
+            Text(caption).font(.caption2).opacity(0.8).lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    /// The other saved locations: one tap opens them in the main window.
+    @ViewBuilder
+    private func otherLocations(_ report: WeatherReport) -> some View {
+        let others = store.allLocations.filter { $0.id != report.location.id }.prefix(5)
+        if !others.isEmpty {
+            VStack(spacing: 2) {
+                ForEach(Array(others)) { location in
+                    let r = store.reports[location.id]
+                    Button {
+                        store.selectedID = location.id
+                        openWindow(id: SceneID.main)
+                        NSApp.activate()
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text(location.isCurrentLocation ? "My Location" : location.name).lineLimit(1)
+                            Spacer()
+                            if let r { WeatherSymbol(condition: r.current.condition, isDay: r.current.isDay, size: 13) }
+                            Text(store.units.temperatureString(r?.current.temperature)).monospacedDigit()
+                                .frame(width: 38, alignment: .trailing)
+                        }
+                        .font(.callout)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, 4)
+            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+    }
+
     private func daily(_ report: WeatherReport) -> some View {
         let days = Array(report.daily.prefix(5))
         let low = days.map(\.low).min() ?? 0
@@ -173,5 +241,42 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 460)
         .padding()
+    }
+}
+
+/// Compact next-2-hours rain curve for the menu-bar dropdown (same interpolation as the main card).
+struct MiniNowcast: View {
+    let report: WeatherReport
+
+    var body: some View {
+        let start = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 / 60).rounded(.down) * 60)
+        let samples = NowcastCurve.samples(report.minutely, from: start, minutes: 120, step: 2)
+        VStack(spacing: 2) {
+            GeometryReader { geo in
+                let w = geo.size.width, h = geo.size.height
+                let pts = samples.enumerated().map { i, s in
+                    CGPoint(x: w * CGFloat(i) / CGFloat(max(samples.count - 1, 1)), y: h - h * CGFloat(NowcastCurve.level(s.rate) / 3))
+                }
+                ZStack {
+                    ForEach([1.0, 2.0], id: \.self) { l in
+                        Rectangle().fill(.white.opacity(0.15)).frame(height: 0.5).position(x: w / 2, y: h - h * l / 3)
+                    }
+                    Path { p in
+                        p.move(to: CGPoint(x: 0, y: h))
+                        pts.forEach { p.addLine(to: $0) }
+                        p.addLine(to: CGPoint(x: w, y: h))
+                        p.closeSubpath()
+                    }
+                    .fill(LinearGradient(colors: [Color(red: 0.36, green: 0.72, blue: 1.0).opacity(0.9),
+                                                  Color(red: 0.36, green: 0.72, blue: 1.0).opacity(0.15)],
+                                         startPoint: .top, endPoint: .bottom))
+                }
+            }
+            HStack {
+                Text("Now"); Spacer(); Text("1 h"); Spacer(); Text("2 h")
+            }
+            .font(.system(size: 9, weight: .medium)).opacity(0.75)
+        }
+        .accessibilityLabel(report.nowcastSummary ?? "Rain in the next two hours")
     }
 }

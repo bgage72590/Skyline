@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import SkylineCore
 
@@ -70,6 +71,24 @@ enum SceneID {
 enum AppActions {
     /// Set by views that have access to `openWindow`, used when the Dock icon is clicked with no window open.
     static var openMainWindow: (() -> Void)?
+
+    private static var spaceMonitor: Any?
+
+    /// Space plays/pauses the radar from anywhere in the main window, except while a text field
+    /// (e.g. the search field) is being edited. In-app event monitor only; nothing is sent to other apps.
+    static func installSpaceShortcut(store: WeatherStore) {
+        guard spaceMonitor == nil else { return }
+        spaceMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak store] event in
+            guard event.keyCode == 49,
+                  event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
+                  let window = event.window, window.identifier?.rawValue.hasPrefix(SceneID.main) == true
+                    || window.title == "Skyline",
+                  !(window.firstResponder is NSText), !event.isARepeat,
+                  let store, store.selectedLocation != nil else { return event }
+            store.radar.togglePlay()
+            return nil
+        }
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {

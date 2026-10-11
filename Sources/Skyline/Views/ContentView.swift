@@ -49,6 +49,7 @@ struct ContentView: View {
         .onAppear {
             let open = openWindow
             AppActions.openMainWindow = { open(id: SceneID.main) }
+            AppActions.installSpaceShortcut(store: store)
             // Launch arguments for screenshots/QA: `-SkylineOpenRadar YES`, `-SkylineOpenModule uv`.
             let defaults = UserDefaults.standard
             if defaults.bool(forKey: "SkylineOpenRadar") { store.radarExpanded = true }

@@ -61,15 +61,12 @@ struct LocationDetailView: View {
         .onChange(of: location.id) { _, _ in
             store.radarExpanded = false; store.activeModule = nil; store.focusedAlertID = nil
         }
-        // Keyboard: the detail area can take focus (⌘⇧F) and handles Space for the radar loop,
-        // so typing a space in the search field never toggles playback.
+        // Keyboard: the detail area can take focus (⌘⇧F). Space (play/pause radar) is handled by an
+        // in-app key monitor (AppActions.installSpaceShortcut) so it works without focus but never
+        // while typing in the search field.
         .focusable()
         .focused($contentFocused)
         .focusEffectDisabled()
-        .onKeyPress(.space) {
-            store.radar.togglePlay()
-            return .handled
-        }
         .onChange(of: store.focusContentRequest) { _, _ in contentFocused = true }
     }
 

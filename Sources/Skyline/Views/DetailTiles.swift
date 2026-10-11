@@ -19,7 +19,7 @@ struct DetailTilesGrid: View {
             tappable(.humidity) { HumidityTile(report: report, units: units) }
             tappable(.visibility) { VisibilityTile(report: report, units: units) }
             tappable(.pressure) { PressureTile(report: report, units: units) }
-            if let aq = report.airQuality { AirQualityTile(airQuality: aq) }
+            if let aq = report.airQuality { AirQualityTile(airQuality: aq, report: report) }
             MoonTile(date: report.current.time)
             tappable(.confidence) { ConfidenceTile(report: report, units: units) }
         }
@@ -35,19 +35,97 @@ struct UVTile: View {
     let report: WeatherReport
     var body: some View {
         let uv = report.current.uvIndex ?? 0
+        let series = report.upcomingHours(count: 14).map { ($0.time, $0.uvIndex ?? 0) }
+        let peak = Briefing.peak(series, from: report.current.time, hours: 14)
         Tile(title: "UV Index", systemImage: "sun.max.fill") {
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(Int(uv.rounded()))").font(.system(size: 32, weight: .medium))
-                Text(UVScale.category(uv)).font(.title3.weight(.semibold))
-                Spacer(minLength: 6)
-                ScaleBar(fraction: uv / 11, colors: [.green, .yellow, .orange, .red, .purple])
-                Spacer(minLength: 6)
-                if let max = report.today?.uvIndexMax {
-                    Text(max >= 3 ? "Use sun protection; peak \(Int(max.rounded())) today." : "Low for the rest of the day.")
-                        .font(.caption).opacity(0.85)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("\(Int(uv.rounded()))").font(.system(size: 32, weight: .medium))
+                    Text(UVScale.category(uv)).font(.title3.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.7)
+                }
+                Spacer(minLength: 4)
+                // Hourly UV for the next ~14 h, coloured on the WHO scale.
+                HourlyMiniBars(values: series, maxValue: 11, timeZone: report.timeZone, highlight: peak?.time,
+                               color: { UVColors.color($0) })
+                    .frame(height: 34)
+                Spacer(minLength: 4)
+                if let peak, peak.value >= 1 {
+                    Text(peak.value >= 3 ? "Peak \(Int(peak.value.rounded())) at \(Fmt.hour(peak.time, report.timeZone)). Use sun protection."
+                                        : "Low; peak \(Int(peak.value.rounded())) at \(Fmt.hour(peak.time, report.timeZone)).")
+                        .font(.caption).foregroundStyle(Glass.secondaryText).lineLimit(2)
+                } else {
+                    Text("No UV until morning.").font(.caption).foregroundStyle(Glass.secondaryText)
                 }
             }
         }
+    }
+}
+
+enum UVColors {
+    static func color(_ uv: Double) -> Color {
+        switch uv {
+        case ..<3: Color(red: 0.36, green: 0.80, blue: 0.40)
+        case ..<6: Color(red: 0.98, green: 0.84, blue: 0.20)
+        case ..<8: Color(red: 1.0, green: 0.58, blue: 0.16)
+        case ..<11: Color(red: 0.95, green: 0.25, blue: 0.25)
+        default: Color(red: 0.70, green: 0.35, blue: 0.95)
+        }
+    }
+}
+
+enum AQIColors {
+    static func color(_ aqi: Double) -> Color {
+        switch aqi {
+        case ..<51: Color(red: 0.36, green: 0.80, blue: 0.40)
+        case ..<101: Color(red: 0.98, green: 0.84, blue: 0.20)
+        case ..<151: Color(red: 1.0, green: 0.58, blue: 0.16)
+        case ..<201: Color(red: 0.95, green: 0.25, blue: 0.25)
+        case ..<301: Color(red: 0.62, green: 0.30, blue: 0.85)
+        default: Color(red: 0.55, green: 0.10, blue: 0.20)
+        }
+    }
+}
+
+/// A compact strip of hourly bars (tile-sized), each coloured by its value, with the peak hour
+/// outlined and a couple of hour labels underneath.
+struct HourlyMiniBars: View {
+    let values: [(Date, Double)]
+    let maxValue: Double
+    let timeZone: TimeZone
+    var highlight: Date? = nil
+    let color: (Double) -> Color
+
+    var body: some View {
+        VStack(spacing: 2) {
+            GeometryReader { geo in
+                let n = max(values.count, 1)
+                let gap: CGFloat = 2
+                let w = max((geo.size.width - gap * CGFloat(n - 1)) / CGFloat(n), 1)
+                HStack(alignment: .bottom, spacing: gap) {
+                    ForEach(values.indices, id: \.self) { i in
+                        let v = values[i].1
+                        let h = max(2, geo.size.height * CGFloat(min(v / maxValue, 1)))
+                        RoundedRectangle(cornerRadius: 1.5)
+                            .fill(color(v).opacity(v <= 0 ? 0.35 : 0.95))
+                            .frame(width: w, height: h)
+                            .overlay {
+                                if values[i].0 == highlight {
+                                    RoundedRectangle(cornerRadius: 1.5).strokeBorder(.white, lineWidth: 1)
+                                }
+                            }
+                    }
+                }
+                .frame(maxHeight: .infinity, alignment: .bottom)
+            }
+            HStack {
+                Text(values.first.map { Fmt.hour($0.0, timeZone) } ?? "")
+                Spacer()
+                Text(values.last.map { Fmt.hour($0.0, timeZone) } ?? "")
+            }
+            .font(.system(size: 9, weight: .medium))
+            .foregroundStyle(Glass.secondaryText)
+        }
+        .accessibilityHidden(true)
     }
 }
 
@@ -138,6 +216,11 @@ struct WindTile: View {
                             centerUnit: units.speedUnit)
             }
             .frame(maxHeight: .infinity)
+            if let peak = Briefing.peak(report.hourly.compactMap { h in h.windGust.map { (h.time, $0) } },
+                                        from: report.current.time, hours: 24), peak.value > 0 {
+                Text("Peak gust \(units.speedString(peak.value)) at \(Fmt.hour(peak.time, report.timeZone))")
+                    .font(.caption).foregroundStyle(Glass.secondaryText).lineLimit(1).minimumScaleFactor(0.8)
+            }
         }
     }
 
@@ -288,18 +371,35 @@ struct PressureGauge: View {
 
 struct AirQualityTile: View {
     let airQuality: AirQuality
+    let report: WeatherReport
     var body: some View {
+        let now = report.current.time
+        let series = airQuality.hourly.filter { $0.time > now.addingTimeInterval(-3600) }.prefix(24).map { ($0.time, $0.value) }
+        let peak = Briefing.peak(Array(series), from: now, hours: 24)
         Tile(title: "Air Quality", systemImage: "aqi.medium") {
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(airQuality.usAQI)").font(.system(size: 32, weight: .medium))
-                Text(airQuality.category).font(.title3.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.6)
-                Spacer(minLength: 6)
-                ScaleBar(fraction: Double(airQuality.usAQI) / 300,
-                         colors: [.green, .yellow, .orange, .red, .purple, Color(red: 0.5, green: 0, blue: 0.15)])
-                Spacer(minLength: 6)
-                if let pm = airQuality.pm25 {
-                    Text("US AQI · PM2.5 \(Int(pm.rounded())) µg/m³").font(.caption).opacity(0.85)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("\(airQuality.usAQI)").font(.system(size: 32, weight: .medium))
+                    Text(airQuality.category).font(.title3.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.6)
                 }
+                Spacer(minLength: 4)
+                if series.count > 3 {
+                    HourlyMiniBars(values: Array(series), maxValue: max(150, (peak?.value ?? 0) * 1.1),
+                                   timeZone: report.timeZone, highlight: peak?.time, color: { AQIColors.color($0) })
+                        .frame(height: 34)
+                } else {
+                    ScaleBar(fraction: Double(airQuality.usAQI) / 300,
+                             colors: [.green, .yellow, .orange, .red, .purple, Color(red: 0.5, green: 0, blue: 0.15)])
+                }
+                Spacer(minLength: 4)
+                Group {
+                    if let peak, series.count > 3 {
+                        Text("Peak \(Int(peak.value.rounded())) (\(AirQuality.category(Int(peak.value.rounded())))) at \(Fmt.hour(peak.time, report.timeZone))")
+                    } else if let pm = airQuality.pm25 {
+                        Text("US AQI · PM2.5 \(Int(pm.rounded())) µg/m³")
+                    }
+                }
+                .font(.caption).foregroundStyle(Glass.secondaryText).lineLimit(2)
             }
         }
     }
