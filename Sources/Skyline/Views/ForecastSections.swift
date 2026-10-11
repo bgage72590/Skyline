@@ -108,7 +108,12 @@ struct AlertBanner: View {
 struct NowcastCard: View {
     let report: WeatherReport
     let units: UnitPreference
-    @State private var scrub: Date?
+    /// QA hook: `-SkylineNowcastScrub <minutes>` pre-selects a point so the callout can be screenshotted.
+    @State private var scrub: Date? = {
+        let m = UserDefaults.standard.integer(forKey: "SkylineNowcastScrub")
+        guard m > 0 else { return nil }
+        return Date(timeIntervalSince1970: (Date().timeIntervalSince1970 / 60).rounded(.down) * 60 + Double(m) * 60)
+    }()
 
     private static let rain = Color(red: 0.36, green: 0.72, blue: 1.0)
 
