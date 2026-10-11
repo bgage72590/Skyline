@@ -24,7 +24,20 @@ final class WeatherStore {
     var reports: [String: WeatherReport] = [:]
     var errors: [String: String] = [:]
     var loadingIDs: Set<String> = []
-    var units: UnitPreference { didSet { defaults.set(units.rawValue, forKey: Keys.units) } }
+    /// The units every view formats with: the preset plus any per-dimension overrides (T20).
+    private(set) var units: DisplayUnits = .imperial
+    var unitPreset: UnitPreference { didSet { defaults.set(unitPreset.rawValue, forKey: Keys.units); resolveUnits() } }
+    var temperatureUnit: TemperatureUnit? { didSet { saveOverride(temperatureUnit?.rawValue, Keys.temperatureUnit) } }
+    var speedUnit: SpeedUnit? { didSet { saveOverride(speedUnit?.rawValue, Keys.speedUnit) } }
+    var precipitationUnit: PrecipitationUnit? { didSet { saveOverride(precipitationUnit?.rawValue, Keys.precipitationUnit) } }
+    var pressureUnit: PressureUnit? { didSet { saveOverride(pressureUnit?.rawValue, Keys.pressureUnit) } }
+    var distanceUnit: DistanceUnit? { didSet { saveOverride(distanceUnit?.rawValue, Keys.distanceUnit) } }
+    /// 12/24-hour clock for every time shown (T20).
+    var clockStyle: ClockStyle { didSet { defaults.set(clockStyle.rawValue, forKey: Keys.clock); Fmt.clock = clockStyle } }
+    /// City the menu bar shows (nil = My Location, else the first saved city), chosen in Settings (T10).
+    var menuBarPinID: String? { didSet { defaults.set(menuBarPinID, forKey: Keys.menuBarPin) } }
+    /// Set by the dropdown's alert line; the main window's alert banner opens that alert and clears it.
+    var pendingAlertID: String?
     var refreshMinutes: Int { didSet { defaults.set(refreshMinutes, forKey: Keys.refresh); startRefreshLoop() } }
     var locationDenied = false
     /// True while "My Location" is waiting for its first fix (the sidebar shows a loading row).
@@ -54,6 +67,11 @@ final class WeatherStore {
     /// Bumped when a report crosses its staleness deadline or an alert ends, so views that show data age
     /// (menu-bar dimming, the offline banner) re-render without polling.
     private(set) var staleTick = 0
+    /// The status-item image (icon + temperature, dimmed when stale), rendered here whenever one of its
+    /// inputs changes, on a later main-actor turn, so `MenuBarLabel.body` only reads it and never runs
+    /// ImageRenderer during a view update (Code Reviewer nice-to-have).
+    private(set) var menuBarImage: NSImage?
+    @ObservationIgnored private var menuBarImageKey: String?
 
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let locationProvider = LocationProvider()
@@ -73,6 +91,13 @@ final class WeatherStore {
         static let refresh = "refreshMinutes"
         static let seeded = "seededDefaultLocation"
         static let lastFix = "lastCurrentLocation.v1"
+        static let temperatureUnit = "unit.temperature"
+        static let speedUnit = "unit.speed"
+        static let precipitationUnit = "unit.precipitation"
+        static let pressureUnit = "unit.pressure"
+        static let distanceUnit = "unit.distance"
+        static let clock = "clockStyle"
+        static let menuBarPin = "menuBarLocationID"
     }
 
     /// A report younger than this is shown without refetching.
@@ -84,7 +109,14 @@ final class WeatherStore {
         self.service = service
         self.radar = RadarPlayback(service: service)
         self.defaults = defaults
-        self.units = UnitPreference(rawValue: defaults.string(forKey: Keys.units) ?? "") ?? .system
+        self.unitPreset = UnitPreference(rawValue: defaults.string(forKey: Keys.units) ?? "") ?? .system
+        self.temperatureUnit = defaults.string(forKey: Keys.temperatureUnit).flatMap(TemperatureUnit.init(rawValue:))
+        self.speedUnit = defaults.string(forKey: Keys.speedUnit).flatMap(SpeedUnit.init(rawValue:))
+        self.precipitationUnit = defaults.string(forKey: Keys.precipitationUnit).flatMap(PrecipitationUnit.init(rawValue:))
+        self.pressureUnit = defaults.string(forKey: Keys.pressureUnit).flatMap(PressureUnit.init(rawValue:))
+        self.distanceUnit = defaults.string(forKey: Keys.distanceUnit).flatMap(DistanceUnit.init(rawValue:))
+        self.clockStyle = ClockStyle(rawValue: defaults.string(forKey: Keys.clock) ?? "") ?? .system
+        self.menuBarPinID = defaults.string(forKey: Keys.menuBarPin)
         let minutes = defaults.integer(forKey: Keys.refresh)
         self.refreshMinutes = minutes >= 5 ? minutes : 15
         self.selectedID = defaults.string(forKey: Keys.selected)
@@ -115,9 +147,12 @@ final class WeatherStore {
         } else {
             isLocating = true
         }
+        Fmt.clock = clockStyle
+        resolveUnits()
         setUpLocation()
         observeWake()
         startRefreshLoop()
+        trackMenuBarImage()
         // Download-cache clean-up (entries older than 14 days), off the launch path.
         let service = self.service
         Task.detached(priority: .utility) {
@@ -136,13 +171,50 @@ final class WeatherStore {
         allLocations.first { $0.id == selectedID } ?? allLocations.first
     }
 
-    /// Menu bar follows the device location when available, else the selected / first saved place.
+    /// The pinned city (Settings), else My Location, else the first saved city. It no longer changes
+    /// when a different sidebar city is clicked (T10).
     var menuBarLocation: WeatherLocation? {
-        currentLocation ?? selectedLocation
+        LocationList.menuBarLocation(current: currentLocation, saved: savedLocations, pinnedID: menuBarPinID)
+    }
+
+    private func resolveUnits() {
+        let new = DisplayUnits(preset: unitPreset, temperature: temperatureUnit, speed: speedUnit,
+                               precipitation: precipitationUnit, pressure: pressureUnit, distance: distanceUnit)
+        if new != units { units = new }
+    }
+
+    private func saveOverride(_ raw: String?, _ key: String) {
+        if let raw { defaults.set(raw, forKey: key) } else { defaults.removeObject(forKey: key) }
+        resolveUnits()
+    }
+
+    /// The dropdown's one-click °F/°C switch: flips the temperature unit only.
+    func toggleTemperatureUnit() {
+        temperatureUnit = units.temperature == .fahrenheit ? .celsius : .fahrenheit
     }
 
     var menuBarReport: WeatherReport? {
         menuBarLocation.flatMap { reports[$0.id] }
+    }
+
+    /// What the status item shows: SF Symbol, temperature text, dimmed. Nil before the first report.
+    var menuBarLabelSpec: MenuBarLabel.Spec? {
+        guard let report = menuBarReport else { return nil }
+        return MenuBarLabel.Spec(symbol: report.current.condition.symbolName(isDay: report.current.isDay),
+                                 text: units.temperatureString(report.current.temperature),
+                                 dimmed: isStale(report))
+    }
+
+    /// Re-renders `menuBarImage` when its spec changes. Observation's onChange fires once (before the
+    /// change lands), so the work is deferred to a Task and the tracking is re-armed there.
+    private func trackMenuBarImage() {
+        let spec = withObservationTracking { menuBarLabelSpec } onChange: { [weak self] in
+            Task { @MainActor in self?.trackMenuBarImage() }
+        }
+        let key = spec?.key
+        guard key != menuBarImageKey else { return }
+        menuBarImageKey = key
+        menuBarImage = spec.flatMap(MenuBarLabel.render)
     }
 
     func isLoading(_ location: WeatherLocation) -> Bool { loadingIDs.contains(location.id) }
@@ -505,11 +577,35 @@ final class WeatherStore {
         Task { await load(location) }
     }
 
-    func remove(_ location: WeatherLocation) {
-        guard !location.isCurrentLocation else { return }
-        savedLocations.removeAll { $0.id == location.id }
+    /// Removes a saved city. With an undo manager (sidebar ⌫ / context menu), Edit › Undo (⌘Z) puts it
+    /// back in the same place, and Redo removes it again (T19).
+    func remove(_ location: WeatherLocation, undoManager: UndoManager? = nil) {
+        guard !location.isCurrentLocation, let index = savedLocations.firstIndex(where: { $0.id == location.id }) else { return }
+        let wasSelected = selectedID == location.id
+        savedLocations.remove(at: index)
         reports[location.id] = nil
-        if selectedID == location.id { selectedID = allLocations.first?.id }
+        errors[location.id] = nil
+        if wasSelected { selectedID = allLocations.first?.id }
+        if let undoManager {
+            undoManager.registerUndo(withTarget: self) { store in
+                MainActor.assumeIsolated {
+                    store.restore(location, at: index, select: wasSelected, undoManager: undoManager)
+                }
+            }
+            undoManager.setActionName("Remove \(location.name)")
+        }
+    }
+
+    func restore(_ location: WeatherLocation, at index: Int, select: Bool, undoManager: UndoManager? = nil) {
+        savedLocations = LocationList.restoring(location, at: index, into: savedLocations)
+        if select { selectedID = location.id }
+        if let undoManager {
+            undoManager.registerUndo(withTarget: self) { store in
+                MainActor.assumeIsolated { store.remove(location, undoManager: undoManager) }
+            }
+            undoManager.setActionName("Remove \(location.name)")
+        }
+        Task { await load(location) }
     }
 
     func move(_ location: WeatherLocation, by offset: Int) {
@@ -517,6 +613,29 @@ final class WeatherStore {
         let j = i + offset
         guard savedLocations.indices.contains(j) else { return }
         savedLocations.swapAt(i, j)
+    }
+
+    /// Drag-to-reorder in the sidebar (offsets within the saved cities).
+    func moveSaved(fromOffsets source: IndexSet, toOffset destination: Int) {
+        let moved = LocationList.moving(savedLocations, fromOffsets: source, toOffset: destination)
+        if moved.map(\.id) != savedLocations.map(\.id) { savedLocations = moved }
+    }
+
+    /// Return in the search field adds the first result, searching right away if the debounced search
+    /// hasn't answered yet (T19).
+    func submitSearch() {
+        if let first = searchResults.first { add(first); return }
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query.count >= 2 else { return }
+        searchTask?.cancel()
+        isSearching = true
+        searchTask = Task { [weak self] in
+            guard let self else { return }
+            let results = (try? await self.service.search(query)) ?? []
+            guard !Task.isCancelled else { return }
+            self.isSearching = false
+            if let first = results.first { self.add(first) } else { self.searchResults = [] }
+        }
     }
 
     private func persistLastFix(_ location: WeatherLocation) {

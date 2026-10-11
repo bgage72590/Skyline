@@ -47,7 +47,7 @@ public enum ForecastSampler {
                 f[VerificationSource.blend.rawValue] = SourceValues(t: b.temperature, pop: b.precipitationProbability,
                                                                     p: b.precipitation, w: b.windSpeed)
             }
-            let record = ForecastRecord(loc: key, issued: issued, valid: time, f: f).dedupingNOAAFamily()
+            let record = ForecastRecord(loc: key, issued: issued, valid: time, f: f).dedupingNOAAFamily(dropDuplicates: false)
             if record.f.count > 1 { out.append(record) }
         }
         return out

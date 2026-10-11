@@ -6,7 +6,7 @@ import SkylineCore
 /// above it shrinks away, so "what's happening" is always one glance away.
 struct BriefingBar: View {
     let report: WeatherReport
-    let units: UnitPreference
+    let units: DisplayUnits
 
     var body: some View {
         let tz = report.timeZone
@@ -54,8 +54,9 @@ struct AlertBanner: View {
                         Text("Until \(Fmt.dayTime(until, timeZone))\(top.senderName.map { " · \($0)" } ?? "")")
                             .font(.caption).foregroundStyle(Glass.secondaryText)
                     }
-                    if let headline = top.headline {
-                        Text(headline).font(.caption).lineLimit(2).foregroundStyle(.white)
+                    // Not the NWS headline when it just restates the event, time and office (UI/UX #8).
+                    if let line = TextTidy.alertSubtitle(event: top.event, headline: top.headline, description: top.description) {
+                        Text(line).font(.caption).lineLimit(2).foregroundStyle(.white)
                     }
                 }
                 Spacer(minLength: 0)
@@ -98,6 +99,15 @@ struct AlertBanner: View {
                 store.showAlertOnMap(alert, wideLayout: isWide)
             }
         }
+        // The dropdown's alert line asks for this alert's full text (UI/UX #19). Deferred a turn so no
+        // observed state is written during the view update.
+        .onChange(of: store.pendingAlertID, initial: true) { _, id in
+            guard let id, let alert = alerts.first(where: { $0.id == id }) else { return }
+            DispatchQueue.main.async {
+                detail = alert
+                store.pendingAlertID = nil
+            }
+        }
     }
 }
 
@@ -107,7 +117,7 @@ struct AlertBanner: View {
 /// Shown only when rain is actually due.
 struct NowcastCard: View {
     let report: WeatherReport
-    let units: UnitPreference
+    let units: DisplayUnits
     /// QA hook: `-SkylineNowcastScrub <minutes>` pre-selects a point so the callout can be screenshotted.
     @State private var scrub: Date? = {
         let m = UserDefaults.standard.integer(forKey: "SkylineNowcastScrub")
@@ -124,7 +134,7 @@ struct NowcastCard: View {
         let end = start.addingTimeInterval(120 * 60)
         let selected = scrub.flatMap { s in samples.min { abs($0.time.timeIntervalSince(s)) < abs($1.time.timeIntervalSince(s)) } }
         let tz = report.timeZone
-        Card(title: "Next 2 Hours", systemImage: "cloud.rain.fill", subtitle: report.nowcastSummary.map { $0 + "." }) {
+        Card(title: "Next 2 Hours", systemImage: "cloud.rain.fill", subtitle: subtitle(samples, tz: tz)) {
             Chart {
                 // Guide lines first so the rain draws over them.
                 ForEach([1.0, 2.0, 3.0], id: \.self) { level in
@@ -198,6 +208,18 @@ struct NowcastCard: View {
             .filter { $0 - start.timeIntervalSince1970 >= 20 * 60 }
             .map { Date(timeIntervalSince1970: $0) }
         return [start] + rounds
+    }
+
+    /// The nowcast sentence, unless the pinned briefing above already says it (UI/UX #8); then the
+    /// peak instead ("Heaviest around 5:15 PM").
+    private func subtitle(_ samples: [NowcastCurve.Sample], tz: TimeZone) -> String? {
+        let briefing = Briefing.headline(report, now: report.current.time, hourLabel: { Fmt.hour($0, tz) },
+                                         delta: { Int(units.temperatureDelta($0).rounded()) })
+        guard TextTidy.isRepeated(report.nowcastSummary, in: briefing) else {
+            return report.nowcastSummary.map { $0 + "." }
+        }
+        guard let peak = samples.max(by: { $0.rate < $1.rate }), peak.rate >= 0.1 else { return nil }
+        return "Heaviest around \(Fmt.time(peak.time, tz)) (\(NowcastCurve.intensityName(peak.rate).lowercased()))."
     }
 
     private func relative(_ t: Date, from start: Date) -> String {

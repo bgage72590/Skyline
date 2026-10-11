@@ -66,8 +66,9 @@ final class RadarImageCache {
     }
 
     private func networkChanged(satisfied: Bool) {
-        defer { lastPathSatisfied = satisfied }
-        if satisfied && !lastPathSatisfied { retryFailedNow() }
+        let wasSatisfied = lastPathSatisfied
+        lastPathSatisfied = satisfied // set first: the retry below checks `isOnline`
+        if satisfied && !wasSatisfied { retryFailedNow() }
     }
 
     /// Forget transient failures (and recent "missing" verdicts, which may have been caused by the same
@@ -96,8 +97,19 @@ final class RadarImageCache {
     /// Seconds before a transiently failed tile may be asked again.
     private static func backoff(attempts: Int) -> TimeInterval { min(5 * pow(2, Double(max(attempts - 1, 0))), 60) }
 
+    /// False while the Mac has no network. Retry ticks stop then; the network coming back triggers one.
+    var isOnline: Bool { lastPathSatisfied }
+
+    /// The radar window became visible again: re-request tiles whose back-off expired while it was hidden.
+    func requestRetryWhenVisible() {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Self.retryNotification, object: nil)
+        }
+    }
+
     private func scheduleRetryTick(after delay: TimeInterval) {
-        guard !retryScheduled else { return }
+        // Offline: no point waking every minute; `networkChanged` retries when the path is back.
+        guard !retryScheduled, lastPathSatisfied else { return }
         retryScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.5) { [weak self] in
             MainActor.assumeIsolated {

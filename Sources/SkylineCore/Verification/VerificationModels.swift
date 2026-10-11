@@ -135,7 +135,10 @@ extension ForecastRecord {
     /// higher-weighted family member is dropped (the blender collapses them the same way), and HRRR's
     /// "probability" (really the GFS-family one) is never scored as HRRR. Applied when recording and when
     /// scoring, so history saved before this rule is scored the same way.
-    public func dedupingNOAAFamily() -> ForecastRecord {
+    /// - Parameter dropDuplicates: false keeps every member's values (only HRRR's borrowed probability is
+    ///   removed). Used when storing records and for learning weights: dropping a member whenever it equals
+    ///   a higher-weighted one scores it only on the hours it disagrees, which biases its learned weight.
+    public func dedupingNOAAFamily(dropDuplicates: Bool = true) -> ForecastRecord {
         let lead = leadHours
         let family: [ForecastModel] = [.hrrr, .bestMatch, .gfs]
         var out = self
@@ -143,6 +146,7 @@ extension ForecastRecord {
             h.pop = nil
             out.f[VerificationSource.hrrr.rawValue] = h.isEmpty ? nil : h
         }
+        guard dropDuplicates else { return out }
         func dedupe(_ path: WritableKeyPath<SourceValues, Double?>, variable: String) {
             let ranked = family.enumerated().sorted { a, b in
                 let wa = ForecastBlender.weight(.model(a.element), variable: variable, leadHours: lead)

@@ -29,17 +29,19 @@ struct ContentView: View {
         @Bindable var store = store
         NavigationSplitView {
             SidebarView()
+                .id(store.clockStyle) // times re-format when the 12/24-hour setting changes
                 .navigationSplitViewColumnWidth(min: 250, ideal: 290, max: 380)
         } detail: {
             if let location = store.selectedLocation {
                 LocationDetailView(location: location)
-                    .id(location.id)
+                    .id(location.id + "|" + store.clockStyle.rawValue)
             } else {
                 EmptyStateView()
             }
         }
         .searchable(text: $store.searchText, placement: .sidebar, prompt: "Search for a city or airport")
         .onChange(of: store.searchText) { _, _ in store.searchTextChanged() }
+        .onSubmit(of: .search) { store.submitSearch() } // Return adds the first result (T19)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 if store.selectedLocation != nil {

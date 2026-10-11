@@ -474,6 +474,9 @@ final class RadarLayerView: NSView {
     /// Re-requests tiles marked missing whose failure verdict has expired (back-off over, wake, network
     /// back). Event-driven from a notification on the main queue: never inside layout.
     private func retryMissingTiles() {
+        // Paused while the window is covered/minimised or the Mac is offline; becoming visible and the
+        // network returning both post the retry notification again.
+        guard playback?.isVisible == true, RadarImageCache.shared.isOnline else { return }
         var changed = false
         for g in [active, pending].compactMap({ $0 }) {
             for i in g.frames.indices where !g.missing[i].isEmpty {

@@ -82,8 +82,10 @@ enum AppActions {
 
     private static var spaceMonitor: Any?
 
-    /// Space plays/pauses the radar from anywhere in the main window, except while a text field
-    /// (e.g. the search field) is being edited. In-app event monitor only; nothing is sent to other apps.
+    /// Space plays/pauses the radar from anywhere in the main window, except where Space already means
+    /// something: a text field being edited, or a focused button, checkbox, slider, pop-up or segmented
+    /// control (keyboard navigation), which get the key as usual (L10). In-app event monitor only;
+    /// nothing is sent to other apps.
     static func installSpaceShortcut(store: WeatherStore) {
         guard spaceMonitor == nil else { return }
         spaceMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak store] event in
@@ -91,15 +93,39 @@ enum AppActions {
                   event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
                   let window = event.window, window.identifier?.rawValue.hasPrefix(SceneID.main) == true
                     || window.title == "Skyline",
-                  !(window.firstResponder is NSText), !event.isARepeat,
+                  !spaceBelongsTo(window.firstResponder), !event.isARepeat,
                   let store, store.selectedLocation != nil else { return event }
             store.radar.togglePlay()
             return nil
         }
     }
+
+    /// True when the focused view handles Space itself (text editing, or pressing a focused control).
+    /// Lists (the sidebar) have no Space action, so Space still plays the radar there.
+    static func spaceBelongsTo(_ responder: NSResponder?) -> Bool {
+        guard let responder else { return false }
+        if responder is NSText { return true }
+        if let control = responder as? NSControl, !(control is NSTableView) {
+            return control.isEnabled && control.acceptsFirstResponder
+        }
+        return false
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            // Always dark, like the dropdown: in system Light Mode the sidebar material, sheets, alerts and
+            // Settings otherwise turn light gray against the dark sky panel (UI/UX #3). App-wide, because
+            // `.preferredColorScheme` on the window kept its content (map, radar) alive after closing,
+            // and SwiftUI resets a window's own `appearance`. The menu-bar icon is a template image, so the
+            // menu bar still tints it for its own light/dark look.
+            NSApp.appearance = NSAppearance(named: .darkAqua)
+            // "Show in Dock" off → menu-bar-only app from launch (T10).
+            DockIcon.apply()
+        }
+    }
+
     /// Keep running in the menu bar after the main window is closed.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 

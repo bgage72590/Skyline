@@ -304,7 +304,7 @@ enum ScrollProbe {
 
 struct HeroView: View {
     let report: WeatherReport
-    let units: UnitPreference
+    let units: DisplayUnits
 
     var body: some View {
         VStack(spacing: 0) {
@@ -356,13 +356,14 @@ private enum HourItem: Identifiable {
 
 struct HourlyCard: View {
     let report: WeatherReport
-    let units: UnitPreference
+    let units: DisplayUnits
     var onOpen: () -> Void = {}
 
     var body: some View {
         let items = makeItems()
         Button(action: onOpen) {
-            Card(title: headline == nil ? "Hourly Forecast" : nil, systemImage: "clock", subtitle: headline) {
+            // Always labelled; the summary is whole sentences or nothing (UI/UX #18).
+            Card(title: "Hourly Forecast", systemImage: "clock", subtitle: headline) {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 2) {
                         ForEach(items) { item in
@@ -426,20 +427,16 @@ struct HourlyCard: View {
         return "\(Int((p / 10).rounded() * 10))%"
     }
 
-    /// Apple-style one-line summary: nowcast first, otherwise the NWS/consensus text for today.
+    /// The day's forecast text (first two whole sentences), or nothing.
     private var headline: String? {
-        // The pinned briefing (and the Next 2 Hours card) already say what the nowcast says, so the
-        // hourly card leads with the day's forecast text and falls back to the nowcast.
-        if let summary = report.today?.summary {
-            return summary.split(separator: ".").prefix(2).joined(separator: ".") + "."
-        }
-        return report.nowcastSummary.map { $0 + "." }
+        // No nowcast fallback: the briefing bar and the Next 2 Hours card already say it (UI/UX #8).
+        TextTidy.hourlyHeadline(summary: report.today?.summary, nowcast: nil)
     }
 }
 
 struct DailyCard: View {
     let report: WeatherReport
-    let units: UnitPreference
+    let units: DisplayUnits
     var onOpenDay: (Date) -> Void = { _ in }
 
     var body: some View {
@@ -477,7 +474,7 @@ struct DailyCard: View {
             }
             .frame(width: 34)
             Text(units.temperatureString(day.low))
-                .opacity(0.6)
+                .opacity(0.75)
                 .frame(width: 40, alignment: .trailing)
             TemperatureRangeBar(rangeLow: rangeLow, rangeHigh: rangeHigh, low: day.low, high: day.high,
                                 current: offset == 0 ? report.current.temperature : nil)
@@ -485,6 +482,7 @@ struct DailyCard: View {
                 .frame(width: 40, alignment: .trailing)
         }
         .font(.title3.weight(.medium))
+        .monospacedDigit() // low/high columns line up (L16)
         .padding(.vertical, 10)
         .contentShape(Rectangle())
     }
@@ -503,8 +501,11 @@ struct SourcesFooter: View {
         }
         .font(.caption2)
         .multilineTextAlignment(.center)
-        .opacity(0.7)
+        .foregroundStyle(Glass.secondaryText)
         .frame(maxWidth: .infinity)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .glassCard(cornerRadius: 12) // readable on light skies (T6)
         .padding(.top, 6)
     }
 }

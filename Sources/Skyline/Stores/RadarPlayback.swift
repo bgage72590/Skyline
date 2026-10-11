@@ -23,7 +23,13 @@ final class RadarPlayback {
         didSet { if index != oldValue { notifySinks() } }
     }
     var isPlaying = false { didSet { updateHoldsLoop(); updateClock() } }
-    var isVisible = false { didSet { updateHoldsLoop(); updateClock() } }
+    var isVisible = false {
+        didSet {
+            updateHoldsLoop(); updateClock()
+            // Tile retries pause while the window is hidden; catch up once it's back (next main-queue turn).
+            if isVisible && !oldValue { RadarImageCache.shared.requestRetryWhenVisible() }
+        }
+    }
     /// True while the user drags the radar scrubber (frames are loaded for scrubbing).
     var isScrubbingRadar = false { didSet { if isScrubbingRadar != oldValue { updateHoldsLoop() } } }
     /// Whether map views hold every frame of the loop. Only while playing (or queued to play), scrubbing,

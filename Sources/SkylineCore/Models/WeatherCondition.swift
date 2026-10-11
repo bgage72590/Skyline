@@ -1,7 +1,7 @@
 import Foundation
 
 /// Broad visual category used to pick backgrounds and symbols.
-public enum SkyCategory: String, Codable, Sendable {
+public enum SkyCategory: String, Codable, Sendable, CaseIterable {
     case clear, partlyCloudy, cloudy, fog, drizzle, rain, snow, thunderstorm
 }
 

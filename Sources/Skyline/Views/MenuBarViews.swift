@@ -3,46 +3,51 @@ import SwiftUI
 import SkylineCore
 
 /// Status item: icon + temperature. Re-renders only when the report changes.
-/// When the data is stale or offline the temperature is drawn dimmed (a half-transparent template image,
-/// which the menu bar tints like any other item but at reduced strength).
+/// Drawn as a template image (the menu bar tints it like any other item) so the layout can be fixed:
+/// the digits are tabular and the temperature always reserves the width of "88°", so 9° → 10° or a
+/// different digit doesn't nudge the neighbouring menu-bar icons (L11). When the data is stale or
+/// offline the image is drawn at reduced strength.
 struct MenuBarLabel: View {
     let store: WeatherStore
 
+    struct Spec: Equatable {
+        var symbol: String
+        var text: String
+        var dimmed: Bool
+        var key: String { symbol + "|" + text + (dimmed ? "|d" : "") }
+    }
+
     var body: some View {
-        if let report = store.menuBarReport {
-            let text = store.units.temperatureString(report.current.temperature)
-            let symbol = report.current.condition.symbolName(isDay: report.current.isDay)
-            if store.isStale(report), let dimmed = Self.dimmedImage(symbol: symbol, text: text) {
-                Image(nsImage: dimmed)
-            } else {
-                Label(text, systemImage: symbol)
-                    .labelStyle(.titleAndIcon)
-            }
+        // Only reads the pre-rendered image (WeatherStore.trackMenuBarImage); no rendering in body.
+        if let image = store.menuBarImage {
+            Image(nsImage: image)
+        } else if let spec = store.menuBarLabelSpec {
+            Label(spec.text, systemImage: spec.symbol)
+                .labelStyle(.titleAndIcon)
         } else {
             Label("Skyline", systemImage: "cloud.sun")
                 .labelStyle(.iconOnly)
         }
     }
 
-    @MainActor private static var dimmedCache: [String: NSImage] = [:]
-
-    /// Renders "symbol + temperature" once per distinct value into a template image at 45 % alpha.
-    @MainActor static func dimmedImage(symbol: String, text: String) -> NSImage? {
-        let key = symbol + "|" + text
-        if let cached = dimmedCache[key] { return cached }
+    /// Renders "symbol + temperature" into a template image (45 % alpha if dimmed). Called by the store
+    /// outside any view update, only when the spec changes.
+    @MainActor static func render(_ spec: Spec) -> NSImage? {
         let content = HStack(spacing: 4) {
-            Image(systemName: symbol)
-            Text(text)
+            Image(systemName: spec.symbol)
+            ZStack(alignment: .leading) {
+                Text("88°").hidden() // reserve two digits' width
+                Text(spec.text)
+            }
+            .monospacedDigit()
         }
         .font(.system(size: 13, weight: .regular))
-        .foregroundStyle(Color.black.opacity(0.45))
+        .foregroundStyle(Color.black.opacity(spec.dimmed ? 0.45 : 1))
         .padding(.horizontal, 1)
         let renderer = ImageRenderer(content: content)
         renderer.scale = NSScreen.main?.backingScaleFactor ?? 2
         guard let image = renderer.nsImage else { return nil }
         image.isTemplate = true
-        if dimmedCache.count > 64 { dimmedCache.removeAll() }
-        dimmedCache[key] = image
         return image
     }
 }
@@ -58,23 +63,38 @@ struct MenuBarContentView: View {
                 header(report)
                 if let alert = report.activeAlerts().first {
                     let alertCount = report.activeAlerts().count
-                    Label("\(alert.event)\(alertCount > 1 ? " +\(alertCount - 1)" : "")",
-                          systemImage: "exclamationmark.triangle.fill")
+                    // Opens the main window on this location with the full alert text.
+                    Button {
+                        store.selectedID = report.location.id
+                        store.activeModule = nil
+                        store.radarExpanded = false
+                        store.pendingAlertID = alert.id
+                        openWindow(id: SceneID.main)
+                        NSApp.activate()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Label("\(alert.event)\(alertCount > 1 ? " +\(alertCount - 1)" : "")",
+                                  systemImage: "exclamationmark.triangle.fill")
+                            Image(systemName: "chevron.right").font(.caption2.weight(.bold)).opacity(0.8)
+                        }
                         .font(.callout.weight(.semibold))
                         .foregroundStyle(AlertsCard.color(alert.severity))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Read the full alert")
                 }
                 Text(Briefing.headline(report, now: report.current.time,
                                        hourLabel: { Fmt.hour($0, report.timeZone) },
                                        delta: { Int(store.units.temperatureDelta($0).rounded()) }))
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
-                if Briefing.rainDueSoon(report, now: report.current.time) {
-                    MiniNowcast(report: report).frame(height: 46)
+                // Everything below the headline scrolls if the dropdown would be taller than the screen (T21).
+                ViewThatFits(in: .vertical) {
+                    details(report)
+                    ScrollView { details(report) }.scrollIndicators(.automatic)
                 }
-                hourly(report)
-                chips(report)
-                daily(report)
-                otherLocations(report)
+                .frame(maxHeight: Self.maxDetailsHeight)
                 updatedLine(report)
             } else if let location = store.menuBarLocation {
                 if let error = store.errors[location.id], !store.isLoading(location) {
@@ -115,11 +135,28 @@ struct MenuBarContentView: View {
                 }
                 Spacer()
                 Button {
-                    Task { await store.refreshAll(force: true) }
+                    store.toggleTemperatureUnit()
                 } label: {
-                    Image(systemName: "arrow.clockwise")
+                    Text(store.units.temperature.label).font(.callout.weight(.semibold)).monospacedDigit()
                 }
-                .help("Refresh")
+                .help("Switch to \(store.units.temperature == .fahrenheit ? "°C" : "°F")")
+                SettingsLink {
+                    Image(systemName: "gearshape")
+                }
+                .simultaneousGesture(TapGesture().onEnded { NSApp.activate() })
+                .help("Settings (⌘,)")
+                if store.loadingIDs.isEmpty {
+                    Button {
+                        Task { await store.refreshAll(force: true) }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .help("Refresh")
+                } else {
+                    // Visible feedback while refreshing (T21).
+                    ProgressView().controlSize(.small).frame(width: 16, height: 16)
+                        .help("Refreshing…")
+                }
                 Button {
                     NSApp.terminate(nil)
                 } label: {
@@ -131,8 +168,15 @@ struct MenuBarContentView: View {
         }
         .padding(14)
         .frame(width: 320)
+        .id(store.clockStyle)
         .foregroundStyle(.white)
-        .background(SkyPalette.gradient(for: report))
+        .background {
+            // Black wash keeps white text ≥ 4.5:1 on every sky (T6; tested via SkyColors.dropdownScrim).
+            ZStack {
+                SkyPalette.gradient(for: report)
+                Color.black.opacity(SkyColors.dropdownScrim)
+            }
+        }
         .environment(\.colorScheme, .dark)
         .task {
             if let location = store.menuBarLocation { await store.load(location) }
@@ -140,6 +184,28 @@ struct MenuBarContentView: View {
         .onAppear {
             let open = openWindow
             AppActions.openMainWindow = { open(id: SceneID.main) }
+        }
+    }
+
+    /// Tallest the scrolling middle section may get: the screen's usable height minus the header,
+    /// alert, briefing and footer.
+    private static var maxDetailsHeight: CGFloat {
+        // QA hook: `-SkylineMenuMaxHeight 220` forces the scrolling case on a normal screen.
+        let forced = UserDefaults.standard.double(forKey: "SkylineMenuMaxHeight")
+        if forced > 0 { return forced }
+        return max(260, (NSScreen.main?.visibleFrame.height ?? 800) - 300)
+    }
+
+    @ViewBuilder
+    private func details(_ report: WeatherReport) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if Briefing.rainDueSoon(report, now: report.current.time) {
+                MiniNowcast(report: report).frame(height: 46)
+            }
+            hourly(report)
+            chips(report)
+            daily(report)
+            otherLocations(report)
         }
     }
 
@@ -187,13 +253,13 @@ struct MenuBarContentView: View {
                 VStack(spacing: 4) {
                     Text(Fmt.hour(hour.time, report.timeZone)).font(.caption2.weight(.semibold))
                     WeatherSymbol(condition: hour.condition, isDay: hour.isDay, size: 16)
-                    Text(store.units.temperatureString(hour.temperature)).font(.callout.weight(.medium))
+                    Text(store.units.temperatureString(hour.temperature)).font(.callout.weight(.medium)).monospacedDigit()
                 }
                 .frame(maxWidth: .infinity)
             }
         }
         .padding(.vertical, 8)
-        .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     /// UV, air quality and peak gust at a glance.
@@ -208,7 +274,8 @@ struct MenuBarContentView: View {
                 chip("aqi.medium", "AQI \(aq.usAQI)", aq.category)
             }
             if let gust, gust.value > 0 {
-                chip("wind", "Gust \(store.units.speedString(gust.value))", Fmt.hour(gust.time, tz))
+                // Unit in the value, the word in the caption, so the number is never what gets cut (UI/UX #10).
+                chip("wind", store.units.speedString(gust.value), "Gust · " + Fmt.hour(gust.time, tz))
             }
         }
     }
@@ -216,12 +283,13 @@ struct MenuBarContentView: View {
     private func chip(_ symbol: String, _ value: String, _ caption: String) -> some View {
         VStack(alignment: .leading, spacing: 1) {
             Label(value, systemImage: symbol).font(.caption.weight(.semibold)).lineLimit(1)
-            Text(caption).font(.caption2).opacity(0.8).lineLimit(1)
+                .minimumScaleFactor(0.85)
+            Text(caption).font(.caption2).opacity(0.9).lineLimit(1)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .background(.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     /// The other saved locations: one tap opens them in the main window.
@@ -253,7 +321,7 @@ struct MenuBarContentView: View {
                 }
             }
             .padding(.vertical, 4)
-            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .background(.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
     }
 
@@ -268,40 +336,14 @@ struct MenuBarContentView: View {
                         .frame(width: 46, alignment: .leading)
                     WeatherSymbol(condition: day.condition, isDay: true, size: 14)
                         .frame(width: 22)
-                    Text(store.units.temperatureString(day.low)).opacity(0.65).frame(width: 34, alignment: .trailing)
+                    Text(store.units.temperatureString(day.low)).opacity(0.8).frame(width: 34, alignment: .trailing)
                     TemperatureRangeBar(rangeLow: low, rangeHigh: high, low: day.low, high: day.high)
                     Text(store.units.temperatureString(day.high)).frame(width: 34, alignment: .trailing)
                 }
                 .font(.callout.weight(.medium))
+                .monospacedDigit()
             }
         }
-    }
-}
-
-struct SettingsView: View {
-    @Environment(WeatherStore.self) private var store
-
-    var body: some View {
-        @Bindable var store = store
-        Form {
-            Picker("Units", selection: $store.units) {
-                ForEach(UnitPreference.allCases) { Text($0.label).tag($0) }
-            }
-            Picker("Refresh every", selection: $store.refreshMinutes) {
-                Text("10 minutes").tag(10)
-                Text("15 minutes").tag(15)
-                Text("30 minutes").tag(30)
-                Text("60 minutes").tag(60)
-            }
-            Section("Data sources") {
-                Text("Forecasts blend Open-Meteo models (best match, NOAA HRRR, ECMWF IFS, NOAA GFS, DWD ICON) with the official National Weather Service forecast in the US. Alerts from NWS. Radar from NOAA NEXRAD via Iowa Environmental Mesonet (US) and RainViewer (global). All free, no API keys.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .formStyle(.grouped)
-        .frame(width: 460)
-        .padding()
     }
 }
 
@@ -336,7 +378,7 @@ struct MiniNowcast: View {
             HStack {
                 Text("Now"); Spacer(); Text("1 h"); Spacer(); Text("2 h")
             }
-            .font(.system(size: 9, weight: .medium)).opacity(0.75)
+            .font(.caption2.weight(.medium)).opacity(0.9)
         }
         .accessibilityLabel(report.nowcastSummary ?? "Rain in the next two hours")
     }

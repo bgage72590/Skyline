@@ -7,6 +7,7 @@ import SkylineCore
 /// a thin light edge with a soft glow rather than the system's bright blue highlight.
 struct SidebarView: View {
     @Environment(WeatherStore.self) private var store
+    @Environment(\.undoManager) private var undoManager
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -18,27 +19,15 @@ struct SidebarView: View {
                 if store.currentLocation == nil && store.isLocating && !store.locationDenied {
                     LocatingRow()
                 }
-                ForEach(Array(store.allLocations.enumerated()), id: \.element.id) { index, location in
-                    let selected = store.selectedLocation?.id == location.id
-                    Button {
-                        if store.selectedID != location.id { store.selectedID = location.id }
-                        focused = true
-                    } label: {
-                        SidebarRow(location: location, report: store.reports[location.id],
-                                   units: store.units, isSelected: selected)
-                    }
-                    .buttonStyle(.plain)
-                    .help(index < 9 ? "⌘\(index + 1)" : "")
-                    .accessibilityAddTraits(selected ? .isSelected : [])
-                    .contextMenu {
-                        if !location.isCurrentLocation {
-                            Button("Move Up") { store.move(location, by: -1) }
-                            Button("Move Down") { store.move(location, by: 1) }
-                            Divider()
-                            Button("Remove", role: .destructive) { store.remove(location) }
-                        }
-                    }
+                if let current = store.currentLocation {
+                    row(current, index: 0)
                 }
+                // Saved cities: drag to reorder (T19). My Location stays pinned on top.
+                let offset = store.currentLocation == nil ? 0 : 1
+                ForEach(Array(store.savedLocations.enumerated()), id: \.element.id) { index, location in
+                    row(location, index: index + offset)
+                }
+                .onMove { source, destination in store.moveSaved(fromOffsets: source, toOffset: destination) }
                 if store.locationDenied {
                     Text("Location Services is off for Skyline. Enable it in System Settings › Privacy & Security to see weather where you are.")
                         .font(.caption)
@@ -63,11 +52,43 @@ struct SidebarView: View {
         .onKeyPress(.upArrow) { store.selectLocation(offset: -1); return .handled }
         .onKeyPress(.downArrow) { store.selectLocation(offset: 1); return .handled }
         .onDeleteCommand {
-            if let location = store.selectedLocation, !location.isCurrentLocation { store.remove(location) }
+            // Undoable with ⌘Z (T19).
+            if let location = store.selectedLocation, !location.isCurrentLocation {
+                store.remove(location, undoManager: undoManager)
+            }
         }
         .task {
             // Fill in sidebar temperatures (cheap: served from cache when fresh).
             await store.refreshDue()
+        }
+    }
+
+    private func row(_ location: WeatherLocation, index: Int) -> some View {
+        let selected = store.selectedLocation?.id == location.id
+        return Button {
+            if store.selectedID != location.id { store.selectedID = location.id }
+            focused = true
+        } label: {
+            SidebarRow(location: location, report: store.reports[location.id],
+                       units: store.units, isSelected: selected,
+                       inMenuBar: store.menuBarLocation?.id == location.id)
+        }
+        .buttonStyle(.plain)
+        .help(index < 9 ? "⌘\(index + 1)" : "")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .contextMenu {
+            if store.menuBarPinID == location.id {
+                Button("Stop Pinning to Menu Bar") { store.menuBarPinID = nil }
+            } else {
+                Button("Show in Menu Bar") { store.menuBarPinID = location.id }
+            }
+            if !location.isCurrentLocation {
+                Divider()
+                Button("Move Up") { store.move(location, by: -1) }
+                Button("Move Down") { store.move(location, by: 1) }
+                Divider()
+                Button("Remove", role: .destructive) { store.remove(location, undoManager: undoManager) }
+            }
         }
     }
 
@@ -150,8 +171,9 @@ struct LocatingRow: View {
 struct SidebarRow: View {
     let location: WeatherLocation
     let report: WeatherReport?
-    let units: UnitPreference
+    let units: DisplayUnits
     let isSelected: Bool
+    var inMenuBar = false
     @State private var hovering = false
 
     static let radius: CGFloat = 14
@@ -166,6 +188,11 @@ struct SidebarRow: View {
                     Text(location.isCurrentLocation ? "My Location" : location.name)
                         .font(.system(size: 14, weight: .semibold))
                         .lineLimit(1)
+                    if inMenuBar {
+                        Image(systemName: "menubar.rectangle").font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Glass.secondaryText)
+                            .help("Shown in the menu bar")
+                    }
                 }
                 Text(location.isCurrentLocation ? location.name : Fmt.time(Date(), location.timeZone))
                     .font(.caption)
@@ -219,14 +246,18 @@ struct SidebarRow: View {
         .animation(.easeOut(duration: 0.2), value: isSelected)
     }
 
-    /// The card's condition gradient, slightly darkened (more when not selected) with a soft top sheen,
-    /// so different skies sit together without the brightest card shouting.
+    /// The card's condition gradient, darkened at least `SkyColors.cardScrim` (selected cards too: the
+    /// selection shows as the light edge and glow, not a brighter, less readable card), a bottom scrim
+    /// under the H/L line, and a soft top sheen. Keeps white text ≥ 4.5:1 on every sky (T6, tested).
     static func cardFill(_ gradient: LinearGradient, selected: Bool, hovering: Bool = false) -> some View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        let wash = selected || hovering ? SkyColors.cardScrim : SkyColors.cardScrim + 0.06
         return ZStack {
             shape.fill(gradient)
-            shape.fill(Color.black.opacity(selected ? 0.08 : (hovering ? 0.18 : 0.26)))
-            shape.fill(LinearGradient(colors: [.white.opacity(0.10), .clear], startPoint: .top, endPoint: .center))
+            shape.fill(Color.black.opacity(wash))
+            shape.fill(LinearGradient(colors: [.clear, .black.opacity(SkyColors.cardBottomScrim)],
+                                      startPoint: .center, endPoint: .bottom))
+            shape.fill(LinearGradient(colors: [.white.opacity(0.06), .clear], startPoint: .top, endPoint: .center))
         }
     }
 }

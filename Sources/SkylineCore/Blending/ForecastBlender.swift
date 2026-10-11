@@ -287,8 +287,8 @@ public enum ForecastBlender {
         func daytimePoP(_ m: ForecastModel, _ day: Date) -> Double? {
             guard !ignores(m, "precipitation_probability"),
                   let column = om.hourlyColumn("precipitation_probability", model: m) else { return nil }
-            let start = day.addingTimeInterval(6 * 3600)
-            guard let end = calendar.date(byAdding: .day, value: 1, to: day),
+            guard let start = calendar.date(bySettingHour: 6, minute: 0, second: 0, of: day),
+                  let end = calendar.date(byAdding: .day, value: 1, to: day),
                   let first = hourTimes.firstIndex(where: { $0 > start }), hourTimes.last.map({ $0 >= end }) == true
             else { return nil }
             var best: Double?

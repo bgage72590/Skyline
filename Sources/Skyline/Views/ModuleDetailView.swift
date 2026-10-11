@@ -69,7 +69,7 @@ struct ModuleDetailView: View {
         _day = State(initialValue: selection.day ?? report.daily.first?.date ?? Date())
     }
 
-    private var units: UnitPreference { store.units }
+    private var units: DisplayUnits { store.units }
     private var tz: TimeZone { report.timeZone }
     private var selectedDay: DailyForecast? { report.daily.first { $0.date == day } ?? report.daily.first }
 
@@ -215,7 +215,7 @@ struct ModuleDetailView: View {
             case .precipitation: v = h.precipitationProbability
             case .humidity: v = h.humidity
             case .visibility: v = h.visibility.map(units.distance)
-            case .pressure: v = h.pressure.map { units.isImperialDisplay ? $0 * 0.0295299830714 : $0 }
+            case .pressure: v = h.pressure.map { units.pressure($0) }
             case .confidence, .accuracy: v = nil
             }
             let spread = (module == .conditions) ? h.temperatureSpread.map(units.temperatureDelta) : nil
@@ -233,7 +233,7 @@ struct ModuleDetailView: View {
         let minSpan: Double = switch module {
         case .conditions, .feelsLike: 8
         case .uv: 4
-        case .pressure: units.isImperialDisplay ? 0.2 : 6
+        case .pressure: units.pressureStep
         default: 4
         }
         if hi - lo < minSpan { let mid = (hi + lo) / 2; lo = mid - minSpan / 2; hi = mid + minSpan / 2 }
@@ -250,7 +250,7 @@ struct ModuleDetailView: View {
         case .precipitation: "\(Int(v.rounded()))% chance"
         case .humidity: "\(Int(v.rounded()))%"
         case .visibility: String(format: "%.1f", v)
-        case .pressure: units.isImperialDisplay ? String(format: "%.2f inHg", v) : "\(Int(v.rounded())) hPa"
+        case .pressure: units.pressure == .inHg ? String(format: "%.2f inHg", v) : "\(Int(v.rounded())) hPa"
         case .confidence, .accuracy: ""
         }
     }
@@ -329,9 +329,11 @@ struct ModuleDetailView: View {
             .chartYScale(domain: domain)
             .chartXScale(domain: (pts.first!.time)...(pts.last!.time))
             .chartXAxis {
-                AxisMarks(values: .stride(by: .hour, count: 6)) { _ in
+                AxisMarks(values: .stride(by: .hour, count: 6)) { v in
                     AxisGridLine().foregroundStyle(.white.opacity(0.15))
-                    AxisValueLabel(format: .dateTime.hour()).foregroundStyle(Glass.secondaryText)
+                    // Fmt honours the 12/24-hour setting (Charts' own format follows only the system).
+                    AxisValueLabel { if let d = v.as(Date.self) { Text(Fmt.hour(d, tz)) } }
+                        .foregroundStyle(Glass.secondaryText)
                 }
             }
             .chartYAxis {

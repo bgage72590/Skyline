@@ -21,50 +21,13 @@ public enum UnitPreference: String, Codable, Sendable, CaseIterable, Identifiabl
     }
 
     var isImperial: Bool { resolved() == .imperial }
-    /// Whether values are shown in US customary units.
-    public var isImperialDisplay: Bool { isImperial }
 
-    public func temperature(_ celsius: Double) -> Double {
-        isImperial ? celsius * 9 / 5 + 32 : celsius
-    }
-
-    /// Rounded temperature with a degree sign, e.g. "62°".
-    public func temperatureString(_ celsius: Double?) -> String {
-        guard let celsius else { return "--" }
-        let v = Int(temperature(celsius).rounded())
-        return "\(v)°"
-    }
-
-    /// Converts a temperature *difference*.
-    public func temperatureDelta(_ celsius: Double) -> Double { isImperial ? celsius * 9 / 5 : celsius }
-
-    public func speed(_ kmh: Double) -> Double { isImperial ? kmh / 1.609344 : kmh }
-    public var speedUnit: String { isImperial ? "mph" : "km/h" }
-    public func speedString(_ kmh: Double?) -> String {
-        guard let kmh else { return "--" }
-        return "\(Int(speed(kmh).rounded())) \(speedUnit)"
-    }
-
-    public func precipitation(_ mm: Double) -> Double { isImperial ? mm / 25.4 : mm }
-    public var precipitationUnit: String { isImperial ? "in" : "mm" }
-    public func precipitationString(_ mm: Double?) -> String {
-        guard let mm else { return "--" }
-        let v = precipitation(mm)
-        return isImperial ? String(format: "%.2f\"", v) : String(format: "%.1f mm", v)
-    }
-
-    public func distance(_ metres: Double) -> Double { isImperial ? metres / 1609.344 : metres / 1000 }
-    public var distanceUnit: String { isImperial ? "mi" : "km" }
-    public func visibilityString(_ metres: Double?) -> String {
-        guard let metres else { return "--" }
-        let v = distance(metres)
-        return v >= 10 ? "\(Int(v.rounded())) \(distanceUnit)" : String(format: "%.1f %@", v, distanceUnit)
-    }
-
-    public func pressureString(_ hPa: Double?) -> String {
-        guard let hPa else { return "--" }
-        return isImperial ? String(format: "%.2f inHg", hPa * 0.0295299830714) : "\(Int(hPa.rounded())) hPa"
-    }
+    // Formatting goes through `DisplayUnits` (per-dimension units); these keep the preset shorthand.
+    public func temperatureString(_ celsius: Double?) -> String { units.temperatureString(celsius) }
+    public func speedString(_ kmh: Double?) -> String { units.speedString(kmh) }
+    public func precipitationString(_ mm: Double?) -> String { units.precipitationString(mm) }
+    public func visibilityString(_ metres: Double?) -> String { units.visibilityString(metres) }
+    public func pressureString(_ hPa: Double?) -> String { units.pressureString(hPa) }
 }
 
 public enum Compass {

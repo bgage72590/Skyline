@@ -4,7 +4,7 @@ import SkylineCore
 /// Square condition tiles (Apple Weather's grid). Tapping a tile opens its detail panel.
 struct DetailTilesGrid: View {
     let report: WeatherReport
-    let units: UnitPreference
+    let units: DisplayUnits
     var onOpen: (DetailModule) -> Void = { _ in }
 
     private let columns = [GridItem(.adaptive(minimum: 165), spacing: 14)]
@@ -200,7 +200,7 @@ struct SunCurve: View {
 
 struct WindTile: View {
     let report: WeatherReport
-    let units: UnitPreference
+    let units: DisplayUnits
     var body: some View {
         let c = report.current
         Tile(title: "Wind", systemImage: "wind") {
@@ -235,7 +235,7 @@ struct WindTile: View {
 
 struct PrecipitationTile: View {
     let report: WeatherReport
-    let units: UnitPreference
+    let units: DisplayUnits
     var body: some View {
         let next24 = report.upcomingHours(count: 24).compactMap(\.precipitation).reduce(0, +)
         let chance = report.today?.precipitationProbability
@@ -251,7 +251,7 @@ struct PrecipitationTile: View {
 
 struct FeelsLikeTile: View {
     let report: WeatherReport
-    let units: UnitPreference
+    let units: DisplayUnits
     var body: some View {
         let c = report.current
         let delta = c.apparentTemperature - c.temperature
@@ -268,7 +268,7 @@ struct FeelsLikeTile: View {
 
 struct HumidityTile: View {
     let report: WeatherReport
-    let units: UnitPreference
+    let units: DisplayUnits
     var body: some View {
         let c = report.current
         Tile(title: "Humidity", systemImage: "humidity.fill") {
@@ -280,7 +280,7 @@ struct HumidityTile: View {
 
 struct VisibilityTile: View {
     let report: WeatherReport
-    let units: UnitPreference
+    let units: DisplayUnits
     var body: some View {
         let v = report.current.visibility
         let detail: String = {
@@ -300,14 +300,14 @@ struct VisibilityTile: View {
 
 struct PressureTile: View {
     let report: WeatherReport
-    let units: UnitPreference
+    let units: DisplayUnits
     var body: some View {
         let p = report.current.pressure
         let trend = pressureTrend()
         Tile(title: "Pressure", systemImage: "gauge.with.dots.needle.33percent") {
             PressureGauge(hPa: p, trend: trend,
-                          valueText: p.map { units.isImperialDisplay ? String(format: "%.2f", $0 * 0.0295299830714) : "\(Int($0.rounded()))" } ?? "--",
-                          unitText: units.isImperialDisplay ? "inHg" : "hPa")
+                          valueText: p.map { units.pressureNumber($0) } ?? "--",
+                          unitText: units.pressureUnit)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
@@ -431,7 +431,7 @@ struct MoonTile: View {
 /// Skyline-only module, styled like Apple's tiles: how closely the sources agree for today.
 struct ConfidenceTile: View {
     let report: WeatherReport
-    let units: UnitPreference
+    let units: DisplayUnits
     var body: some View {
         let spread = report.today?.highSpread
         let level: String = {

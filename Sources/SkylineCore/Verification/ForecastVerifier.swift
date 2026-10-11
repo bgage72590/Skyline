@@ -162,7 +162,9 @@ public actor ForecastVerifier {
     public func weights(_ key: String) -> BlendWeights {
         load()
         if let w = cachedWeights[key] { return w }
-        let w = AdaptiveWeighting.weights(from: scores(key), config: config)
+        // Learn from every member's full record (see `dedupingNOAAFamily(dropDuplicates:)`); display stays de-duplicated.
+        let learning = AccuracyScorer.score(verified.filter { $0.r.loc == key }, now: now(), dedupe: false)
+        let w = AdaptiveWeighting.weights(from: learning, config: config)
         cachedWeights[key] = w
         return w
     }

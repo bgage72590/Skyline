@@ -6,8 +6,11 @@ import SkylineCore
 @MainActor
 enum Fmt {
     private static var cache: [String: DateFormatter] = [:]
+    /// 12/24-hour choice from Settings (T20); every hour/time template below goes through it.
+    static var clock: ClockStyle = .system { didSet { if clock != oldValue { cache.removeAll() } } }
 
-    static func string(_ date: Date, template: String, timeZone: TimeZone) -> String {
+    static func string(_ date: Date, template rawTemplate: String, timeZone: TimeZone) -> String {
+        let template = clock.template(rawTemplate)
         let key = template + "|" + timeZone.identifier
         let formatter: DateFormatter
         if let cached = cache[key] {
@@ -37,23 +40,9 @@ enum Fmt {
 
 /// Apple-Weather-like sky gradients. Static (no animation) to keep the GPU idle.
 enum SkyPalette {
+    /// Colours live in SkylineCore (`SkyColors`) so their text contrast is unit-tested (T6).
     static func colors(_ category: SkyCategory, isDay: Bool) -> [Color] {
-        func c(_ r: Double, _ g: Double, _ b: Double) -> Color { Color(red: r, green: g, blue: b) }
-        switch (category, isDay) {
-        case (.clear, true): return [c(0.19, 0.46, 0.86), c(0.42, 0.70, 0.97)]
-        case (.clear, false): return [c(0.03, 0.06, 0.19), c(0.14, 0.20, 0.40)]
-        case (.partlyCloudy, true): return [c(0.27, 0.50, 0.80), c(0.56, 0.71, 0.88)]
-        case (.partlyCloudy, false): return [c(0.07, 0.10, 0.22), c(0.22, 0.27, 0.42)]
-        case (.cloudy, true): return [c(0.40, 0.48, 0.58), c(0.62, 0.68, 0.76)]
-        case (.cloudy, false): return [c(0.12, 0.15, 0.21), c(0.27, 0.31, 0.38)]
-        case (.fog, true): return [c(0.50, 0.53, 0.58), c(0.71, 0.73, 0.76)]
-        case (.fog, false): return [c(0.18, 0.19, 0.22), c(0.33, 0.35, 0.38)]
-        case (.drizzle, true), (.rain, true): return [c(0.25, 0.33, 0.45), c(0.45, 0.53, 0.63)]
-        case (.drizzle, false), (.rain, false): return [c(0.07, 0.10, 0.16), c(0.20, 0.25, 0.33)]
-        case (.snow, true): return [c(0.52, 0.60, 0.73), c(0.78, 0.83, 0.90)]
-        case (.snow, false): return [c(0.16, 0.19, 0.27), c(0.33, 0.37, 0.46)]
-        case (.thunderstorm, _): return [c(0.15, 0.15, 0.25), c(0.32, 0.29, 0.41)]
-        }
+        SkyColors.stops(category, isDay: isDay).map { Color(red: $0.r, green: $0.g, blue: $0.b) }
     }
 
     static func gradient(_ category: SkyCategory, isDay: Bool) -> LinearGradient {

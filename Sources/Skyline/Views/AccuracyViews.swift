@@ -5,7 +5,7 @@ import SkylineCore
 /// Tile in the grid: either "Collecting data" with progress, or the blend's verified error.
 struct AccuracyTile: View {
     let location: WeatherLocation
-    let units: UnitPreference
+    let units: DisplayUnits
     @Environment(WeatherStore.self) private var store
 
     var body: some View {
@@ -26,10 +26,14 @@ struct AccuracyTile: View {
 }
 
 enum AccuracyFormat {
-    static func delta(_ c: Double, _ units: UnitPreference) -> String {
+    static func delta(_ c: Double, _ units: DisplayUnits) -> String {
         String(format: "%.1f°", units.temperatureDelta(c))
     }
-    static func signed(_ c: Double, _ units: UnitPreference) -> String {
+    /// "1.9°F"
+    static func deltaWithUnit(_ c: Double, _ units: DisplayUnits) -> String {
+        String(format: "%.1f", units.temperatureDelta(c)) + units.temperature.label
+    }
+    static func signed(_ c: Double, _ units: DisplayUnits) -> String {
         String(format: "%+.1f°", units.temperatureDelta(c))
     }
     static func percent(_ v: Double?) -> String { v.map { "\(Int(($0 * 100).rounded()))%" } ?? "—" }
@@ -41,9 +45,10 @@ enum AccuracyFormat {
 /// Body of the Forecast Accuracy detail (inspector column or panel).
 struct AccuracyPanel: View {
     let location: WeatherLocation
-    let units: UnitPreference
+    let units: DisplayUnits
     @Environment(WeatherStore.self) private var store
     @State private var bucket: LeadBucket?
+    @State private var showDetails = false
 
     var body: some View {
         let r = store.accuracy[location.id]
@@ -55,6 +60,11 @@ struct AccuracyPanel: View {
                     .padding(.horizontal, 10).padding(.vertical, 6)
                     .background(Color.yellow, in: Capsule())
             }
+            // One plain-English sentence first (T9); the numbers and jargon sit behind Details.
+            Text(r.map { AccuracySummary.headline($0, delta: { AccuracyFormat.deltaWithUnit($0, units) }) }
+                 ?? "Skyline is checking its forecasts against what the nearest weather station measures. The first results appear once a few hours have been verified.")
+                .font(.title3.weight(.medium))
+                .fixedSize(horizontal: false, vertical: true)
             if let r {
                 if r.status == .collecting { collecting(r) }
                 if r.verifiedPairs > 0 { scores(r) }
@@ -107,7 +117,7 @@ struct AccuracyPanel: View {
         let blend = (bucket.flatMap { r.byBucket[$0] } ?? r.overall)[.blend]
         // Headline numbers.
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
-            stat("Skyline temp. error", blend?.tempMAE.map { "±" + AccuracyFormat.delta($0, units) } ?? "—",
+            stat("Typical temp. miss", blend?.tempMAE.map { "±" + AccuracyFormat.delta($0, units) } ?? "—",
                  blend?.tempBiasMean.map { "Bias " + AccuracyFormat.signed($0, units) } ?? "")
             stat("Rain hours caught", AccuracyFormat.percent(blend?.hitRate),
                  blend?.falseAlarmRatio.map { "\(AccuracyFormat.percent($0)) false alarms" } ?? "No wet hours yet")
@@ -128,8 +138,15 @@ struct AccuracyPanel: View {
             Text("No verified forecasts at this lead time yet.").font(.callout).foregroundStyle(Glass.secondaryText)
         } else {
             maeChart(rows)
-            sourceTable(rows)
-            weightsRow(r)
+            DisclosureGroup("Details: every source, rain scores and the weights in use", isExpanded: $showDetails) {
+                VStack(alignment: .leading, spacing: 10) {
+                    sourceTable(rows)
+                    weightsRow(r)
+                }
+                .padding(.top, 6)
+            }
+            .font(.callout)
+            .tint(.white)
         }
     }
 
@@ -169,7 +186,7 @@ struct AccuracyPanel: View {
         Grid(alignment: .trailing, horizontalSpacing: 10, verticalSpacing: 6) {
             GridRow {
                 Text("Source").gridColumnAlignment(.leading)
-                Text("Temp"); Text("Bias"); Text("Wind"); Text("Rain hit"); Text("False"); Text("Brier"); Text("n")
+                Text("Temp"); Text("Bias"); Text("Wind"); Text("Rain caught"); Text("False alarms"); Text("Brier"); Text("Hours")
             }
             .font(.caption2.weight(.semibold)).foregroundStyle(Glass.secondaryText)
             ForEach(rows, id: \.source) { s in
@@ -188,7 +205,7 @@ struct AccuracyPanel: View {
         }
         .padding(10)
         .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        Text("Wind error in \(units.speedUnit) · n = recency-weighted samples · Brier only for sources that give a rain probability")
+        Text("Temp and wind: typical error (wind in \(units.speedUnit)). Bias: + means forecasts ran warm. Hours: recent-weighted hours checked. Brier: rain-probability score, lower is better (only sources that give a probability).")
             .font(.caption2).foregroundStyle(Glass.secondaryText)
     }
 

@@ -32,12 +32,18 @@ public actor ResponseCache {
 
     /// Deletes entries older than `maxAge` (default 14 days) so old "My Location" responses don't pile
     /// up as a timestamped location trail. Unreadable files are deleted too. Call once at launch.
-    public func prune(olderThan maxAge: TimeInterval = 14 * 86400) {
+    /// The disk scan runs off the actor (awaiting it frees the actor), so forecast fetches made during
+    /// the sweep aren't stuck behind it.
+    public func prune(olderThan maxAge: TimeInterval = 14 * 86400) async {
         let cutoff = now().addingTimeInterval(-maxAge)
         memory = memory.filter { $0.value.storedAt >= cutoff }
         recency.removeAll { memory[$0] == nil }
-        guard let directory,
-              let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        guard let directory else { return }
+        await Task.detached(priority: .utility) { Self.pruneFiles(in: directory, cutoff: cutoff) }.value
+    }
+
+    private nonisolated static func pruneFiles(in directory: URL, cutoff: Date) {
+        guard let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         else { return }
         for url in files where url.pathExtension == "plist" {
             guard let raw = try? Data(contentsOf: url),
