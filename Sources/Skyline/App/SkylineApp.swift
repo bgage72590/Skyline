@@ -31,6 +31,18 @@ struct SkylineApp: App {
                 .disabled(store.selectedLocation == nil)
                 Button(store.radar.isPlaying ? "Pause Radar" : "Play Radar") { store.radar.togglePlay() }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
+                Divider()
+                Button("Previous Location") { store.selectLocation(offset: -1) }
+                    .keyboardShortcut(.upArrow, modifiers: .command)
+                Button("Next Location") { store.selectLocation(offset: 1) }
+                    .keyboardShortcut(.downArrow, modifiers: .command)
+                ForEach(Array(store.allLocations.prefix(9).enumerated()), id: \.element.id) { i, location in
+                    Button(location.isCurrentLocation ? "My Location" : location.name) { store.selectLocation(number: i + 1) }
+                        .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: .command)
+                }
+                Divider()
+                Button("Focus Forecast") { store.focusContentRequest += 1 }
+                    .keyboardShortcut("f", modifiers: [.command, .shift])
             }
         }
 

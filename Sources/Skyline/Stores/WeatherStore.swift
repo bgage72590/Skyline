@@ -134,6 +134,7 @@ final class WeatherStore {
             var report = try await service.report(for: location, forceRefresh: force)
             report.location = location
             if defaults.bool(forKey: "SkylineDemoAlert"), report.alerts.isEmpty { report.alerts = [Self.demoAlert(near: location)] }
+            if defaults.bool(forKey: "SkylineDemoRain") { report.minutely = Self.demoRain(from: report.current.time) }
             reports[location.id] = report
             errors[location.id] = nil
         } catch is CancellationError {
@@ -259,6 +260,14 @@ final class WeatherStore {
                            Coordinate(latitude: c.latitude - 0.3, longitude: c.longitude + 0.45),
                            Coordinate(latitude: c.latitude - 0.2, longitude: c.longitude - 0.6)]]
         return alert
+    }
+
+    /// QA hook (`-SkylineDemoRain YES`): a synthetic shower in the nowcast so the "Next 2 Hours"
+    /// chart can be checked on a dry day. Never applied without the launch argument.
+    static func demoRain(from now: Date) -> [MinutelyPrecipitation] {
+        let start = (now.timeIntervalSince1970 / 900).rounded(.down) * 900
+        let mm: [Double] = [0, 0, 0.08, 0.3, 0.7, 1.6, 2.4, 1.3, 0.6, 0.35, 0.2, 0.1, 0, 0]
+        return mm.enumerated().map { MinutelyPrecipitation(time: Date(timeIntervalSince1970: start + Double($0.offset) * 900), precipitation: $0.element) }
     }
 
     // MARK: Keyboard navigation

@@ -101,55 +101,107 @@ struct AlertBanner: View {
     }
 }
 
-/// Next-two-hours precipitation from the 15-minute nowcast. Shown only when rain is actually due.
+/// Next-two-hours precipitation: a dense, continuous rain-intensity curve built from the 15-minute
+/// nowcast (monotone-cubic interpolated to one sample per minute, see `NowcastCurve`), on a perceptual
+/// Light / Moderate / Heavy scale with guide lines, time labels and a hover/drag/←→ scrubber.
+/// Shown only when rain is actually due.
 struct NowcastCard: View {
     let report: WeatherReport
     let units: UnitPreference
     @State private var scrub: Date?
 
+    private static let rain = Color(red: 0.36, green: 0.72, blue: 1.0)
+
     var body: some View {
-        let now = report.current.time
-        let rows = report.minutely.filter { $0.time >= now.addingTimeInterval(-15 * 60) && $0.time <= now.addingTimeInterval(2 * 3600) }
-        let maxValue = max(rows.map(\.precipitation).max() ?? 0, 1.0)
-        let selected = scrub.flatMap { s in rows.first { $0.time == s } }
+        // Start at the current minute (not the report's fetch time) so "Now" is honest for cached data.
+        let start = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 / 60).rounded(.down) * 60)
+        let samples = NowcastCurve.samples(report.minutely, from: start, minutes: 120)
+        let end = start.addingTimeInterval(120 * 60)
+        let selected = scrub.flatMap { s in samples.min { abs($0.time.timeIntervalSince(s)) < abs($1.time.timeIntervalSince(s)) } }
+        let tz = report.timeZone
         Card(title: "Next 2 Hours", systemImage: "cloud.rain.fill", subtitle: report.nowcastSummary.map { $0 + "." }) {
             Chart {
-                ForEach(rows, id: \.time) { r in
-                    BarMark(x: .value("Time", r.time, unit: .minute), y: .value("mm", r.precipitation), width: .ratio(0.7))
-                        .foregroundStyle(Color(red: 0.4, green: 0.75, blue: 1.0).gradient)
-                        .cornerRadius(2)
+                // Guide lines first so the rain draws over them.
+                ForEach([1.0, 2.0, 3.0], id: \.self) { level in
+                    RuleMark(y: .value("Guide", level))
+                        .foregroundStyle(.white.opacity(0.16))
+                        .lineStyle(StrokeStyle(lineWidth: 0.5, dash: [2, 3]))
+                }
+                ForEach(samples, id: \.time) { s in
+                    AreaMark(x: .value("Time", s.time), y: .value("Intensity", NowcastCurve.level(s.rate)))
+                        .interpolationMethod(.monotone)
+                        .foregroundStyle(LinearGradient(
+                            stops: [.init(color: Self.rain.opacity(0.95), location: 0),
+                                    .init(color: Self.rain.opacity(0.55), location: 0.55),
+                                    .init(color: Self.rain.opacity(0.12), location: 1)],
+                            startPoint: .top, endPoint: .bottom))
+                    LineMark(x: .value("Time", s.time), y: .value("Intensity", NowcastCurve.level(s.rate)))
+                        .interpolationMethod(.monotone)
+                        .lineStyle(StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
+                        .foregroundStyle(Color(red: 0.62, green: 0.86, blue: 1.0))
                 }
                 if let selected {
                     RuleMark(x: .value("Selected", selected.time))
-                        .foregroundStyle(.white.opacity(0.8))
-                        .annotation(position: .top, spacing: 2, overflowResolution: .init(x: .fit(to: .chart), y: .fit(to: .chart))) {
-                            ScrubCallout(title: Fmt.time(selected.time, report.timeZone),
-                                         value: intensity(selected.precipitation))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .lineStyle(StrokeStyle(lineWidth: 1))
+                        .annotation(position: .top, spacing: 2,
+                                    overflowResolution: .init(x: .fit(to: .chart), y: .fit(to: .chart))) {
+                            ScrubCallout(title: Fmt.time(selected.time, tz) + "  ·  " + relative(selected.time, from: start),
+                                         value: intensity(selected.rate))
                         }
+                    PointMark(x: .value("Selected", selected.time), y: .value("Intensity", NowcastCurve.level(selected.rate)))
+                        .symbolSize(48)
+                        .foregroundStyle(.white)
                 }
             }
-            .chartYScale(domain: 0...(maxValue * 1.5))
+            .chartXScale(domain: start...end)
+            .chartYScale(domain: 0...3.9) // headroom above "Heavy" for the callout
             .chartYAxis {
-                AxisMarks(values: [0, maxValue / 2, maxValue]) { v in
-                    AxisGridLine().foregroundStyle(.white.opacity(0.12))
-                    AxisValueLabel { Text(v.index == 0 ? "" : (v.index == 1 ? "Light" : "Heavy")) }
-                        .foregroundStyle(Glass.secondaryText)
+                AxisMarks(position: .leading, values: [1.0, 2.0, 3.0]) { v in
+                    AxisValueLabel(horizontalSpacing: 6) {
+                        Text(["", "Light", "Moderate", "Heavy"][min(max(v.index + 1, 0), 3)])
+                    }
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(Glass.secondaryText)
                 }
             }
             .chartXAxis {
-                AxisMarks(values: .stride(by: .minute, count: 30)) { _ in
-                    AxisValueLabel(format: .dateTime.hour().minute()).foregroundStyle(Glass.secondaryText)
+                AxisMarks(values: Self.ticks(start: start, end: end)) { v in
+                    AxisTick(length: 3).foregroundStyle(.white.opacity(0.3))
+                    AxisValueLabel(anchor: v.index == 0 ? .topLeading : .top) {
+                        if let d = v.as(Date.self) {
+                            Text(v.index == 0 ? "Now" : Fmt.time(d, tz))
+                        }
+                    }
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(Glass.secondaryText)
                 }
             }
-            .chartScrubber(times: rows.map(\.time), selection: $scrub)
-            .environment(\.timeZone, report.timeZone)
-            .frame(height: 110)
+            .chartPlotStyle { $0.clipped() }
+            .chartScrubber(times: samples.map(\.time), selection: $scrub)
+            .environment(\.timeZone, tz)
+            .frame(height: 130)
+            .accessibilityLabel("Rain intensity over the next two hours")
+            .accessibilityValue(report.nowcastSummary ?? "")
         }
     }
 
-    private func intensity(_ mm15: Double) -> String {
-        let perHour = mm15 * 4
-        let label = perHour < 0.4 ? "None" : (perHour < 2.5 ? "Light" : (perHour < 7.6 ? "Moderate" : "Heavy"))
-        return "\(label) · \(units.precipitationString(perHour))/h"
+    /// "Now" plus round clock times (:00 / :30), skipping any that would crowd "Now" or the right edge.
+    static func ticks(start: Date, end: Date) -> [Date] {
+        let first = (start.timeIntervalSince1970 / 1800).rounded(.up) * 1800
+        let rounds = stride(from: first, to: end.timeIntervalSince1970 - 8 * 60, by: 1800)
+            .filter { $0 - start.timeIntervalSince1970 >= 12 * 60 }
+            .map { Date(timeIntervalSince1970: $0) }
+        return [start] + rounds
+    }
+
+    private func relative(_ t: Date, from start: Date) -> String {
+        let m = Int((t.timeIntervalSince(start) / 60).rounded())
+        return m <= 0 ? "now" : "in \(m) min"
+    }
+
+    private func intensity(_ perHour: Double) -> String {
+        let name = NowcastCurve.intensityName(perHour)
+        return perHour < 0.1 ? "No rain" : "\(name) · \(units.precipitationString(perHour))/h"
     }
 }

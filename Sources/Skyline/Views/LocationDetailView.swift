@@ -16,6 +16,7 @@ struct LocationDetailView: View {
     @Environment(WeatherStore.self) private var store
     @Namespace private var radarNamespace
     @State private var isWide = true
+    @State private var widthBox = WidthBox()
     @FocusState private var contentFocused: Bool
 
     static let wideOn: CGFloat = 1000
@@ -41,9 +42,17 @@ struct LocationDetailView: View {
         }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { w in
             if UserDefaults.standard.bool(forKey: "SkylineLogLayout") { NSLog("SkylineLayout width=%.0f wide=%d", w, isWide ? 1 : 0) }
-            let wide = isWide ? w >= Self.wideOff : w >= Self.wideOn
-            guard wide != isWide else { return }
-            DispatchQueue.main.async { if isWide != wide { isWide = wide } }
+            // Record the latest width (unobserved), then decide on the next main-queue turn from the
+            // *latest* width, so a stale early value (e.g. 100 pt while the window opens) can't win.
+            widthBox.width = w
+            guard !widthBox.pending else { return }
+            widthBox.pending = true
+            DispatchQueue.main.async {
+                widthBox.pending = false
+                let latest = widthBox.width
+                let wide = isWide ? latest >= Self.wideOff : latest >= Self.wideOn
+                if wide != isWide { isWide = wide }
+            }
         }
         .environment(\.colorScheme, .dark)
         .environment(\.isWideLayout, isWide)
@@ -128,6 +137,12 @@ struct LocationDetailView: View {
             store.activeModule = ModuleSelection(module: module, day: day)
         }
     }
+}
+
+/// Plain (unobserved) holder for the latest measured width; writing it never invalidates a view.
+private final class WidthBox {
+    var width: CGFloat = 0
+    var pending = false
 }
 
 private struct IsWideLayoutKey: EnvironmentKey { static let defaultValue = false }
@@ -315,11 +330,12 @@ struct HourlyCard: View {
 
     /// Apple-style one-line summary: nowcast first, otherwise the NWS/consensus text for today.
     private var headline: String? {
-        if let nowcast = report.nowcastSummary { return nowcast + "." }
+        // The pinned briefing (and the Next 2 Hours card) already say what the nowcast says, so the
+        // hourly card leads with the day's forecast text and falls back to the nowcast.
         if let summary = report.today?.summary {
             return summary.split(separator: ".").prefix(2).joined(separator: ".") + "."
         }
-        return nil
+        return report.nowcastSummary.map { $0 + "." }
     }
 }
 
