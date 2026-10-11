@@ -2,7 +2,7 @@ import Foundation
 
 /// URL builders for every free API Skyline uses. None require keys.
 public enum Endpoints {
-    static let hourlyVars = "temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,is_day,uv_index,wind_speed_10m,wind_direction_10m,relative_humidity_2m,dew_point_2m,pressure_msl,visibility"
+    static let hourlyVars = "temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,is_day,uv_index,wind_speed_10m,wind_direction_10m,relative_humidity_2m,dew_point_2m,pressure_msl,visibility,wind_gusts_10m"
     static let dailyVars = "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,sunrise,sunset,uv_index_max,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant"
     static let currentVars = "temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,cloud_cover,pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,uv_index,dew_point_2m"
 
@@ -31,6 +31,9 @@ public enum Endpoints {
             .init(name: "latitude", value: String(format: "%.4f", c.latitude)),
             .init(name: "longitude", value: String(format: "%.4f", c.longitude)),
             .init(name: "current", value: "us_aqi,pm2_5,pm10,ozone"),
+            .init(name: "hourly", value: "us_aqi"),
+            .init(name: "forecast_days", value: "2"),
+            .init(name: "timeformat", value: "unixtime"),
             .init(name: "timezone", value: "auto"),
         ]
         return u.url!
@@ -49,6 +52,12 @@ public enum Endpoints {
 
     public static func nwsPoint(_ c: Coordinate) -> URL {
         URL(string: String(format: "https://api.weather.gov/points/%.4f,%.4f", c.latitude, c.longitude))!
+    }
+
+    /// Forecast-zone metadata incl. its outline geometry (e.g. https://api.weather.gov/zones/forecast/NYZ072).
+    public static func nwsZone(_ url: URL) -> URL? {
+        guard url.host == "api.weather.gov" else { return nil }
+        return url
     }
 
     public static func nwsAlerts(_ c: Coordinate) -> URL {

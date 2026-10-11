@@ -65,6 +65,22 @@ public enum RainViewerParser {
     }
 }
 
+/// How far back the radar loop goes (NEXRAD only; RainViewer's free tier is fixed at ~2 h).
+public enum RadarRange: String, CaseIterable, Codable, Sendable, Identifiable {
+    case oneHour, twoHours, threeHours
+    public var id: String { rawValue }
+    public var label: String {
+        switch self { case .oneHour: "1 hr"; case .twoHours: "2 hr"; case .threeHours: "3 hr" }
+    }
+    /// Minutes between frames (keeps every range at ≤ 13 frames, so prefetch memory is the same).
+    public var stepMinutes: Int {
+        switch self { case .oneHour: 5; case .twoHours: 10; case .threeHours: 15 }
+    }
+    public var totalMinutes: Int {
+        switch self { case .oneHour: 50; case .twoHours: 120; case .threeHours: 180 }
+    }
+}
+
 public enum IEMNexrad {
     struct Raw: Decodable {
         struct Meta: Decodable { var valid: String }
@@ -87,6 +103,23 @@ public enum IEMNexrad {
             let layer = minutesAgo == 0 ? "nexrad-n0q-900913" : String(format: "nexrad-n0q-900913-m%02dm", minutesAgo)
             return RadarFrame(time: latest.addingTimeInterval(-Double(minutesAgo) * 60),
                               urlTemplate: "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/\(layer)/{z}/{x}/{y}.png?v=\(version)")
+        }
+    }
+
+    /// Longer loops use IEM's archived composites, addressed by their UTC scan time
+    /// (`ridge::USCOMP-N0Q-YYYYMMDDHHMM`). Those URLs never change content, so they cache well.
+    public static func frames(latest: Date, range: RadarRange) -> [RadarFrame] {
+        guard range != .oneHour else { return frames(latest: latest) }
+        let step = Double(range.stepMinutes * 60)
+        let base = (latest.timeIntervalSince1970 / 300).rounded(.down) * 300
+        let count = range.totalMinutes / range.stepMinutes
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyyMMddHHmm"
+        return (0...count).reversed().map { k in
+            let t = Date(timeIntervalSince1970: base - Double(k) * step)
+            return RadarFrame(time: t, urlTemplate: "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/ridge::USCOMP-N0Q-\(formatter.string(from: t))/{z}/{x}/{y}.png")
         }
     }
 }

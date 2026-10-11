@@ -96,8 +96,9 @@ public struct NWSPeriod: Codable, Hashable, Sendable {
 
 public enum NWSAlertParser {
     struct Raw: Decodable {
-        struct Feature: Decodable { var properties: Props }
+        struct Feature: Decodable { var properties: Props; var geometry: GeoJSONGeometry? }
         struct Props: Decodable {
+            var affectedZones: [String]?
             var id: String
             var event: String
             var headline: String?
@@ -118,19 +119,68 @@ public enum NWSAlertParser {
     /// Parses `/alerts/active` GeoJSON. Drops test/exercise messages, sorts most severe first.
     public static func decode(_ data: Data) throws -> [WeatherAlert] {
         let raw = try JSONDecoder().decode(Raw.self, from: data)
-        return raw.features.map(\.properties)
-            .filter { ($0.status ?? "Actual") == "Actual" }
-            .map { p in
-                WeatherAlert(id: p.id, event: p.event, headline: p.headline,
+        return raw.features
+            .filter { ($0.properties.status ?? "Actual") == "Actual" }
+            .map { f in
+                let p = f.properties
+                var alert = WeatherAlert(id: p.id, event: p.event, headline: p.headline,
                              severity: AlertSeverity(rawValue: p.severity ?? "") ?? .unknown,
                              urgency: p.urgency, areaDescription: p.areaDesc,
                              description: p.description, instruction: p.instruction,
                              effective: p.effective.flatMap(NWSDate.parse),
                              expires: p.expires.flatMap(NWSDate.parse),
                              ends: p.ends.flatMap(NWSDate.parse), senderName: p.senderName)
+                alert.polygons = f.geometry?.rings ?? []
+                alert.affectedZones = (p.affectedZones ?? []).compactMap(URL.init(string:))
+                return alert
             }
             .sorted { $0.severity == $1.severity ? ($0.effective ?? .distantPast) > ($1.effective ?? .distantPast)
                                                   : $0.severity > $1.severity }
+    }
+}
+
+/// Minimal GeoJSON geometry: Polygon / MultiPolygon outer rings as coordinates (holes ignored).
+public struct GeoJSONGeometry: Decodable, Sendable {
+    public var rings: [[Coordinate]]
+
+    enum CodingKeys: String, CodingKey { case type, coordinates }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let type = try c.decode(String.self, forKey: .type)
+        func ring(_ points: [[Double]]) -> [Coordinate] {
+            points.compactMap { $0.count >= 2 ? Coordinate(latitude: $0[1], longitude: $0[0]) : nil }
+        }
+        switch type {
+        case "Polygon":
+            let polygon = try c.decode([[[Double]]].self, forKey: .coordinates)
+            rings = polygon.prefix(1).map(ring)
+        case "MultiPolygon":
+            let multi = try c.decode([[[[Double]]]].self, forKey: .coordinates)
+            rings = multi.compactMap { $0.first.map(ring) }
+        default:
+            rings = []
+        }
+        rings = rings.map { GeoJSONGeometry.simplify($0, maxPoints: 400) }.filter { $0.count >= 3 }
+    }
+
+    /// Keeps every n-th point so detailed zone outlines stay cheap to draw.
+    public static func simplify(_ ring: [Coordinate], maxPoints: Int) -> [Coordinate] {
+        guard ring.count > maxPoints, maxPoints > 3 else { return ring }
+        let step = Double(ring.count) / Double(maxPoints)
+        var out: [Coordinate] = []
+        var i = 0.0
+        while Int(i) < ring.count { out.append(ring[Int(i)]); i += step }
+        if let last = ring.last, out.last != last { out.append(last) }
+        return out
+    }
+}
+
+/// `/zones/forecast/{id}` → the zone outline.
+public enum NWSZoneParser {
+    struct Raw: Decodable { var geometry: GeoJSONGeometry? }
+    public static func decode(_ data: Data) throws -> [[Coordinate]] {
+        try JSONDecoder().decode(Raw.self, from: data).geometry?.rings ?? []
     }
 }
 

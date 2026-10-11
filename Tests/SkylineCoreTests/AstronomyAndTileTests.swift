@@ -75,3 +75,57 @@ final class AstronomyAndTileTests: XCTestCase {
         XCTAssertNotNil(gate.filter(0.54))
     }
 }
+
+final class RedesignCoreTests: XCTestCase {
+    func testIEMRangeFrames() {
+        let latest = Date(timeIntervalSince1970: 1_791_740_100) // a 5-minute boundary
+        let two = IEMNexrad.frames(latest: latest, range: .twoHours)
+        XCTAssertEqual(two.count, 13)
+        XCTAssertEqual(two.last?.time, latest)
+        XCTAssertEqual(two.first?.time, latest.addingTimeInterval(-120 * 60))
+        XCTAssertTrue(two.last!.urlTemplate.contains("ridge::USCOMP-N0Q-"), two.last!.urlTemplate)
+        XCTAssertEqual(IEMNexrad.frames(latest: latest, range: .threeHours).count, 13)
+        XCTAssertEqual(IEMNexrad.frames(latest: latest, range: .oneHour).count, 11)
+    }
+
+    func testAlertGeometryParsing() throws {
+        let json = """
+        {"features":[{"geometry":{"type":"Polygon","coordinates":[[[-74,40],[-73,40],[-73,41],[-74,40]]]},
+          "properties":{"id":"a","event":"Flood Warning","severity":"Severe","affectedZones":["https://api.weather.gov/zones/forecast/NYZ072"]}},
+         {"geometry":null,"properties":{"id":"b","event":"Rip Current Statement","severity":"Moderate",
+          "affectedZones":["https://api.weather.gov/zones/forecast/NYZ075"]}}]}
+        """
+        let alerts = try NWSAlertParser.decode(Data(json.utf8))
+        XCTAssertEqual(alerts.count, 2)
+        XCTAssertEqual(alerts[0].polygons.first?.count, 4)
+        XCTAssertEqual(alerts[0].polygons.first?.first, Coordinate(latitude: 40, longitude: -74))
+        XCTAssertTrue(alerts[1].polygons.isEmpty)
+        XCTAssertEqual(alerts[1].affectedZones.first?.lastPathComponent, "NYZ075")
+    }
+
+    func testZoneMultiPolygonSimplified() throws {
+        let ring = (0..<1000).map { i in "[\(-74 + Double(i) / 1000),\(40 + sin(Double(i)))]" }.joined(separator: ",")
+        let json = "{\"geometry\":{\"type\":\"MultiPolygon\",\"coordinates\":[[[\(ring)]],[[[0,0],[1,0],[1,1],[0,0]]]]}}"
+        let rings = try NWSZoneParser.decode(Data(json.utf8))
+        XCTAssertEqual(rings.count, 2)
+        XCTAssertLessThanOrEqual(rings[0].count, 402)
+    }
+
+    func testAirQualityHourly() throws {
+        let json = """
+        {"current":{"us_aqi":42},"hourly":{"time":[1791720000,1791723600],"us_aqi":[40,null]}}
+        """
+        let aq = try XCTUnwrap(OpenMeteoAirQualityResponse.decode(Data(json.utf8)))
+        XCTAssertEqual(aq.hourly.count, 1)
+        XCTAssertEqual(aq.hourly.first?.value, 40)
+        XCTAssertEqual(AirQuality.category(42), "Good")
+    }
+
+    func testBriefingPeakAndRain() {
+        let now = Date(timeIntervalSince1970: 1_791_720_000)
+        let series = (0..<30).map { (now.addingTimeInterval(Double($0) * 3600), Double($0 == 5 ? 50 : 10)) }
+        let peak = Briefing.peak(series, from: now)
+        XCTAssertEqual(peak?.value, 50)
+        XCTAssertEqual(peak?.time, now.addingTimeInterval(5 * 3600))
+    }
+}

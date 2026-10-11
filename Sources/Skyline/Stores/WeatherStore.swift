@@ -24,6 +24,8 @@ final class WeatherStore {
     var units: UnitPreference { didSet { defaults.set(units.rawValue, forKey: Keys.units) } }
     var refreshMinutes: Int { didSet { defaults.set(refreshMinutes, forKey: Keys.refresh); startRefreshLoop() } }
     var locationDenied = false
+    /// True while "My Location" is waiting for its first fix (the sidebar shows a loading row).
+    var isLocating = false
 
     var searchText = ""
     var searchResults: [PlaceSearchResult] = []
@@ -48,6 +50,7 @@ final class WeatherStore {
         static let units = "unitPreference"
         static let refresh = "refreshMinutes"
         static let seeded = "seededDefaultLocation"
+        static let lastFix = "lastCurrentLocation.v1"
     }
 
     /// A report younger than this is shown without refetching.
@@ -75,6 +78,14 @@ final class WeatherStore {
         }
         if selectedID == nil || !allLocations.contains(where: { $0.id == selectedID }) && selectedID != WeatherLocation.currentLocationID {
             selectedID = savedLocations.first?.id
+        }
+        // Show "My Location" immediately from the last fix (refined when CoreLocation answers), so the
+        // row never goes missing at launch while the first fix is slow.
+        if let data = defaults.data(forKey: Keys.lastFix),
+           let last = try? JSONDecoder().decode(WeatherLocation.self, from: data) {
+            currentLocation = last
+        } else {
+            isLocating = true
         }
         setUpLocation()
         observeWake()
@@ -184,8 +195,10 @@ final class WeatherStore {
         locationProvider.onAuthorizationChange = { [weak self] authorized in
             guard let self else { return }
             self.locationDenied = !authorized
+            if !authorized { self.isLocating = false }
             if !authorized, self.currentLocation != nil {
                 self.currentLocation = nil
+                self.defaults.removeObject(forKey: Keys.lastFix)
                 if self.selectedID == WeatherLocation.currentLocationID { self.selectedID = self.savedLocations.first?.id }
             }
         }
@@ -193,6 +206,7 @@ final class WeatherStore {
     }
 
     private func handleLocation(_ c: CLLocationCoordinate2D) {
+        if isLocating { isLocating = false }
         let coordinate = Coordinate(latitude: c.latitude, longitude: c.longitude)
         if let existing = currentLocation,
            CLLocation(latitude: existing.coordinate.latitude, longitude: existing.coordinate.longitude)
@@ -200,9 +214,11 @@ final class WeatherStore {
             return
         }
         let isFirstFix = currentLocation == nil
-        let location = WeatherLocation(id: WeatherLocation.currentLocationID, name: currentLocation?.name ?? "My Location",
+        var location = WeatherLocation(id: WeatherLocation.currentLocationID, name: currentLocation?.name ?? "My Location",
                                        coordinate: coordinate, isCurrentLocation: true)
+        location.timeZoneIdentifier = currentLocation?.timeZoneIdentifier
         currentLocation = location
+        persistLastFix(location)
         if isFirstFix && (selectedID == nil || selectedID == savedLocations.first?.id) {
             selectedID = location.id
         }
@@ -214,6 +230,7 @@ final class WeatherStore {
                 location.country = placemark.country
                 location.timeZoneIdentifier = placemark.timeZone?.identifier
                 currentLocation = location
+                persistLastFix(location)
             }
             await load(location, force: true)
         }
@@ -263,6 +280,10 @@ final class WeatherStore {
         let j = i + offset
         guard savedLocations.indices.contains(j) else { return }
         savedLocations.swapAt(i, j)
+    }
+
+    private func persistLastFix(_ location: WeatherLocation) {
+        if let data = try? JSONEncoder().encode(location) { defaults.set(data, forKey: Keys.lastFix) }
     }
 
     private func persistLocations() {

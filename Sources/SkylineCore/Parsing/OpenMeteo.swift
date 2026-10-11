@@ -131,12 +131,23 @@ public struct OpenMeteoAirQualityResponse: Decodable, Sendable {
         public var pm10: Double?
         public var ozone: Double?
     }
+    public struct Hourly: Decodable, Sendable {
+        public var time: [Double]?
+        public var us_aqi: [Double?]?
+    }
     public var current: Current?
+    public var hourly: Hourly?
 
     public static func decode(_ data: Data) throws -> AirQuality? {
         let r = try JSONDecoder().decode(OpenMeteoAirQualityResponse.self, from: data)
         guard let c = r.current, let aqi = c.us_aqi else { return nil }
-        return AirQuality(usAQI: Int(aqi.rounded()), pm25: c.pm2_5, pm10: c.pm10, ozone: c.ozone)
+        var result = AirQuality(usAQI: Int(aqi.rounded()), pm25: c.pm2_5, pm10: c.pm10, ozone: c.ozone)
+        if let times = r.hourly?.time, let values = r.hourly?.us_aqi {
+            result.hourly = zip(times, values).compactMap { t, v in
+                v.map { HourlyValue(time: Date(timeIntervalSince1970: t), value: $0) }
+            }
+        }
+        return result
     }
 }
 

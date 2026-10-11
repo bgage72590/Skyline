@@ -33,6 +33,10 @@ struct SidebarView: View {
             }
 
             Section {
+                if store.currentLocation == nil && store.isLocating && !store.locationDenied {
+                    LocatingRow()
+                        .listRowInsets(EdgeInsets(top: 4, leading: 4, bottom: 4, trailing: 4))
+                }
                 ForEach(store.allLocations) { location in
                     SidebarRow(location: location,
                                report: store.reports[location.id],
@@ -65,6 +69,26 @@ struct SidebarView: View {
             // Fill in sidebar temperatures (cheap: served from cache when fresh).
             await store.refreshDue()
         }
+    }
+}
+
+/// Placeholder shown until the first location fix arrives (instead of the row silently missing).
+struct LocatingRow: View {
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Label("My Location", systemImage: "location.fill").font(.headline)
+                Text("Finding your location…").font(.caption).opacity(0.85)
+            }
+            Spacer()
+            ProgressView().controlSize(.small)
+        }
+        .foregroundStyle(.white)
+        .padding(10)
+        .frame(height: 84)
+        .background(SkyPalette.gradient(.partlyCloudy, isDay: true).opacity(0.7),
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .accessibilityLabel("My Location, finding your location")
     }
 }
 

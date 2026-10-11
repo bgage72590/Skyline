@@ -51,6 +51,7 @@ public struct HourlyForecast: Codable, Hashable, Identifiable, Sendable {
     public var dewPoint: Double?                 // °C
     public var pressure: Double?                 // hPa
     public var visibility: Double?               // metres
+    public var windGust: Double?                 // km/h
 
     public var id: Date { time }
     public var condition: WeatherCondition { WeatherCondition(wmoCode: weatherCode) }
@@ -59,7 +60,9 @@ public struct HourlyForecast: Codable, Hashable, Identifiable, Sendable {
                 precipitationProbability: Double? = nil, precipitation: Double? = nil,
                 weatherCode: Int, isDay: Bool, uvIndex: Double? = nil, windSpeed: Double? = nil,
                 windDirection: Double? = nil, humidity: Double? = nil, temperatureSpread: Double? = nil,
-                dewPoint: Double? = nil, pressure: Double? = nil, visibility: Double? = nil) {
+                dewPoint: Double? = nil, pressure: Double? = nil, visibility: Double? = nil,
+                windGust: Double? = nil) {
+        self.windGust = windGust
         self.time = time; self.temperature = temperature; self.apparentTemperature = apparentTemperature
         self.precipitationProbability = precipitationProbability; self.precipitation = precipitation
         self.weatherCode = weatherCode; self.isDay = isDay; self.uvIndex = uvIndex
@@ -154,6 +157,11 @@ public struct WeatherAlert: Codable, Hashable, Identifiable, Sendable {
     public var expires: Date?
     public var ends: Date?
     public var senderName: String?
+    /// Outline(s) of the warned area: storm-based polygons from the alert itself, or the affected
+    /// forecast zones' shapes (filled in by `WeatherService`). Each ring is a list of coordinates.
+    public var polygons: [[Coordinate]] = []
+    /// NWS forecast-zone URLs, used to look up an outline when the alert has no polygon of its own.
+    public var affectedZones: [URL] = []
 
     public init(id: String, event: String, headline: String?, severity: AlertSeverity, urgency: String?,
                 areaDescription: String?, description: String?, instruction: String?,
@@ -165,17 +173,29 @@ public struct WeatherAlert: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+/// One timestamped value of an hourly series (AQI forecast etc.).
+public struct HourlyValue: Codable, Hashable, Sendable, Identifiable {
+    public var time: Date
+    public var value: Double
+    public var id: Date { time }
+    public init(time: Date, value: Double) { self.time = time; self.value = value }
+}
+
 public struct AirQuality: Codable, Hashable, Sendable {
     public var usAQI: Int
     public var pm25: Double?
     public var pm10: Double?
     public var ozone: Double?
+    /// Hourly US AQI forecast (next ~2 days), when available.
+    public var hourly: [HourlyValue] = []
 
     public init(usAQI: Int, pm25: Double?, pm10: Double?, ozone: Double?) {
         self.usAQI = usAQI; self.pm25 = pm25; self.pm10 = pm10; self.ozone = ozone
     }
 
-    public var category: String {
+    public var category: String { Self.category(usAQI) }
+
+    public static func category(_ usAQI: Int) -> String {
         switch usAQI {
         case ..<51: "Good"
         case ..<101: "Moderate"

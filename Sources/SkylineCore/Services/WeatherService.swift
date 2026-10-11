@@ -45,7 +45,8 @@ public actor WeatherService {
         return try OpenMeteoGeocodingResponse.decode(data)
     }
 
-    public func radarFrames(_ provider: RadarProvider, forceRefresh: Bool = false) async throws -> [RadarFrame] {
+    public func radarFrames(_ provider: RadarProvider, range: RadarRange = .oneHour,
+                            forceRefresh: Bool = false) async throws -> [RadarFrame] {
         switch provider {
         case .rainViewer:
             let data = try await fetch(Endpoints.rainViewerMaps, ttl: TTL.radarIndex, force: forceRefresh)
@@ -53,7 +54,7 @@ public actor WeatherService {
         case .nexrad:
             let data = try await fetch(Endpoints.iemLatest, ttl: TTL.radarIndex, force: forceRefresh)
             let latest = try IEMNexrad.latestValidTime(data) ?? now()
-            return IEMNexrad.frames(latest: latest)
+            return IEMNexrad.frames(latest: latest, range: range)
         }
     }
 
@@ -107,8 +108,34 @@ public actor WeatherService {
         async let a = optionalFetch(Endpoints.nwsAlerts(c), ttl: TTL.alerts, force: force, headers: headers)
         let periods = await f.flatMap { try? NWSPeriod.decodeList($0) } ?? []
         let hourly = await h.flatMap { try? NWSPeriod.decodeList($0) } ?? []
-        let alerts = await a.flatMap { try? NWSAlertParser.decode($0) } ?? []
+        var alerts = await a.flatMap { try? NWSAlertParser.decode($0) } ?? []
+        alerts = await withZoneOutlines(alerts)
         return NWSBundle(point: point, periods: periods, hourly: hourly, alerts: alerts)
+    }
+
+    /// Zone-based alerts (no polygon of their own) get their forecast zones' outlines, so the map can
+    /// draw them. Zone shapes rarely change, so they're cached for a week; at most 8 zones per refresh.
+    private func withZoneOutlines(_ alerts: [WeatherAlert]) async -> [WeatherAlert] {
+        let zones = Array(Set(alerts.filter { $0.polygons.isEmpty }.flatMap { $0.affectedZones.prefix(4) }).prefix(8))
+        guard !zones.isEmpty else { return alerts }
+        var outlines: [URL: [[Coordinate]]] = [:]
+        await withTaskGroup(of: (URL, [[Coordinate]]).self) { group in
+            for zone in zones {
+                guard let url = Endpoints.nwsZone(zone) else { continue }
+                group.addTask {
+                    let data = await self.optionalFetch(url, ttl: 7 * 24 * 3600, force: false,
+                                                        headers: ["Accept": "application/geo+json"])
+                    return (zone, data.flatMap { try? NWSZoneParser.decode($0) } ?? [])
+                }
+            }
+            for await (zone, rings) in group { outlines[zone] = rings }
+        }
+        return alerts.map { alert in
+            guard alert.polygons.isEmpty else { return alert }
+            var a = alert
+            a.polygons = alert.affectedZones.flatMap { outlines[$0] ?? [] }
+            return a
+        }
     }
 
     // MARK: Fetch with cache

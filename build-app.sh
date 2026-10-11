@@ -61,9 +61,59 @@ if [[ -f "$ROOT/Resources/AppIcon.png" ]]; then
   rm -rf "$ICONSET"
 fi
 
-echo "==> Signing (ad-hoc)"
-codesign --force --deep --sign - --identifier "$BUNDLE_ID" "$APP"
+# Stable signing identity. Ad-hoc signatures (`codesign -s -`) change with every build, so macOS's
+# privacy database (TCC) treats each rebuild as a new app and asks for Location access again.
+# A self-signed certificate kept in the login keychain gives every build the same designated
+# requirement, so permissions granted once stick. Created once, idempotently, without GUI prompts.
+SIGN_NAME="Skyline Local Signing"
+KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+
+signing_identity_hash() {
+  security find-certificate -c "$SIGN_NAME" -Z "$KEYCHAIN" 2>/dev/null | awk '/SHA-1 hash:/ {print $3; exit}'
+}
+
+ensure_signing_identity() {
+  [[ -n "$(signing_identity_hash)" ]] && return 0
+  echo "    creating self-signed code-signing certificate \"$SIGN_NAME\" in the login keychain"
+  local tmp; tmp="$(mktemp -d)"
+  cat > "$tmp/cert.cnf" <<CNF
+[ req ]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[ dn ]
+CN = $SIGN_NAME
+[ ext ]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+CNF
+  local pass="skyline-$$-$RANDOM"
+  openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes -config "$tmp/cert.cnf" \
+      -keyout "$tmp/key.pem" -out "$tmp/cert.pem" >/dev/null 2>&1 &&
+  openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" -name "$SIGN_NAME" \
+      -out "$tmp/id.p12" -passout "pass:$pass" >/dev/null 2>&1 &&
+  security import "$tmp/id.p12" -k "$KEYCHAIN" -P "$pass" -T /usr/bin/codesign >/dev/null 2>&1
+  local rc=$?
+  rm -rf "$tmp"
+  return $rc
+}
+
+echo "==> Signing"
+SIGN_ID="-"
+if ensure_signing_identity && [[ -n "$(signing_identity_hash)" ]]; then
+  SIGN_ID="$(signing_identity_hash)"
+  echo "    identity: $SIGN_NAME ($SIGN_ID)"
+else
+  echo "    WARNING: could not create/find \"$SIGN_NAME\"; falling back to ad-hoc signing." >&2
+  echo "    macOS will re-ask for Location access after every rebuild." >&2
+fi
+if ! codesign --force --deep --sign "$SIGN_ID" --identifier "$BUNDLE_ID" "$APP" 2>/tmp/skyline-codesign.log; then
+  echo "    WARNING: signing with \"$SIGN_NAME\" failed ($(tail -1 /tmp/skyline-codesign.log)); using ad-hoc." >&2
+  codesign --force --deep --sign - --identifier "$BUNDLE_ID" "$APP"
+fi
 codesign --verify --strict "$APP"
+codesign -d -r- "$APP" 2>&1 | sed -n 's/^designated => /    designated requirement: /p'
 
 if [[ $ZIP -eq 1 ]]; then
   if [[ -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs" ]]; then

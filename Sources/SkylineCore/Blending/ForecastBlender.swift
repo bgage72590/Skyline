@@ -61,7 +61,7 @@ public enum ForecastBlender {
         // Pre-extract columns once.
         let variables = ["temperature_2m", "apparent_temperature", "precipitation_probability", "precipitation",
                          "weather_code", "is_day", "uv_index", "wind_speed_10m", "wind_direction_10m",
-                         "relative_humidity_2m", "dew_point_2m", "pressure_msl", "visibility"]
+                         "relative_humidity_2m", "dew_point_2m", "pressure_msl", "visibility", "wind_gusts_10m"]
         var columns: [ForecastModel: [String: [Double?]]] = [:]
         for m in models { columns[m] = Dictionary(uniqueKeysWithValues: variables.map { ($0, col($0, m)) }) }
 
@@ -106,7 +106,8 @@ public enum ForecastBlender {
                 temperatureSpread: spread,
                 dewPoint: weightedMean(samples("dew_point_2m")),
                 pressure: weightedMean(samples("pressure_msl")),
-                visibility: weightedMean(samples("visibility"))))
+                visibility: weightedMean(samples("visibility")),
+                windGust: weightedMean(samples("wind_gusts_10m"))))
         }
         return result
     }
