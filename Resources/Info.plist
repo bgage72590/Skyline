@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Skyline</string>
+	<key>CFBundleExecutable</key>
+	<string>Skyline</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.briangage.Skyline</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Skyline</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.weather</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSLocationUsageDescription</key>
+	<string>Skyline uses your location to show the weather, radar and severe-weather alerts where you are.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Skyline uses your location to show the weather, radar and severe-weather alerts where you are.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>© 2026 Brian Gage. Weather data: Open-Meteo (CC BY 4.0), NOAA/NWS, Iowa Environmental Mesonet, RainViewer.</string>
+</dict>
+</plist>
