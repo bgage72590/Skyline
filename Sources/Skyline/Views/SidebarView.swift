@@ -47,7 +47,7 @@ struct SidebarView: View {
                         .padding(.top, 4)
                 }
             }
-            .listRowInsets(EdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10))
+            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
         }

@@ -195,7 +195,7 @@ struct NowcastCard: View {
     static func ticks(start: Date, end: Date) -> [Date] {
         let first = (start.timeIntervalSince1970 / 1800).rounded(.up) * 1800
         let rounds = stride(from: first, to: end.timeIntervalSince1970 - 8 * 60, by: 1800)
-            .filter { $0 - start.timeIntervalSince1970 >= 12 * 60 }
+            .filter { $0 - start.timeIntervalSince1970 >= 20 * 60 }
             .map { Date(timeIntervalSince1970: $0) }
         return [start] + rounds
     }
