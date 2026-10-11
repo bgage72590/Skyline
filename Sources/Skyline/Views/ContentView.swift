@@ -51,6 +51,7 @@ struct ContentView: View {
             // Launch arguments for screenshots/QA: `-SkylineOpenRadar YES`, `-SkylineOpenModule uv`.
             let defaults = UserDefaults.standard
             if defaults.bool(forKey: "SkylineOpenRadar") { store.radarExpanded = true }
+            StressTest.runIfRequested(store: store)
             if let raw = defaults.string(forKey: "SkylineOpenModule"), let module = DetailModule(rawValue: raw) {
                 store.activeModule = ModuleSelection(module: module, day: nil)
             }

@@ -49,4 +49,29 @@ final class AstronomyAndTileTests: XCTestCase {
         let hourly = ForecastBlender.blendHourly(openMeteo: om, nwsHourly: [], now: Date(timeIntervalSince1970: 1_791_725_400))
         XCTAssertEqual(daily[1].hours(from: hourly, timeZone: tz).count, 24)
     }
+
+    func testZoomFittingRespectsTileBudget() {
+        // A large window over the US at a detailed zoom: 11 frames must fit a 240-tile budget.
+        let visible = MapRectValue(x: 70_000_000, y: 95_000_000, width: 3_000_000, height: 2_000_000)
+        let z = TileMath.zoom(fitting: visible, viewWidth: 1300, maxZ: 10, frames: 11, tileBudget: 240)
+        XCTAssertLessThanOrEqual(TileMath.tiles(covering: visible, z: z).count * 11, 240)
+        XCTAssertLessThanOrEqual(z, TileMath.zoom(visibleWidth: visible.width, viewWidth: 1300, maxZ: 10))
+        // A generous budget leaves the natural zoom alone.
+        XCTAssertEqual(TileMath.zoom(fitting: visible, viewWidth: 1300, maxZ: 10, frames: 1, tileBudget: 10_000),
+                       TileMath.zoom(visibleWidth: visible.width, viewWidth: 1300, maxZ: 10))
+    }
+
+    /// Regression for the layout-loop crash: repeated progress reports must not re-deliver unchanged values.
+    func testChangeGateSuppressesNoOpWrites() {
+        var gate = ChangeGate(step: 0.02)
+        XCTAssertEqual(gate.filter(0.5), 0.5)
+        XCTAssertNil(gate.filter(0.5))
+        XCTAssertNil(gate.filter(0.505))      // same quantised value
+        XCTAssertEqual(gate.filter(0.53)!, 0.54, accuracy: 1e-9)
+        var delivered = 0
+        for _ in 0..<1000 where gate.filter(0.54) != nil { delivered += 1 }
+        XCTAssertEqual(delivered, 0)
+        gate.reset()
+        XCTAssertNotNil(gate.filter(0.54))
+    }
 }

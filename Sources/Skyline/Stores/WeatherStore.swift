@@ -173,7 +173,7 @@ final class WeatherStore {
     func setMainWindowVisible(_ visible: Bool) {
         guard visible != isMainWindowVisible else { return }
         isMainWindowVisible = visible
-        radar.isVisible = visible
+        if radar.isVisible != visible { radar.isVisible = visible }
         if visible { Task { await refreshDue() } }
     }
 

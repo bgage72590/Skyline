@@ -7,17 +7,17 @@ struct RadarCard: View {
     let pinText: String?
     var namespace: Namespace.ID
     @Environment(WeatherStore.self) private var store
+    @AppStorage(RadarOpacity.key) private var opacity = RadarOpacity.defaultValue
 
     var body: some View {
         let radar = store.radar
         let expanded = store.radarExpanded
         Card(title: "Precipitation", systemImage: "umbrella.fill") {
             ZStack {
-                RadarMapView(center: location.coordinate, frames: radar.frames,
-                             index: expanded ? max(0, radar.frames.count - 1) : radar.index,
+                RadarMapView(playback: radar, center: location.coordinate, frames: radar.frames,
                              maxNativeZoom: radar.provider.maximumNativeZoom, interactive: false,
-                             spanDegrees: 3.2, opacity: radar.opacity, pinText: pinText,
-                             onProgress: expanded ? nil : { radar.reportProgress($0) })
+                             spanDegrees: 3.2, opacity: opacity, pinText: pinText,
+                             followsPlayback: !expanded, reportsProgress: !expanded)
                     .allowsHitTesting(false)
                 // Whole map is a button, like Apple's map tile.
                 Color.clear
@@ -35,6 +35,7 @@ struct RadarCard: View {
                             .disabled(radar.frames.count < 2)
                         RadarTimeLabel(radar: radar, timeZone: location.timeZone, compact: true)
                         Spacer()
+                        RadarOpacityControl(opacity: $opacity, compact: true)
                     }
                 }
                 .padding(8)
@@ -60,16 +61,15 @@ struct ExpandedRadarView: View {
     let pinText: String?
     var namespace: Namespace.ID
     @Environment(WeatherStore.self) private var store
-    @State private var scrubbing = false
+    @AppStorage(RadarOpacity.key) private var opacity = RadarOpacity.defaultValue
 
     var body: some View {
         let radar = store.radar
         ZStack {
-            RadarMapView(center: location.coordinate, frames: radar.frames, index: radar.index,
+            RadarMapView(playback: radar, center: location.coordinate, frames: radar.frames,
                          maxNativeZoom: radar.provider.maximumNativeZoom, interactive: true,
-                         spanDegrees: radar.provider == .nexrad ? 5 : 9, opacity: radar.opacity,
-                         pinText: pinText, crossfade: !scrubbing,
-                         onProgress: { radar.reportProgress($0) })
+                         spanDegrees: radar.provider == .nexrad ? 5 : 9, opacity: opacity,
+                         pinText: pinText, followsPlayback: true, reportsProgress: true)
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
                     CircleButton(systemImage: "arrow.down.right.and.arrow.up.left", help: "Collapse map (Esc)") { collapse() }
@@ -82,7 +82,7 @@ struct ExpandedRadarView: View {
                     .padding(.vertical, 6)
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     Spacer()
-                    RadarOptions(radar: radar)
+                    RadarOptions(radar: radar, opacity: $opacity)
                 }
                 .padding(12)
                 Spacer()
@@ -94,7 +94,7 @@ struct ExpandedRadarView: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 8)
-                RadarTimeline(radar: radar, timeZone: location.timeZone, scrubbing: $scrubbing)
+                RadarTimeline(radar: radar, timeZone: location.timeZone)
                     .padding([.horizontal, .bottom], 12)
             }
         }
@@ -105,12 +105,12 @@ struct ExpandedRadarView: View {
             radar.configure(for: location.coordinate)
             await radar.loadFrames()
             // Intent only: the clock starts once every frame's tiles are prefetched.
-            if radar.frames.count > 1 { radar.isPlaying = true }
+            if radar.frames.count > 1 { radar.setPlaying(true) }
         }
     }
 
     private func collapse() {
-        store.radar.isPlaying = false // the compact tile stays still (and free) unless the user hits play
+        store.radar.setPlaying(false) // the compact tile stays still (and free) unless the user hits play
         withAnimation(.spring(response: 0.42, dampingFraction: 0.9)) {
             store.radarExpanded = false
         }
@@ -165,8 +165,41 @@ struct RadarTimeLabel: View {
     }
 }
 
+/// Persisted radar-layer opacity (default ~70 % so roads, labels and coastlines show through).
+enum RadarOpacity {
+    static let key = "radarOpacity"
+    static let defaultValue = 0.7
+    static let range: ClosedRange<Double> = 0.2...1.0
+}
+
+/// Opacity slider for the radar layer: compact capsule in the map tile, labelled in the expanded map.
+struct RadarOpacityControl: View {
+    @Binding var opacity: Double
+    var compact = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "square.2.layers.3d.top.filled")
+                .font(.system(size: compact ? 10 : 12, weight: .semibold))
+            Slider(value: $opacity, in: RadarOpacity.range)
+                .controlSize(compact ? .mini : .small)
+                .frame(width: compact ? 80 : 130)
+            Text("\(Int((opacity * 100).rounded()))%")
+                .font((compact ? Font.caption2 : Font.caption).monospacedDigit().weight(.semibold))
+                .frame(width: compact ? 30 : 36, alignment: .trailing)
+        }
+        .padding(.horizontal, compact ? 8 : 0)
+        .padding(.vertical, compact ? 4 : 0)
+        .background {
+            if compact { Capsule().fill(.ultraThinMaterial) }
+        }
+        .help("Radar opacity: lower it to see the map underneath")
+    }
+}
+
 struct RadarOptions: View {
     let radar: RadarPlayback
+    @Binding var opacity: Double
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 8) {
@@ -176,12 +209,10 @@ struct RadarOptions: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .frame(width: 280)
-            HStack(spacing: 6) {
-                Image(systemName: "circle.lefthalf.filled").font(.caption)
-                Slider(value: Binding(get: { radar.opacity }, set: { radar.opacity = $0 }), in: 0.3...1)
-                    .frame(width: 120)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("Radar opacity").font(.caption2.weight(.semibold)).opacity(0.75)
+                RadarOpacityControl(opacity: $opacity)
             }
-            .help("Radar opacity")
             if let error = radar.errorMessage {
                 Text(error).font(.caption).foregroundStyle(.red)
             }
@@ -194,7 +225,6 @@ struct RadarOptions: View {
 struct RadarTimeline: View {
     let radar: RadarPlayback
     let timeZone: TimeZone
-    @Binding var scrubbing: Bool
 
     var body: some View {
         HStack(spacing: 14) {
@@ -212,9 +242,9 @@ struct RadarTimeline: View {
 
             VStack(spacing: 4) {
                 Slider(value: Binding(get: { Double(radar.index) },
-                                      set: { scrubbing = true; radar.scrub(to: Int($0.rounded())) }),
+                                      set: { radar.crossfade = false; radar.scrub(to: Int($0.rounded())) }),
                        in: 0...Double(max(radar.frames.count - 1, 1)),
-                       onEditingChanged: { editing in scrubbing = editing })
+                       onEditingChanged: { editing in radar.crossfade = !editing })
                     .disabled(radar.frames.count < 2)
                 HStack {
                     Text(radar.frames.first.map { Fmt.time($0.time, timeZone) } ?? "")

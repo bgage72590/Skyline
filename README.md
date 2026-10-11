@@ -111,4 +111,8 @@ Tapping the hourly or 10-day module, a day row, or a tile opens an in-window det
 module expansion): a 10-day picker, a Swift Charts hourly chart for that metric, and a summary. The
 Confidence module shows each source's high/low and its blend weight for the chosen day. Launch
 arguments for QA screenshots: `-SkylineOpenRadar YES`, `-SkylineOpenModule <conditions|uv|wind|…>`.
+Radar stress test (in-process, no synthetic input): `-SkylineOpenRadar YES -SkylineStressTest <seconds>
+-SkylineStressQuit YES` expands/collapses, plays/pauses, scrubs, zooms and changes opacity, logging
+`[stress]` progress and memory to stdout. The radar opacity slider (card and expanded map) is saved
+as `radarOpacity` (default 70 %); the radar is screen-blended over a muted dark map so labels stay legible.
 * CoreLocation uses one-shot `requestLocation()` at kilometre accuracy, not continuous updates.

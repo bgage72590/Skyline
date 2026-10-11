@@ -15,14 +15,22 @@ import SkylineCore
 final class RadarPlayback {
     private(set) var provider: RadarProvider = .nexrad
     private(set) var frames: [RadarFrame] = []
-    var index: Int = 0
+    /// Observed only by the small time label / scrubber. Map layers are driven directly (see `sinks`),
+    /// so a frame change never re-renders the map's SwiftUI parent or touches layout.
+    var index: Int = 0 {
+        didSet { if index != oldValue { notifySinks() } }
+    }
     var isPlaying = false { didSet { updateClock() } }
     var isVisible = false { didSet { updateClock() } }
     /// Fraction (0…1) of all frames' visible tiles that are loaded, reported by the map view.
     private(set) var progress: Double = 0
     private(set) var isLoadingIndex = false
     private(set) var errorMessage: String?
-    var opacity: Double = 0.75
+    /// While the user drags the scrubber, frames switch without cross-fading.
+    @ObservationIgnored var crossfade = true
+    @ObservationIgnored private let sinks = NSHashTable<AnyObject>.weakObjects()
+    /// QA hook: the expanded map registers a zoom handler so the stress test can zoom programmatically.
+    @ObservationIgnored var debugZoomHandler: ((Double) -> Void)?
 
     @ObservationIgnored private let service: WeatherService
     @ObservationIgnored private var clock: Task<Void, Never>?
@@ -52,6 +60,7 @@ final class RadarPlayback {
         provider = p
         frames = []
         progress = 0
+        progressGate.reset()
         loadedAt = nil
         Task { await loadFrames(force: true) }
     }
@@ -70,30 +79,53 @@ final class RadarPlayback {
                 frames = new
                 index = max(0, new.count - 1)
                 progress = 0
+                progressGate.reset()
             }
         } catch {
             errorMessage = "Radar unavailable: \(error.localizedDescription)"
         }
     }
 
+    /// Called asynchronously (never from inside layout) by the map that owns progress reporting.
     func reportProgress(_ value: Double) {
-        let rounded = (value * 50).rounded() / 50 // 2 % steps: avoids needless SwiftUI updates
-        guard rounded != progress else { return }
+        guard let delivered = progressGate.filter(value), delivered != progress else { return }
         let wasReady = isReady
-        progress = rounded
+        progress = delivered
         if isReady != wasReady { updateClock() }
+    }
+
+    @ObservationIgnored private var progressGate = ChangeGate(step: 0.02)
+
+    // MARK: Direct frame delivery to map layers
+
+    func addSink(_ sink: RadarLayerView) { sinks.add(sink) }
+    func removeSink(_ sink: RadarLayerView) { sinks.remove(sink) }
+
+    private func notifySinks() {
+        let animated = crossfade
+        for case let sink as RadarLayerView in sinks.allObjects {
+            sink.playbackIndexChanged(index, animated: animated)
+        }
     }
 
     func togglePlay() { isPlaying.toggle() }
 
+    /// Writes only real changes: an @Observable setter notifies observers even when the value is equal,
+    /// and every notification schedules another SwiftUI update pass.
+    func setPlaying(_ playing: Bool) {
+        if isPlaying != playing { isPlaying = playing }
+    }
+
     func step(_ delta: Int) {
         guard !frames.isEmpty else { return }
-        index = (index + delta + frames.count) % frames.count
+        let next = (index + delta + frames.count) % frames.count
+        if next != index { index = next }
     }
 
     func scrub(to i: Int) {
-        isPlaying = false
-        index = min(max(0, i), max(0, frames.count - 1))
+        setPlaying(false)
+        let next = min(max(0, i), max(0, frames.count - 1))
+        if next != index { index = next }
     }
 
     private func updateClock() {

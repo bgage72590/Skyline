@@ -8,7 +8,7 @@ struct LocationDetailView: View {
     let location: WeatherLocation
     @Environment(WeatherStore.self) private var store
     @Namespace private var radarNamespace
-    @State private var width: CGFloat = 900
+    @State private var isWide = true
 
     var body: some View {
         let report = store.reports[location.id]
@@ -25,7 +25,14 @@ struct LocationDetailView: View {
                             Color.clear.preference(key: WidthKey.self, value: geo.size.width)
                         })
                 }
-                .onPreferenceChange(WidthKey.self) { width = $0 }
+                .onPreferenceChange(WidthKey.self) { w in
+                    // Hysteresis + no-op guard so a width near the breakpoint can't flip the layout back
+                    // and forth (each flip changes layout, which re-reports the width).
+                    // Applied on the next main-queue turn, outside the layout pass that reported it.
+                    let wide = isWide ? w >= 800 : w >= 840
+                    guard wide != isWide else { return }
+                    DispatchQueue.main.async { if isWide != wide { isWide = wide } }
+                }
                 .opacity(store.radarExpanded ? 0 : 1)
                 .scrollDisabled(store.radarExpanded || store.activeModule != nil)
 
@@ -75,7 +82,7 @@ struct LocationDetailView: View {
                 AlertsCard(alerts: report.alerts, timeZone: report.timeZone)
             }
             HourlyCard(report: report, units: units) { open(.conditions, day: nil) }
-            if width >= 820 {
+            if isWide {
                 HStack(alignment: .top, spacing: 14) {
                     DailyCard(report: report, units: units) { open(.conditions, day: $0) }
                         .frame(width: 350)

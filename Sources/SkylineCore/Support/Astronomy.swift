@@ -82,6 +82,15 @@ public enum TileMath {
         return min(max(z, 1), maxZ)
     }
 
+    /// Like `zoom(...)`, but steps the zoom down until `frames × tiles` fits `tileBudget`, which caps the
+    /// decoded-image memory a radar map can hold (each 256² RGBA tile is 256 KB).
+    public static func zoom(fitting visible: MapRectValue, viewWidth: Double, maxZ: Int, frames: Int,
+                            tileBudget: Int, targetPoints: Double = 384) -> Int {
+        var z = zoom(visibleWidth: visible.width, viewWidth: viewWidth, maxZ: maxZ, targetPoints: targetPoints)
+        while z > 1, tiles(covering: visible, z: z).count * max(frames, 1) > tileBudget { z -= 1 }
+        return z
+    }
+
     /// Tiles covering `visible` (+ `margin` tiles around it), nearest to the centre first.
     public static func tiles(covering visible: MapRectValue, z: Int, margin: Int = 0) -> [TileKey] {
         let ts = tileSize(z), n = 1 << z
@@ -102,4 +111,23 @@ public enum TileMath {
         let ts = tileSize(key.z)
         return MapRectValue(x: Double(key.x) * ts, y: Double(key.y) * ts, width: ts, height: ts)
     }
+}
+
+/// Coalesces a stream of values (e.g. tile-load progress reported from layout code) so the observer only
+/// sees real changes, quantised to `step`. Pure logic so it can be unit-tested.
+public struct ChangeGate: Sendable {
+    public let step: Double
+    public private(set) var lastDelivered: Double?
+
+    public init(step: Double) { self.step = step }
+
+    /// Returns the value to deliver, or nil if it would be a no-op.
+    public mutating func filter(_ value: Double) -> Double? {
+        let q = (value / step).rounded() * step
+        guard q != lastDelivered else { return nil }
+        lastDelivered = q
+        return q
+    }
+
+    public mutating func reset() { lastDelivered = nil }
 }

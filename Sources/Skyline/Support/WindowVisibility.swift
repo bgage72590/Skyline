@@ -51,10 +51,15 @@ struct WindowVisibilityReader: NSViewRepresentable {
             report(window.occlusionState.contains(.visible) && !window.isMiniaturized)
         }
 
+        /// Deferred to the next main-queue turn: this can run inside a view-hierarchy/layout pass
+        /// (viewDidMoveToWindow), where writing observed SwiftUI state is not allowed.
         private func report(_ visible: Bool) {
             guard visible != lastReported else { return }
             lastReported = visible
-            onChange?(visible)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.lastReported == visible else { return }
+                self.onChange?(visible)
+            }
         }
     }
 }
