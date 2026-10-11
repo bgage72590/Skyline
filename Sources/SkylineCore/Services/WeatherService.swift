@@ -18,12 +18,16 @@ public actor WeatherService {
     private let cache: ResponseCache
     private let now: @Sendable () -> Date
     private var inFlight: [String: Task<WeatherReport, Error>] = [:]
+    /// Forecast verification + adaptive weights (nil = fixed weights, nothing recorded; used by tests).
+    public nonisolated let verifier: ForecastVerifier?
 
     public init(client: HTTPClient = URLSessionHTTPClient(),
                 cache: ResponseCache = ResponseCache(directory: ResponseCache.defaultDirectory()),
+                verifier: ForecastVerifier? = nil,
                 now: @escaping @Sendable () -> Date = { Date() }) {
         self.client = client
         self.cache = cache
+        self.verifier = verifier
         self.now = now
     }
 
@@ -74,8 +78,28 @@ public actor WeatherService {
         let air = await aqData.flatMap { try? OpenMeteoAirQualityResponse.decode($0) }
 
         let tz = TimeZone(identifier: om.timezone) ?? location.timeZone
-        let hourly = ForecastBlender.blendHourly(openMeteo: om, nwsHourly: nws?.hourly ?? [], now: current.time)
-        let daily = ForecastBlender.blendDaily(openMeteo: om, nwsPeriods: nws?.periods ?? [], timeZone: tz)
+        let key = VerificationKey.key(for: location)
+        let learned = await verifier?.weights(key) ?? .neutral
+        let minutely = om.minutelyPrecipitation()
+        let hourly = ForecastBlender.blendHourly(openMeteo: om, nwsHourly: nws?.hourly ?? [], now: current.time,
+                                                 weights: learned, minutely: minutely)
+        let daily = ForecastBlender.blendDaily(openMeteo: om, nwsPeriods: nws?.periods ?? [], timeZone: tz,
+                                               weights: learned)
+
+        // Verification runs detached at utility priority: never delays the report.
+        if let verifier {
+            let issued = now()
+            let nwsHourly = nws?.hourly ?? []
+            let stations = nws?.point.observationStations
+            Task.detached(priority: .utility) {
+                if await verifier.wantsIssuance(key) {
+                    let records = ForecastSampler.records(location: key, issued: issued, openMeteo: om,
+                                                          nwsHourly: nwsHourly, blended: hourly)
+                    await verifier.record(records, key: key)
+                }
+                await verifier.verifyIfDue(key: key, stationsURL: stations)
+            }
+        }
 
         var sources = om.modelsWithData.map(\.displayName)
         if let nws, !(nws.periods.isEmpty && nws.hourly.isEmpty) { sources.append("NWS \(nws.point.gridID)") }
@@ -86,7 +110,7 @@ public actor WeatherService {
 
         return WeatherReport(location: loc, fetchedAt: now(), timeZoneIdentifier: om.timezone,
                              current: current, hourly: hourly, daily: daily,
-                             minutely: om.minutelyPrecipitation(), alerts: nws?.alerts ?? [],
+                             minutely: minutely, alerts: nws?.alerts ?? [],
                              airQuality: air, sources: sources,
                              nwsOffice: nws.map { [$0.point.city, $0.point.state].compactMap { $0 }.joined(separator: ", ") })
     }

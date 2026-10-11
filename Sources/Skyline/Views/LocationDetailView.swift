@@ -3,8 +3,8 @@ import SkylineCore
 
 /// Detail area.
 ///
-/// * Wide windows (detail ≥ 1000 pt, hysteresis 960/1000): a large always-visible radar beside a
-///   scrolling forecast column (the sidebar holds the locations, so the window reads as three columns).
+/// * Wide windows (detail ≥ 1000 pt, hysteresis 960/1000): a scrolling forecast column next to the
+///   sidebar and a large always-visible radar on the far right (the window reads as three columns).
 ///   Module detail opens as an inspector in place of the forecast column.
 /// * Narrow windows: one scrolling column with the inline radar card (expand button) and module
 ///   detail as a sheet-style panel.
@@ -75,15 +75,14 @@ struct LocationDetailView: View {
     private func wideLayout(_ report: WeatherReport) -> some View {
         let pin = store.units.temperatureString(report.current.temperature)
         let showColumn = !store.radarExpanded
+        // Forecast column next to the sidebar, the large radar on the far right.
         return HStack(spacing: 14) {
-            RadarPanel(location: location, pinText: pin, alerts: report.alerts)
-                .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
             if showColumn {
                 Group {
                     if let selection = store.activeModule {
                         ModuleDetailView(report: report, selection: selection, inspector: true)
                             .id(selection.id + (selection.day.map { "\($0.timeIntervalSince1970)" } ?? ""))
-                            .transition(.move(edge: .trailing).combined(with: .opacity))
+                            .transition(.move(edge: .leading).combined(with: .opacity))
                     } else {
                         ForecastColumn(report: report, location: location, radarNamespace: radarNamespace,
                                        showsRadarCard: false, onOpen: open)
@@ -92,6 +91,8 @@ struct LocationDetailView: View {
                 }
                 .frame(width: 420)
             }
+            RadarPanel(location: location, pinText: pin, alerts: report.alerts)
+                .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
         }
         .padding(14)
         .foregroundStyle(.white)

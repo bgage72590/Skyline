@@ -8,6 +8,8 @@ public struct NWSPoint: Codable, Hashable, Sendable {
     public var city: String?
     public var state: String?
     public var timeZone: String?
+    /// Gridpoint stations list (nearest first), used for forecast verification.
+    public var observationStations: URL?
 
     struct Raw: Decodable {
         struct Props: Decodable {
@@ -15,6 +17,7 @@ public struct NWSPoint: Codable, Hashable, Sendable {
             var forecastHourly: URL
             var gridId: String
             var timeZone: String?
+            var observationStations: URL?
             var relativeLocation: RelLoc?
         }
         struct RelLoc: Decodable {
@@ -28,7 +31,7 @@ public struct NWSPoint: Codable, Hashable, Sendable {
         let p = try JSONDecoder().decode(Raw.self, from: data).properties
         return NWSPoint(forecastURL: p.forecast, forecastHourlyURL: p.forecastHourly, gridID: p.gridId,
                         city: p.relativeLocation?.properties.city, state: p.relativeLocation?.properties.state,
-                        timeZone: p.timeZone)
+                        timeZone: p.timeZone, observationStations: p.observationStations)
     }
 }
 

@@ -99,7 +99,7 @@ struct ModuleDetailView: View {
                 .menuStyle(.borderlessButton)
                 .fixedSize()
                 Spacer()
-                CircleButton(systemImage: inspector ? "sidebar.trailing" : "xmark",
+                CircleButton(systemImage: inspector ? "sidebar.leading" : "xmark",
                              help: inspector ? "Close inspector (Esc)" : "Close (Esc)") { close() }
                     .keyboardShortcut(.cancelAction)
             }

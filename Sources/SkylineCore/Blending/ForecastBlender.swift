@@ -35,6 +35,40 @@ public enum ForecastBlender {
         }
     }
 
+    /// Base weight for precipitation (probability and amount). In the first hours rain is a nowcasting
+    /// problem: HRRR (radar-assimilating, 15-min output) and best_match (which uses HRRR/NBM-type
+    /// short-range guidance in the US) get most of the weight and the coarse global models little;
+    /// from 3 h to 6 h this fades linearly back to the normal weights.
+    public static func precipitationWeight(_ source: Source, leadHours: Double) -> Double {
+        let normal = weight(source, leadHours: leadHours)
+        let short: Double = switch source {
+        case .model(.hrrr): 5.0
+        case .model(.bestMatch): 2.5
+        case .nws: 2.0
+        case .model(.ecmwf): 0.75
+        case .model(.gfs), .model(.icon): 0.5
+        }
+        if leadHours <= 3 { return short }
+        if leadHours >= 6 { return normal }
+        let f = (leadHours - 3) / 3
+        return short + (normal - short) * f
+    }
+
+    /// Base weight for a variable (precipitation uses the short-range specialist weights).
+    public static func weight(_ source: Source, variable: String, leadHours: Double) -> Double {
+        switch variable {
+        case "precipitation_probability", "precipitation": precipitationWeight(source, leadHours: leadHours)
+        default: weight(source, leadHours: leadHours)
+        }
+    }
+
+    /// How much the 15-minute nowcast counts in an hour's precipitation (amount and probability):
+    /// 60 % for the hour now under way, fading to 0 by 3 h.
+    public static func nowcastShare(leadHours: Double) -> Double {
+        guard leadHours >= 0, leadHours < 3 else { return 0 }
+        return 0.6 * (1 - leadHours / 3)
+    }
+
     /// Weighted mean of (value, weight) pairs, ignoring nil values. Nil when nothing is available.
     public static func weightedMean(_ samples: [(value: Double?, weight: Double)]) -> Double? {
         var sum = 0.0, total = 0.0
@@ -48,8 +82,12 @@ public enum ForecastBlender {
 
     // MARK: Hourly
 
+    /// - Parameters:
+    ///   - weights: learned per-location multipliers on the base weights (`.neutral` = fixed weights).
+    ///   - minutely: the 15-minute nowcast; blended into precipitation for the next ~3 h.
     public static func blendHourly(openMeteo om: OpenMeteoResponse, nwsHourly: [NWSPeriod],
-                                   now: Date) -> [HourlyForecast] {
+                                   now: Date, weights learned: BlendWeights = .neutral,
+                                   minutely: [MinutelyPrecipitation] = []) -> [HourlyForecast] {
         let times = om.hourlyTimes
         guard !times.isEmpty else { return [] }
         let models = om.modelsWithData
@@ -72,9 +110,13 @@ public enum ForecastBlender {
             let lead = max(0, time.timeIntervalSince(now) / 3600)
             let nws = nwsByHour[hourKey(time)]
 
+            func w(_ source: Source, _ variable: String) -> Double {
+                weight(source, variable: variable, leadHours: lead)
+                    * learned.multiplier(variable: variable, VerificationSource(source), leadHours: lead)
+            }
             func samples(_ variable: String, nwsValue: Double? = nil) -> [(value: Double?, weight: Double)] {
-                var s = models.map { m in (value: at(columns[m]?[variable] ?? [], i), weight: weight(.model(m), leadHours: lead)) }
-                if let nwsValue { s.append((nwsValue, weight(.nws, leadHours: lead))) }
+                var s = models.map { m in (value: at(columns[m]?[variable] ?? [], i), weight: w(.model(m), variable)) }
+                if let nwsValue { s.append((nwsValue, w(.nws, variable))) }
                 return s
             }
 
@@ -83,8 +125,21 @@ public enum ForecastBlender {
             let temps = tempSamples.compactMap(\.value)
             let spread = temps.count > 1 ? (temps.max()! - temps.min()!) : nil
 
-            let pop = weightedMean(samples("precipitation_probability", nwsValue: nws?.probabilityOfPrecipitation))
-            let precip = weightedMean(samples("precipitation"))
+            var pop = weightedMean(samples("precipitation_probability", nwsValue: nws?.probabilityOfPrecipitation))
+            var precip = weightedMean(samples("precipitation"))
+            // Short range: lean on the 15-minute nowcast for the hour ending at `time`.
+            // `time` ends the hour; the hour under way (start before now) counts as lead 0.
+            let share = time > now ? nowcastShare(leadHours: max(0, time.timeIntervalSince(now) / 3600 - 1)) : 0
+            if share > 0 {
+                let quarter = minutely.filter { $0.time > time.addingTimeInterval(-3600) && $0.time <= time }
+                if quarter.count >= 3 {
+                    let sum = quarter.map(\.precipitation).reduce(0, +)
+                    precip = (precip ?? sum) * (1 - share) + sum * share
+                    let wetQuarters = Double(quarter.filter { $0.precipitation >= Nowcast.threshold }.count) / Double(quarter.count)
+                    let nowcastPop = sum >= 0.2 ? 70 + 25 * wetQuarters : (sum > 0 ? 35 : 5)
+                    pop = (pop ?? nowcastPop) * (1 - share) + nowcastPop * share
+                }
+            }
 
             // Categorical: HRRR in its sweet spot, else best_match, else first model with data.
             let codeOrder: [ForecastModel] = lead <= 18 ? [.hrrr, .bestMatch] + models : [.bestMatch] + models
@@ -130,7 +185,7 @@ public enum ForecastBlender {
     // MARK: Daily
 
     public static func blendDaily(openMeteo om: OpenMeteoResponse, nwsPeriods: [NWSPeriod],
-                                  timeZone: TimeZone) -> [DailyForecast] {
+                                  timeZone: TimeZone, weights learned: BlendWeights = .neutral) -> [DailyForecast] {
         let days = om.dailyTimes
         guard !days.isEmpty else { return [] }
         var calendar = Calendar(identifier: .gregorian)
@@ -147,9 +202,14 @@ public enum ForecastBlender {
 
         func col(_ v: String, _ m: ForecastModel) -> [Double?] { om.dailyColumn(v, model: m) ?? [] }
         func at(_ c: [Double?], _ i: Int) -> Double? { i < c.count ? c[i] : nil }
-        func dailyWeight(_ m: ForecastModel, _ dayIndex: Int) -> Double {
+        func baseDailyWeight(_ m: ForecastModel, _ dayIndex: Int) -> Double {
             if m == .hrrr { return dayIndex == 0 ? 3.0 : (dayIndex == 1 ? 1.0 : 0) } // later days are truncated
             return weight(.model(m), leadHours: Double(dayIndex) * 24 + 12)
+        }
+        // Day 0 is scored like the 6–24 h bucket, day 1 like day 2, later days like day 3+.
+        func learnedLead(_ dayIndex: Int) -> Double { dayIndex == 0 ? 12 : Double(dayIndex) * 24 + 12 }
+        func dailyWeight(_ m: ForecastModel, _ dayIndex: Int, _ kind: BlendWeights.Kind = .temperature) -> Double {
+            baseDailyWeight(m, dayIndex) * learned.multiplier(kind, VerificationSource(m), leadHours: learnedLead(dayIndex))
         }
         func firstValue(_ v: String, _ i: Int) -> Double? {
             ([.bestMatch] + models).lazy.compactMap { at(col(v, $0), i) }.first
@@ -160,17 +220,18 @@ public enum ForecastBlender {
             let day = calendar.startOfDay(for: rawDay)
             let highP = nwsHigh[day]
             let lowP = nwsNight[day]
-            let nwsW = weight(.nws, leadHours: Double(i) * 24)
+            let nwsW = weight(.nws, leadHours: Double(i) * 24) * learned.multiplier(.temperature, .nws, leadHours: learnedLead(i))
+            let nwsRainW = weight(.nws, leadHours: Double(i) * 24) * learned.multiplier(.rain, .nws, leadHours: learnedLead(i))
 
             var highs = models.map { (value: at(col("temperature_2m_max", $0), i), weight: dailyWeight($0, i)) }
             if let h = highP?.temperatureC { highs.append((h, nwsW)) }
             var lows = models.map { (value: at(col("temperature_2m_min", $0), i), weight: dailyWeight($0, i)) }
             if let l = lowP?.temperatureC { lows.append((l, nwsW)) }
-            var pops = models.map { (value: at(col("precipitation_probability_max", $0), i), weight: dailyWeight($0, i)) }
+            var pops = models.map { (value: at(col("precipitation_probability_max", $0), i), weight: dailyWeight($0, i, .rain)) }
             let nwsPop = [highP?.probabilityOfPrecipitation, lowP?.probabilityOfPrecipitation].compactMap { $0 }.max()
-            if let nwsPop { pops.append((nwsPop, nwsW)) }
+            if let nwsPop { pops.append((nwsPop, nwsRainW)) }
             let sums = models.filter { $0 != .hrrr }
-                .map { (value: at(col("precipitation_sum", $0), i), weight: dailyWeight($0, i)) }
+                .map { (value: at(col("precipitation_sum", $0), i), weight: dailyWeight($0, i, .rain)) }
 
             guard var high = weightedMean(highs), var low = weightedMean(lows) else { continue }
             if low > high { swap(&low, &high) }
@@ -199,8 +260,8 @@ public enum ForecastBlender {
                 sunrise: firstValue("sunrise", i).map { Date(timeIntervalSince1970: $0) },
                 sunset: firstValue("sunset", i).map { Date(timeIntervalSince1970: $0) },
                 uvIndexMax: firstValue("uv_index_max", i),
-                windSpeedMax: weightedMean(models.map { (value: at(col("wind_speed_10m_max", $0), i), weight: dailyWeight($0, i)) }),
-                windGustMax: weightedMean(models.map { (value: at(col("wind_gusts_10m_max", $0), i), weight: dailyWeight($0, i)) }),
+                windSpeedMax: weightedMean(models.map { (value: at(col("wind_speed_10m_max", $0), i), weight: dailyWeight($0, i, .wind)) }),
+                windGustMax: weightedMean(models.map { (value: at(col("wind_gusts_10m_max", $0), i), weight: dailyWeight($0, i, .wind)) }),
                 windDirectionDominant: firstValue("wind_direction_10m_dominant", i),
                 summary: (highP ?? lowP).map { $0.detailedForecast.isEmpty ? $0.shortForecast : $0.detailedForecast },
                 highSpread: highValues.count > 1 ? highValues.max()! - highValues.min()! : nil)

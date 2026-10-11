@@ -63,7 +63,7 @@ final class WeatherStore {
     /// A report younger than this is shown without refetching.
     private let staleAfter: TimeInterval = 10 * 60
 
-    init(service: WeatherService = WeatherService(), defaults: UserDefaults = .standard) {
+    init(service: WeatherService = WeatherService(verifier: ForecastVerifier()), defaults: UserDefaults = .standard) {
         self.service = service
         self.radar = RadarPlayback(service: service)
         self.defaults = defaults
