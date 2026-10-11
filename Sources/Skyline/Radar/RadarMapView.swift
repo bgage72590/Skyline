@@ -34,6 +34,9 @@ struct RadarMapView: NSViewRepresentable {
     var alerts: [WeatherAlert] = []
     /// When this changes to an alert with an outline, the map frames that outline.
     var focusedAlertID: String?
+    /// Points of the map hidden (clipped) on each side; keeps MapKit's legal label and alert framing
+    /// inside the visible part.
+    var horizontalOverscan: CGFloat = 0
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -54,6 +57,7 @@ struct RadarMapView: NSViewRepresentable {
 
     private func apply(to container: RadarMapContainer, coordinator c: Coordinator) {
         container.pin.text = pinText
+        container.setOverscan(horizontalOverscan)
         container.alertOverlay.setAlerts(alerts.map { AlertOverlayView.Shape(alert: $0) }, focused: focusedAlertID)
         if focusedAlertID != c.lastFocusedAlertID {
             c.lastFocusedAlertID = focusedAlertID
@@ -97,7 +101,8 @@ struct RadarMapView: NSViewRepresentable {
             let minSide = 60_000.0 // keep some context around tiny storm polygons
             if rect.size.width < minSide { rect = rect.insetBy(dx: -(minSide - rect.size.width) / 2, dy: 0) }
             if rect.size.height < minSide { rect = rect.insetBy(dx: 0, dy: -(minSide - rect.size.height) / 2) }
-            map.setVisibleMapRect(rect, edgePadding: NSEdgeInsets(top: 90, left: 60, bottom: 140, right: 60), animated: true)
+            let side = 60 + (container?.overscan ?? 0)
+            map.setVisibleMapRect(rect, edgePadding: NSEdgeInsets(top: 90, left: side, bottom: 140, right: side), animated: true)
         }
 
         func recenter(on c: Coordinate, span: Double) {
@@ -115,8 +120,8 @@ struct RadarMapView: NSViewRepresentable {
         func zoom(by factor: Double) {
             guard let map = container?.map else { return }
             var region = map.region
-            region.span.latitudeDelta = min(max(region.span.latitudeDelta * factor, 0.2), 60)
-            region.span.longitudeDelta = min(max(region.span.longitudeDelta * factor, 0.26), 80)
+            region.span.latitudeDelta = min(max(region.span.latitudeDelta * factor, RadarZoomLimits.minSpan), RadarZoomLimits.maxSpan)
+            region.span.longitudeDelta = min(max(region.span.longitudeDelta * factor, RadarZoomLimits.minSpan * 1.3), RadarZoomLimits.maxSpan * 1.3)
             map.setRegion(region, animated: true)
         }
 
@@ -132,7 +137,15 @@ struct RadarMapView: NSViewRepresentable {
 }
 
 /// Hosts the map, the radar layers and the pin at the same frame. Pure AppKit/CA: no SwiftUI inside.
+enum RadarZoomLimits {
+    static let minCameraDistance: CLLocationDistance = 60_000      // ~25 km across: a metro area
+    static let maxCameraDistance: CLLocationDistance = 6_000_000   // ~2,500 km across
+    static let minSpan = 0.5, maxSpan = 30.0                        // degrees latitude, for programmatic zoom
+}
+
 final class RadarMapContainer: NSView {
+    /// Live instance / tile-layer counts, for the stress test's memory log (main thread only).
+    nonisolated(unsafe) static var live = 0
     let map = MKMapView()
     let radar = RadarLayerView()
     let alertOverlay = AlertOverlayView()
@@ -141,11 +154,17 @@ final class RadarMapContainer: NSView {
 
     init(interactive: Bool) {
         super.init(frame: .zero)
+        Self.live += 1
         // Dark, muted base map: roads, coastlines and labels stay legible through a ~70 % radar layer.
         map.appearance = NSAppearance(named: .darkAqua)
         let config = MKStandardMapConfiguration(elevationStyle: .flat, emphasisStyle: .muted)
         config.pointOfInterestFilter = .excludingAll
         map.preferredConfiguration = config
+        // Radar is meaningless at street level (NEXRAD's finest tiles are ~1 km) and MapKit's vector
+        // data for dense street-level and continent-wide views is the app's biggest memory cost, so
+        // keep the camera between "metro area" and "half a continent".
+        map.cameraZoomRange = MKMapView.CameraZoomRange(minCenterCoordinateDistance: RadarZoomLimits.minCameraDistance,
+                                                        maxCenterCoordinateDistance: RadarZoomLimits.maxCameraDistance)
         map.isZoomEnabled = interactive
         map.isScrollEnabled = interactive
         map.isRotateEnabled = false
@@ -167,6 +186,22 @@ final class RadarMapContainer: NSView {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    deinit { Self.live -= 1 }
+
+    private(set) var overscan: CGFloat = 0
+    /// Moves MapKit's own chrome (legal label) out of the clipped margins. Deferred to the next main-queue
+    /// turn: never change AppKit layout inputs inside a SwiftUI update pass. No-op when unchanged.
+    func setOverscan(_ value: CGFloat) {
+        guard value != overscan else { return }
+        overscan = value
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.overscan == value else { return }
+            self.map.additionalSafeAreaInsets = NSEdgeInsets(top: 0, left: value, bottom: 0, right: value)
+            self.radar.horizontalInset = value
+            self.radar.updateTiles(allowZoomChange: true)
+        }
+    }
 
     override func layout() {
         super.layout()
@@ -344,6 +379,7 @@ final class PinView: NSView {
 
 /// Transparent, click-through view holding one CALayer per radar frame.
 final class RadarLayerView: NSView {
+    nonisolated(unsafe) static var liveTiles = 0
     weak var map: MKMapView?
 
     /// Each map may hold at most this many decoded tiles (≈256 KB each → ~40 MB, plus its GPU copy).
@@ -358,6 +394,8 @@ final class RadarLayerView: NSView {
         var tiles: [[TileKey: CALayer]]
         var requested: [Set<TileKey>]
         var missing: [Set<TileKey>]
+
+        deinit { RadarLayerView.liveTiles -= tiles.reduce(0) { $0 + $1.count } }
 
         init(frames: [RadarFrame], bounds: CGRect) {
             self.frames = frames
@@ -502,8 +540,14 @@ final class RadarLayerView: NSView {
 
     // MARK: Tiles
 
+    /// Points clipped off each side by the container's overscan; tiles there are never visible.
+    var horizontalInset: CGFloat = 0
+
+    /// The part of the map actually on screen (minus the clipped overscan), in map points.
     private func visibleRect(_ v: MKMapRect) -> MapRectValue {
-        MapRectValue(x: v.origin.x, y: v.origin.y, width: v.size.width, height: v.size.height)
+        let frac = bounds.width > 1 ? min(max(Double(horizontalInset / bounds.width), 0), 0.45) : 0
+        let dx = v.size.width * frac
+        return MapRectValue(x: v.origin.x + dx, y: v.origin.y, width: v.size.width - 2 * dx, height: v.size.height)
     }
 
     /// Frames this view needs loaded: all of them when following playback, else only the one shown.
@@ -524,7 +568,7 @@ final class RadarLayerView: NSView {
         guard v.size.width > 0 else { return }
         let visible = visibleRect(v)
         let frameCount = follows ? max((pending ?? active)?.frames.count ?? 1, 1) : 1
-        let z = TileMath.zoom(fitting: visible, viewWidth: Double(bounds.width), maxZ: maxZ,
+        let z = TileMath.zoom(fitting: visible, viewWidth: Double(max(bounds.width - 2 * horizontalInset, 1)), maxZ: maxZ,
                               frames: frameCount, tileBudget: Self.tileBudget)
         if allowZoomChange || zoom == 0 { zoom = z }
         desired = TileMath.tiles(covering: visible, z: zoom, margin: 0)
@@ -586,6 +630,7 @@ final class RadarLayerView: NSView {
         g.frameLayers[i].addSublayer(tile)
         CATransaction.commit()
         g.tiles[i][key] = tile
+        Self.liveTiles += 1
     }
 
     /// Drops tiles that scrolled away, frames this view no longer needs, and other-zoom placeholders
@@ -604,6 +649,7 @@ final class RadarLayerView: NSView {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             for key in removed { g.tiles[i][key] = nil }
+            Self.liveTiles -= removed.count
             CATransaction.commit()
         }
         g.missing[i] = g.missing[i].filter { $0.z == zoom }

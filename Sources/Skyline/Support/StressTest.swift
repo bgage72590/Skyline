@@ -31,7 +31,9 @@ enum StressTest {
     }
 
     static func run(store: WeatherStore, seconds: Double) async {
-        var rng = SystemRandomNumberGenerator()
+        // Seeded so runs are comparable (memory before/after); -SkylineStressSeed overrides.
+        let seed = UInt64(max(1, UserDefaults.standard.integer(forKey: "SkylineStressSeed")))
+        var rng = SplitMix64(seed: UserDefaults.standard.object(forKey: "SkylineStressSeed") == nil ? 42 : seed)
         var counts: [String: Int] = [:]
         let start = Date()
         var lastLog = start
@@ -43,8 +45,10 @@ enum StressTest {
         while store.selectedLocation.flatMap({ store.reports[$0.id] }) == nil, Date().timeIntervalSince(start) < 60 {
             try? await Task.sleep(for: .milliseconds(250))
         }
+        var growth: [String: Int] = [:]   // MB of footprint growth attributed to each action kind
         while Date().timeIntervalSince(start) < seconds {
             let radar = store.radar
+            let before = counts, m0 = footprintMB()
             let action = Int.random(in: 0..<100, using: &rng)
             switch action {
             case 0..<18:
@@ -90,20 +94,38 @@ enum StressTest {
                 }
             }
             try? await Task.sleep(for: .milliseconds(Int.random(in: 120...450, using: &rng)))
-            peakMB = max(peakMB, footprintMB())
+            let m1 = footprintMB()
+            peakMB = max(peakMB, m1)
+            if let kind = counts.first(where: { before[$0.key] != $0.value })?.key {
+                growth[kind, default: 0] += m1 - m0
+            }
             if Date().timeIntervalSince(lastLog) >= 15 {
                 lastLog = Date()
-                log("t=\(Int(Date().timeIntervalSince(start)))s mem=\(footprintMB())MB peak=\(peakMB)MB actions=\(counts.values.reduce(0, +)) frames=\(radar.frames.count) progress=\(radar.progress) expanded=\(store.radarExpanded) playing=\(radar.isPlaying)")
+                log("t=\(Int(Date().timeIntervalSince(start)))s mem=\(footprintMB())MB peak=\(peakMB)MB maps=\(RadarMapContainer.live) tiles=\(RadarLayerView.liveTiles) actions=\(counts.values.reduce(0, +)) frames=\(radar.frames.count) progress=\(radar.progress) expanded=\(store.radarExpanded) playing=\(radar.isPlaying)")
             }
         }
         if let savedOpacity { UserDefaults.standard.set(savedOpacity, forKey: RadarOpacity.key) }
         else { UserDefaults.standard.removeObject(forKey: RadarOpacity.key) }
         if store.radar.provider != .nexrad { store.radar.switchProvider(.nexrad) }
         log("done: " + counts.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
+        log("growth by action (MB, net): " + growth.sorted { $0.value > $1.value }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
         log("memory: end=\(footprintMB())MB peak=\(peakMB)MB")
         log("STRESS OK (no crash)")
         try? await Task.sleep(for: .seconds(1))
         if UserDefaults.standard.bool(forKey: "SkylineStressQuit") { NSApp.terminate(nil) }
     }
 
+}
+
+/// Tiny deterministic RNG for reproducible stress runs.
+struct SplitMix64: RandomNumberGenerator {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
 }

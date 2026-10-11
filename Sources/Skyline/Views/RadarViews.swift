@@ -63,10 +63,12 @@ struct RadarPanel: View {
     let location: WeatherLocation
     let pinText: String?
     var alerts: [WeatherAlert] = []
+    var mapOverscan: CGFloat = 0
     @Namespace private var unused
 
     var body: some View {
-        ExpandedRadarView(location: location, pinText: pinText, alerts: alerts, namespace: unused, isPanel: true)
+        ExpandedRadarView(location: location, pinText: pinText, alerts: alerts, namespace: unused, isPanel: true,
+                          mapOverscan: mapOverscan)
     }
 }
 
@@ -77,17 +79,19 @@ struct ExpandedRadarView: View {
     var alerts: [WeatherAlert] = []
     var namespace: Namespace.ID
     var isPanel = false
+    /// Points the map extends past each side of the panel (clipped). The wide layout passes half the
+    /// forecast column's width while it is shown, so the MKMapView keeps the same size whether or not
+    /// the column is visible: toggling it never resizes the map (resizes were the memory-peak driver).
+    var mapOverscan: CGFloat = 0
     @Environment(WeatherStore.self) private var store
     @AppStorage(RadarOpacity.key) private var opacity = RadarOpacity.defaultValue
 
     var body: some View {
         let radar = store.radar
         ZStack {
-            RadarMapView(playback: radar, center: location.coordinate, frames: radar.frames,
-                         maxNativeZoom: radar.provider.maximumNativeZoom, interactive: true,
-                         spanDegrees: radar.provider == .nexrad ? 5 : 9, opacity: opacity,
-                         pinText: pinText, followsPlayback: true, reportsProgress: true,
-                         alerts: alerts, focusedAlertID: store.focusedAlertID)
+            // The map sits in the background so a horizontal overscan can make it wider than the panel
+            // without affecting layout; the clip shape trims it. See `mapOverscan`.
+            Color.clear
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
                     if isPanel {
@@ -125,8 +129,20 @@ struct ExpandedRadarView: View {
                     .padding([.horizontal, .bottom], 12)
             }
         }
+        .background {
+            RadarMapView(playback: radar, center: location.coordinate, frames: radar.frames,
+                         maxNativeZoom: radar.provider.maximumNativeZoom, interactive: true,
+                         spanDegrees: radar.provider == .nexrad ? 5 : 9, opacity: opacity,
+                         pinText: pinText, followsPlayback: true, reportsProgress: true,
+                         alerts: alerts, focusedAlertID: store.focusedAlertID,
+                         horizontalOverscan: mapOverscan)
+                .padding(.horizontal, -mapOverscan)
+        }
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .modifier(MatchedIfExpanded(enabled: !isPanel, namespace: namespace, isSource: store.radarExpanded))
+        // No matched-geometry morph from the card: it resized the MKMapView on every animation frame
+        // (~100 MB of transient Metal/IOSurface memory per expand). The overlay scales+fades in instead
+        // (a render transform, no re-layout of the map).
+        .modifier(MatchedIfExpanded(enabled: false, namespace: namespace, isSource: store.radarExpanded))
         .foregroundStyle(.white)
         .task(id: location.id) {
             radar.configure(for: location.coordinate)

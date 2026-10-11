@@ -31,7 +31,7 @@ final class RadarImageCache {
         config.timeoutIntervalForRequest = 15
         config.httpAdditionalHeaders = ["User-Agent": URLSessionHTTPClient.userAgent]
         session = URLSession(configuration: config)
-        images.totalCostLimit = 64 << 20 // decoded RGBA bytes
+        images.totalCostLimit = 32 << 20 // decoded RGBA bytes; live tiles are held by their layers anyway
     }
 
     func image(for url: URL) -> CGImage? {

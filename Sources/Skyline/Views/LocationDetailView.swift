@@ -97,11 +97,17 @@ struct LocationDetailView: View {
             .frame(width: 420)
             .frame(width: showColumn ? 420 : 0, alignment: .leading)
             .clipped()
+            .padding(.trailing, showColumn ? 14 : 0)
+            // Memory: showing/hiding the column must not resize the MKMapView (each resize reallocates its
+            // Metal drawables and reloads vector tiles: the stress-test peak driver). The radar panel
+            // gives the map a matching overscan instead, and the layout change snaps (the column fades).
+            .transaction(value: showColumn) { $0.animation = nil }
             .opacity(showColumn ? 1 : 0)
             .allowsHitTesting(showColumn)
-            .padding(.trailing, showColumn ? 14 : 0)
-            RadarPanel(location: location, pinText: pin, alerts: report.alerts)
+            RadarPanel(location: location, pinText: pin, alerts: report.alerts,
+                       mapOverscan: showColumn ? (420 + 14) / 2 : 0)
                 .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
+                .transaction(value: showColumn) { $0.animation = nil }
         }
         .padding(14)
         .foregroundStyle(.white)
@@ -126,7 +132,7 @@ struct LocationDetailView: View {
                         ExpandedRadarView(location: location, pinText: store.units.temperatureString(report.current.temperature),
                                           alerts: report.alerts, namespace: radarNamespace)
                             .padding(14)
-                            .transition(.opacity)
+                            .transition(.opacity.combined(with: .scale(scale: 0.96)))
                             .zIndex(2)
                     }
                     if let selection = store.activeModule {
