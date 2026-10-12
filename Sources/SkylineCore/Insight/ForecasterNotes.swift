@@ -62,7 +62,7 @@ public enum AFDParser {
         var points: [String] = []
         var keyMessages = false
         if let km = section("KEY MESSAGES") {
-            points = bullets(km)
+            points = bullets(km).map { clip($0, 400) }
             keyMessages = !points.isEmpty
         }
         if points.isEmpty, let syn = section("SYNOPSIS") ?? section("DISCUSSION") ?? section("SHORT TERM") ?? section("NEAR TERM") {

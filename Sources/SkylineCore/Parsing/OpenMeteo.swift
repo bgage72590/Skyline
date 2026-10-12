@@ -20,8 +20,11 @@ public enum ForecastModel: String, CaseIterable, Codable, Sendable {
     }
 
     /// Models worth requesting for a coordinate.
-    public static func models(for coordinate: Coordinate) -> [ForecastModel] {
-        coordinate.isInCONUS ? [.bestMatch, .hrrr, .ecmwf, .gfs, .icon] : [.bestMatch, .ecmwf, .gfs, .icon]
+    public static func models(for coordinate: Coordinate) -> [ForecastModel] { models(inCONUS: coordinate.isInCONUS) }
+
+    /// HRRR only covers the lower 48.
+    public static func models(inCONUS: Bool) -> [ForecastModel] {
+        inCONUS ? [.bestMatch, .hrrr, .ecmwf, .gfs, .icon] : [.bestMatch, .ecmwf, .gfs, .icon]
     }
 }
 

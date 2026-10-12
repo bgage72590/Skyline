@@ -26,7 +26,8 @@ final class ServiceTests: XCTestCase {
         XCTAssertTrue(report.sources.contains("NWS OKX"))
         XCTAssertTrue(report.sources.contains("NOAA HRRR"))
         XCTAssertEqual(report.nwsOffice, "New York, NY")
-        XCTAssertEqual(report.nowcastSummary, "Rain stopping in about 75 min")
+        // Batch 5: same stop rule as the rain notification (first dry quarter followed by 30 dry minutes).
+        XCTAssertEqual(report.nowcastSummary, "Rain stopping in about 90 min")
         XCTAssertTrue(client.requests.contains { $0.absoluteString.contains("models=best_match,gfs_hrrr") })
     }
 
@@ -50,7 +51,7 @@ final class ServiceTests: XCTestCase {
 
         _ = try await service.report(for: nyc)
         let firstCount = client.requests.count
-        XCTAssertEqual(firstCount, 6) // OM, AQ, points, forecast, hourly, alerts
+        XCTAssertEqual(firstCount, 8) // OM, AQ, points, forecast, hourly, alerts, SPC day 1 + 2 (batch 5)
 
         _ = try await service.report(for: nyc)
         XCTAssertEqual(client.requests.count, firstCount, "second call within TTL must be served from cache")

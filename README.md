@@ -126,6 +126,62 @@ one `CALayer` per frame (tile sublayers positioned in MapKit map points). On pan
 layers just move; on zoom the old zoom level's tiles stay up (scaled) until the new level is complete.
 A new set of scans (every ~5 min) is built hidden and swapped in only once loaded.
 
+
+## Radar and forecast extras (batch 5)
+
+* **Future radar.** In the US (NEXRAD), the loop continues past "Now" with up to 2 h of NOAA HRRR
+  simulated reflectivity from the Iowa Environmental Mesonet. Those frames are labelled "+N min ·
+  Forecast", outlined in purple, and marked on the timeline; the legend says they're a model. Toggle:
+  "Future radar (model)" in the radar options (saved as `radarFuture`, default on).
+* **Rainfall totals.** The expanded radar's Layer picker (US only) swaps the loop for MRMS 1-hour or
+  24-hour rainfall totals (radar + gauges, IEM tiles), with a legend in your precipitation unit.
+* **Outside the US** (decided by a border outline and the saved country, so Toronto, Windsor or Juárez
+  aren't treated as US): RainViewer radar, no NWS requests, no HRRR. A 404 from NWS `/points` is
+  remembered for a week so a border point isn't asked again every refresh.
+* **Severe-storm outlook.** For the lower 48, the SPC Day 1/2 categorical outlook at your point shows
+  under the big temperature ("Slight risk of severe storms today (level 2 of 5)") from Marginal up, and
+  in the briefing line.
+* **Snow.** Snowfall totals from the models are blended; snow days show the expected total in the 10-day
+  list, and the rain/snow icon follows the blended snow-to-water ratio and temperature (NWS wording wins
+  where it exists).
+* **Model comparison.** "Model Comparison" (below Forecast Confidence) charts each model's next 48 h of
+  temperature, NWS dashed, the Skyline blend in white. A Best Match that copies GFS/HRRR is one line.
+
+## Notifications and Focus
+
+Extreme warnings are sent as *time-sensitive*. Without Apple's critical-alerts entitlement (which needs
+a Developer ID and Apple's approval, and which Skyline does not request) macOS lets a time-sensitive
+notification through Focus **only if** you allow it: System Settings › Notifications › Skyline › "Allow
+time-sensitive notifications", and in each Focus, Skyline (or time-sensitive notifications) must be
+allowed. With the self-signed build this may not be offered at all; nothing can break through "Do Not
+Disturb" silently. Treat Skyline as a convenience, not your only warning source.
+
+## QA and measurement hooks (hidden launch arguments)
+
+All are inert unless passed on the command line (`open -a Skyline --args -Hook value`, or the binary
+directly); none is settable from the UI.
+
+| Hook | Effect |
+|---|---|
+| `-SkylineOpenRadar YES` | Expand the radar at launch |
+| `-SkylinePlayRadar YES` | Start radar playback at launch |
+| `-SkylineStressTest <s>` / `-SkylineStressSeed <n>` / `-SkylineStressQuit YES` | In-process radar stress test; quit when done |
+| `-SkylineScrollTest YES` | Scroll-position preservation check (`[scrolltest]`) |
+| `-SkylineHitTest YES` | Map ignores scroll over the forecast column (`[hittest]`) |
+| `-SkylineScrollToCard outlook\|notes\|models` | Scroll the forecast column to that card after ~3 s |
+| `-SkylineMenuMaxHeight <pt>` | Cap the menu-bar dropdown height (overflow/scroll check) |
+| `-SkylineOpenModule <name>` | Open a module detail at launch |
+| `-SkylineCloseMainWindowAfter <s>` | Close the main window after N s (menu-bar-only measurement) |
+| `-SkylineWindowSize WxH` | Main window size for measurements |
+| `-SkylineSnapshotMenu <path>` | Render the menu-bar label to a PNG |
+| `-SkylineNotifyPreview YES` | Print the notification plan (all kinds on); nothing is sent or remembered |
+| `-SkylineSimulateOffline YES\|cold` | Network always fails: `YES` keeps the disk cache (stale banner), `cold` starts empty (error states) |
+| `-SkylineNowcastScrub <min>` | Pre-select a point on the next-hour rain chart (screenshot) |
+| `-SkylineDemoRain YES` / `-SkylineDemoAlert YES` / `-SkylineDemoAccuracy YES` | Synthetic rain, alert or accuracy data for screenshots |
+| `-SkylineLogLayout YES` | Log detail-area width and layout switches |
+| `-SkylineTileBudget <n>` / `-SkylineDecodedCacheMB <n>` | Radar memory experiments (tile budget per map, decoded-tile cache) |
+
+
 ## Modules
 
 Tapping the hourly or 10-day module, a day row, or a tile opens an in-window detail panel (Apple's

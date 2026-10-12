@@ -17,10 +17,20 @@ final class RadarPlayback {
     private(set) var frames: [RadarFrame] = []
     /// Loop length (NEXRAD). Persisted; RainViewer ignores it (its free tier is fixed at ~2 h).
     private(set) var range: RadarRange = RadarRange(rawValue: UserDefaults.standard.string(forKey: "radarRange") ?? "") ?? .oneHour
+    /// Future radar (T12): HRRR forecast frames after "now" (NEXRAD only). Persisted, on by default.
+    private(set) var showsFuture: Bool = UserDefaults.standard.object(forKey: "radarFuture") as? Bool ?? true
+    /// Reflectivity loop, or a rainfall-total overlay (L21, NEXRAD/US only). Not persisted: each launch
+    /// starts on the radar.
+    private(set) var layer: RadarLayer = .reflectivity
+    /// Whether the place is in the lower 48 (NEXRAD, future radar and rainfall totals available).
+    private(set) var inCONUS = true
     /// Observed only by the small time label / scrubber. Map layers are driven directly (see `sinks`),
     /// so a frame change never re-renders the map's SwiftUI parent or touches layout.
     var index: Int = 0 {
-        didSet { if index != oldValue { notifySinks() } }
+        didSet {
+            SwiftUIUpdatePass.assertOutside("radar index")
+            if index != oldValue { notifySinks() }
+        }
     }
     var isPlaying = false { didSet { updateHoldsLoop(); updateClock() } }
     var isVisible = false {
@@ -51,9 +61,12 @@ final class RadarPlayback {
     /// The play clock. A TaskSlot so a clock task that resumes after being replaced can't orphan its successor.
     @ObservationIgnored private let clock = TaskSlot()
     @ObservationIgnored private var loadedAt: Date?
+    @ObservationIgnored private var generation = RequestGeneration()
 
     static let frameInterval: Duration = .milliseconds(550)
     static let holdOnLatest: Duration = .milliseconds(1600)
+    /// A short pause on "now" before the forecast frames, so the hand-off is visible.
+    static let holdOnNow: Duration = .milliseconds(900)
     /// Frames are re-indexed at most this often (new scans arrive every 5–10 min).
     static let indexMaxAge: TimeInterval = 5 * 60
 
@@ -62,20 +75,53 @@ final class RadarPlayback {
     }
 
     var currentFrame: RadarFrame? { frames.indices.contains(index) ? frames[index] : nil }
+    /// Index of the newest observed scan ("now"); later frames are model forecasts.
+    var nowIndex: Int { frames.lastIndex { !$0.isForecast } ?? max(0, frames.count - 1) }
+    var hasForecastFrames: Bool { frames.last?.isForecast == true }
     var isReady: Bool { !frames.isEmpty && progress >= 0.98 }
     /// Play was pressed but the loop is still loading: playback starts by itself when it's ready (R2).
     var isWaitingToPlay: Bool { isPlaying && !isReady && frames.count > 1 }
     var isRunning: Bool { clock.isOccupied }
 
-    /// Picks the right provider for a location and loads the frame index if stale.
-    func configure(for coordinate: Coordinate) {
-        let preferred = RadarProvider.preferred(for: coordinate)
-        if preferred != provider { switchProvider(preferred) } else { Task { await loadFrames() } }
+    /// Picks the right provider for a place (NEXRAD only in the lower 48, by border outline and the saved
+    /// country: QA 4) and loads the frame index if stale. `load: false` when the caller awaits
+    /// `loadFrames()` itself (L7: two index loads raced).
+    func configure(for location: WeatherLocation, load: Bool = true) {
+        inCONUS = location.isInCONUS
+        if !inCONUS, layer != .reflectivity { layer = .reflectivity; resetFrames() }
+        let preferred = RadarProvider.preferred(for: location)
+        if preferred != provider { switchProvider(preferred) } else if load { Task { await loadFrames() } }
+    }
+
+    private func resetFrames() {
+        frames = []
+        progress = 0
+        progressGate.reset()
+        loadedAt = nil
+    }
+
+    func setShowsFuture(_ on: Bool) {
+        guard on != showsFuture else { return }
+        showsFuture = on
+        UserDefaults.standard.set(on, forKey: "radarFuture")
+        guard provider == .nexrad, layer == .reflectivity else { return }
+        setPlaying(false)
+        resetFrames()
+        Task { await loadFrames(force: true) }
+    }
+
+    func setLayer(_ l: RadarLayer) {
+        guard l != layer, l == .reflectivity || (provider == .nexrad && inCONUS) else { return }
+        layer = l
+        setPlaying(false)
+        resetFrames()
+        Task { await loadFrames(force: true) }
     }
 
     func switchProvider(_ p: RadarProvider) {
         guard p != provider else { return }
         provider = p
+        if p != .nexrad { layer = .reflectivity }
         frames = []
         progress = 0
         progressGate.reset()
@@ -98,27 +144,40 @@ final class RadarPlayback {
 
     func loadFrames(force: Bool = false) async {
         if !force, let loadedAt, Date().timeIntervalSince(loadedAt) < Self.indexMaxAge, !frames.isEmpty { return }
+        // L7: a newer request supersedes this one; a slower, older answer is dropped, not applied.
+        let token = generation.next()
         isLoadingIndex = true
-        defer { isLoadingIndex = false }
-        let requested = provider, requestedRange = range
+        defer { if generation.isCurrent(token) { isLoadingIndex = false } }
+        let requested = provider, requestedRange = range, requestedLayer = layer
+        let future = showsFuture && requested == .nexrad
         do {
-            let new = try await service.radarFrames(requested, range: requestedRange, forceRefresh: force)
-            guard requested == provider, requestedRange == range else { return }
+            let new: [RadarFrame]
+            if requestedLayer.isRainfallTotal {
+                new = IEMMRMS.frame(requestedLayer, now: Date()).map { [$0] } ?? []
+            } else {
+                new = try await service.radarFrames(requested, range: requestedRange, future: future, forceRefresh: force)
+            }
+            guard generation.isCurrent(token), requested == provider, requestedRange == range, requestedLayer == layer else { return }
             loadedAt = Date()
             errorMessage = new.isEmpty ? "No radar frames available." : nil
             if new.map(\.id) != frames.map(\.id) {
+                let wasAtNow = index >= nowIndex
                 frames = new
-                index = max(0, new.count - 1)
+                // Start on "now" (the newest scan), not the end of the forecast.
+                if wasAtNow || !isPlaying { index = nowIndex }
+                index = min(index, max(0, new.count - 1))
                 progress = 0
                 progressGate.reset()
             }
         } catch {
+            guard generation.isCurrent(token) else { return }
             errorMessage = "Radar unavailable: \(UserFacingError.message(error))"
         }
     }
 
     /// Called asynchronously (never from inside layout) by the map that owns progress reporting.
     func reportProgress(_ value: Double) {
+        SwiftUIUpdatePass.assertOutside("radar progress")
         guard let delivered = progressGate.filter(value), delivered != progress else { return }
         let wasReady = isReady
         progress = delivered
@@ -198,7 +257,8 @@ final class RadarPlayback {
             while !Task.isCancelled {
                 guard let self else { return }
                 let atLatest = self.index >= self.frames.count - 1
-                try? await Task.sleep(for: atLatest ? Self.holdOnLatest : Self.frameInterval)
+                let atNow = self.hasForecastFrames && self.index == self.nowIndex
+                try? await Task.sleep(for: atLatest ? Self.holdOnLatest : (atNow ? Self.holdOnNow : Self.frameInterval))
                 if Task.isCancelled || !self.clock.owns(token) { return }
                 if atLatest, let loadedAt = self.loadedAt, Date().timeIntervalSince(loadedAt) > Self.indexMaxAge {
                     // New scans: the map keeps showing the old frames until the new ones are prefetched.

@@ -92,7 +92,7 @@ struct AccuracyPanel: View {
                 .font(.callout).monospacedDigit()
             if let id = r?.stationID {
                 Text("Station: \(r?.stationName ?? id) (\(id))").font(.caption).foregroundStyle(Glass.secondaryText)
-            } else if !(location.coordinate.isLikelyInNWSCoverage) {
+            } else if !(location.isLikelyInNWSCoverage) {
                 Text("Verification uses NWS stations, so it is only available in the US.").font(.caption).foregroundStyle(Glass.secondaryText)
             }
             Text("Until then the blend uses Skyline's standard weights. Early numbers below are based on few samples.")
@@ -205,7 +205,7 @@ struct AccuracyPanel: View {
         }
         .padding(10)
         .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        Text("Temp and wind: typical error (wind in \(units.speedUnit)). Bias: + means forecasts ran warm. Hours: recent-weighted hours checked. Brier: rain-probability score, lower is better (only sources that give a probability).")
+        Text("Temp and wind: typical error (wind in \(units.speedUnit)). Bias: + means forecasts ran warm. Hours: recent-weighted hours checked. Brier: rain-probability score, lower is better (only sources that give a probability). Where Best Match is a copy of GFS or HRRR, the table scores it only on the hours it differs from them, so it can look worse than it is; the learned weights use every hour.")
             .font(.caption2).foregroundStyle(Glass.secondaryText)
     }
 

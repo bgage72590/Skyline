@@ -2,8 +2,8 @@ import Foundation
 
 /// URL builders for every free API Skyline uses. None require keys.
 public enum Endpoints {
-    static let hourlyVars = "temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,is_day,uv_index,wind_speed_10m,wind_direction_10m,relative_humidity_2m,dew_point_2m,pressure_msl,visibility,wind_gusts_10m"
-    static let dailyVars = "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,sunrise,sunset,uv_index_max,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant"
+    static let hourlyVars = "temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,is_day,uv_index,wind_speed_10m,wind_direction_10m,relative_humidity_2m,dew_point_2m,pressure_msl,visibility,wind_gusts_10m,snowfall"
+    static let dailyVars = "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,snowfall_sum,sunrise,sunset,uv_index_max,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant"
     static let currentVars = "temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,cloud_cover,pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,uv_index,dew_point_2m"
 
     public static func openMeteoForecast(_ c: Coordinate, models: [ForecastModel]) -> URL {
@@ -75,6 +75,13 @@ public enum Endpoints {
         guard !id.isEmpty, id.allSatisfy({ $0.isHexDigit || $0 == "-" }) else { return nil }
         return URL(string: "https://api.weather.gov/products/\(id)")
     }
+
+    /// SPC categorical convective outlook (GeoJSON), day 1 or 2.
+    public static func spcOutlook(day: Int) -> URL {
+        URL(string: "https://www.spc.noaa.gov/products/outlook/day\(day)otlk_cat.lyr.geojson")!
+    }
+    /// Run time of the newest HRRR on IEM (future radar).
+    public static let iemHRRRLatest = URL(string: "https://mesonet.agron.iastate.edu/data/gis/images/4326/hrrr/refd_0000.json")!
 
     public static let rainViewerMaps = URL(string: "https://api.rainviewer.com/public/weather-maps.json")!
     public static let iemLatest = URL(string: "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.json")!

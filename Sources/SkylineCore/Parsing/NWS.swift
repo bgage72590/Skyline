@@ -151,7 +151,12 @@ public enum NWSAlertParser {
             var ends: String?
             var senderName: String?
             var status: String?
+            var messageType: String?
+            var references: [Reference]?
+            var parameters: Parameters?
         }
+        struct Reference: Decodable { var identifier: String }
+        struct Parameters: Decodable { var VTEC: [String]? }
         var features: [Feature]
     }
 
@@ -172,11 +177,31 @@ public enum NWSAlertParser {
                              ends: p.ends.flatMap(NWSDate.parse), senderName: p.senderName)
                 alert.polygons = f.geometry?.rings ?? []
                 alert.affectedZones = (p.affectedZones ?? []).compactMap(URL.init(string:))
+                alert.references = (p.references ?? []).map(\.identifier)
+                let vtec = (p.parameters?.VTEC ?? []).compactMap(VTEC.init)
+                // Same warning across updates: office.phenomenon.significance.number of the lines that are
+                // still in force (an upgrade's new warning gets a new key; the replaced watch line is skipped).
+                alert.trackingKeys = vtec.filter { !VTEC.ended.contains($0.action) && $0.action != "UPG" }.map(\.key)
+                alert.isCancellation = p.messageType == "Cancel"
+                    || (!vtec.isEmpty && vtec.allSatisfy { VTEC.ended.contains($0.action) || $0.action == "UPG" })
                 return alert
             }
             .filter { $0.isActive(at: now) }
             .sorted { $0.severity == $1.severity ? ($0.effective ?? .distantPast) > ($1.effective ?? .distantPast)
                                                   : $0.severity > $1.severity }
+    }
+}
+
+/// One P-VTEC string, e.g. "/O.CON.KOKX.FL.W.0006.261011T1325Z-261014T0600Z/".
+struct VTEC {
+    static let ended: Set<String> = ["CAN", "EXP"]
+    var action: String
+    var key: String
+    init?(_ s: String) {
+        let f = s.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")).split(separator: ".").map(String.init)
+        guard f.count >= 6, f[1].count == 3 else { return nil }
+        action = f[1]
+        key = f[2...5].joined(separator: ".")
     }
 }
 

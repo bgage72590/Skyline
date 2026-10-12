@@ -23,24 +23,13 @@ public struct Coordinate: Codable, Hashable, Sendable {
                    longitude: (longitude * 100).rounded() / 100)
     }
 
-    /// True when the point is inside NWS coverage (CONUS, Alaska, Hawaii, Puerto Rico / USVI, Guam).
-    /// Coarse bounding boxes; NWS 404s are still handled gracefully for edge cases.
-    public var isLikelyInNWSCoverage: Bool {
-        let boxes: [(minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)] = [
-            (24.0, 50.0, -125.5, -66.5),    // CONUS
-            (51.0, 71.6, -170.0, -129.0),   // Alaska
-            (18.5, 22.5, -160.5, -154.5),   // Hawaii
-            (17.5, 18.6, -67.5, -64.5),     // Puerto Rico / USVI
-            (13.0, 15.5, 144.5, 146.0),     // Guam / CNMI
-        ]
-        return boxes.contains { latitude >= $0.minLat && latitude <= $0.maxLat
-            && longitude >= $0.minLon && longitude <= $0.maxLon }
-    }
+    /// True when the point is inside NWS coverage (lower 48, Alaska, Hawaii, Puerto Rico / USVI, Guam).
+    /// Border-following outlines (`USCoverage`), so Toronto or Monterrey no longer count; NWS 404s are
+    /// still handled (and remembered) for edge cases.
+    public var isLikelyInNWSCoverage: Bool { USCoverage.isInNWSArea(self) }
 
-    /// True inside the HRRR / NEXRAD mosaic footprint (CONUS only).
-    public var isInCONUS: Bool {
-        latitude >= 24.0 && latitude <= 50.0 && longitude >= -125.5 && longitude <= -66.5
-    }
+    /// True inside the HRRR / NEXRAD mosaic footprint (lower 48 only).
+    public var isInCONUS: Bool { USCoverage.isInCONUS(self) }
 }
 
 /// A place the user follows (saved in the sidebar) or the device's current location.

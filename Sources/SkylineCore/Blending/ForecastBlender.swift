@@ -61,7 +61,7 @@ public enum ForecastBlender {
     /// Base weight for a variable (precipitation uses the short-range specialist weights).
     public static func weight(_ source: Source, variable: String, leadHours: Double) -> Double {
         switch variable {
-        case "precipitation_probability", "precipitation": precipitationWeight(source, leadHours: leadHours)
+        case "precipitation_probability", "precipitation", "snowfall": precipitationWeight(source, leadHours: leadHours)
         default: weight(source, leadHours: leadHours)
         }
     }
@@ -110,7 +110,7 @@ public enum ForecastBlender {
         // Pre-extract columns once.
         let variables = ["temperature_2m", "apparent_temperature", "precipitation_probability", "precipitation",
                          "weather_code", "is_day", "uv_index", "wind_speed_10m", "wind_direction_10m",
-                         "relative_humidity_2m", "dew_point_2m", "pressure_msl", "visibility", "wind_gusts_10m"]
+                         "relative_humidity_2m", "dew_point_2m", "pressure_msl", "visibility", "wind_gusts_10m", "snowfall"]
         var columns: [ForecastModel: [String: [Double?]]] = [:]
         for m in models { columns[m] = Dictionary(uniqueKeysWithValues: variables.map { ($0, col($0, m)) }) }
         // Per variable: is best_match just GFS/HRRR (US), or an independent model (elsewhere)?
@@ -135,7 +135,7 @@ public enum ForecastBlender {
             func samples(_ variable: String, nwsValue: Double? = nil) -> [(value: Double?, weight: Double)] {
                 var s = dedupedFamily(models.map { m in
                     (model: m, value: modelValue(columns[m]?[variable] ?? [], i, m, variable), weight: w(.model(m), variable))
-                }, bestMatchIsCopy: bestMatchCopy[variable] ?? false)
+                }, bestMatchIsCopy: (bestMatchCopy[variable] ?? false) && (bestMatchCopy["temperature_2m"] ?? false))
                 if let nwsValue { s.append((nwsValue, w(.nws, variable))) }
                 return s
             }
@@ -168,8 +168,10 @@ public enum ForecastBlender {
             let codeOrder: [ForecastModel] = lead <= 18 ? [.hrrr, .bestMatch] + models : [.bestMatch] + models
             let rawCode = codeOrder.lazy.compactMap { at(columns[$0]?["weather_code"] ?? [], i) }.first.map(Int.init) ?? 3
             let isDay = (models.lazy.compactMap { at(columns[$0]?["is_day"] ?? [], i) }.first ?? 1) >= 1
-            let code = reconcile(code: rawCode, precipitationProbability: pop, precipitation: precip,
-                                 temperature: temp)
+            let snow = weightedMean(samples("snowfall"))
+            let code = precipitationType(reconcile(code: rawCode, precipitationProbability: pop, precipitation: precip,
+                                                   temperature: temp),
+                                         snowfall: snow, precipitation: precip, temperature: temp)
 
             result.append(HourlyForecast(
                 time: time, temperature: temp,
@@ -187,6 +189,7 @@ public enum ForecastBlender {
                 visibility: weightedMean(samples("visibility")),
                 windGust: weightedMean(samples("wind_gusts_10m"))))
             result[result.count - 1].precipitationProbabilitySpread = popSpread
+            result[result.count - 1].snowfall = snow.map { max(0, $0) }
         }
         return result
     }
@@ -211,6 +214,27 @@ public enum ForecastBlender {
     public static let snowToRainAbove = 2.8
     /// Below this blended daily rain chance (%) the daily icon never shows precipitation.
     public static let dailyPrecipitationIconMinPoP = 30.0
+
+    /// Rain vs. snow from the blended amounts (T13): Open-Meteo's snowfall is cm of snow, 7 cm ≈ 10 mm of
+    /// water. When most of the precipitation falls as snow (and it's cold enough), a rain icon becomes
+    /// the matching snow icon; when almost none does, a snow icon becomes rain. Thunder and freezing
+    /// rain are left alone.
+    public static func precipitationType(_ code: Int, snowfall: Double?, precipitation: Double?, temperature: Double) -> Int {
+        guard let snow = snowfall, let water = precipitation, water > 0.05 else { return code }
+        let snowShare = min(1, snow * 10 / 7 / water)
+        if snowShare >= 0.6, temperature <= snowToRainAbove {
+            switch code {
+            case 51, 53, 61: return 71
+            case 55, 63: return 73
+            case 65: return 75
+            case 80: return 85
+            case 81, 82: return 86
+            default: return code
+            }
+        }
+        if snowShare < 0.2, temperature > 0.5 { return rainIfWarm(code, temperature: .infinity) }
+        return code
+    }
 
     /// Maps snow codes to the equivalent rain code when it's too warm for snow.
     public static func rainIfWarm(_ code: Int, temperature: Double) -> Int {
@@ -317,12 +341,16 @@ public enum ForecastBlender {
             baseDailyWeight(m, dayIndex) * learned.multiplier(kind, VerificationSource(m), leadHours: learnedLead(dayIndex))
         }
         var copyCache: [String: Bool] = [:]
-        func bmCopy(_ v: String) -> Bool {
+        func columnCopy(_ v: String) -> Bool {
             if let c = copyCache[v] { return c }
             let c = bestMatchIsCopy(col(v, .bestMatch), of: [ForecastModel.gfs, .hrrr].filter { !ignores($0, v) }.map { col(v, $0) })
             copyCache[v] = c
             return c
         }
+        // Temperature decides whether best_match *is* GFS/HRRR (a continuous value can't match for days by
+        // chance); rain columns full of 0 mm in a dry spell would otherwise look like a copy outside the US
+        // (Code Reviewer batch 4, M4).
+        func bmCopy(_ v: String) -> Bool { columnCopy(v) && columnCopy("temperature_2m_max") && columnCopy("temperature_2m_min") }
         func firstValue(_ v: String, _ i: Int) -> Double? {
             ([.bestMatch] + models).lazy.compactMap { at(col(v, $0), i) }.first
         }
@@ -355,12 +383,16 @@ public enum ForecastBlender {
             let sums = dedupedFamily(models.filter { $0 != .hrrr }
                 .map { (model: $0, value: at(col("precipitation_sum", $0), i), weight: dailyWeight($0, i, .rain)) },
                 bestMatchIsCopy: bmCopy("precipitation_sum"))
+            let snowSums = dedupedFamily(models.filter { $0 != .hrrr }
+                .map { (model: $0, value: at(col("snowfall_sum", $0), i), weight: dailyWeight($0, i, .rain)) },
+                bestMatchIsCopy: bmCopy("snowfall_sum"))
 
             guard var high = weightedMean(highs), var low = weightedMean(lows) else { continue }
             if low > high { swap(&low, &high) }
             let highValues = highs.compactMap(\.value)
             let pop = weightedMean(pops)
             let sum = weightedMean(sums)
+            let snowSum = weightedMean(snowSums).map { max(0, $0) }
             // Icon: US days use the NWS daytime wording, else the blended daytime hours; elsewhere (and as a
             // last resort) the model's worst-hour code. Then precipitation needs ≥ 30 % and snow needs cold.
             let rawCode = Int(firstValue("weather_code", i) ?? 3)
@@ -374,8 +406,11 @@ public enum ForecastBlender {
                                             .hours(from: hourly, timeZone: timeZone), timeZone: timeZone) {
                 candidate = c
             }
-            let code = dailyIcon(code: candidate, dryFallback: dryFallback, precipitationProbability: pop,
+            let icon = dailyIcon(code: candidate, dryFallback: dryFallback, precipitationProbability: pop,
                                  precipitation: sum, temperature: (high + low) / 2)
+            // Rain vs. snow from the blended amounts, unless the NWS forecaster already named the type.
+            let code = nwsText == nil ? precipitationType(icon, snowfall: snowSum, precipitation: sum,
+                                                          temperature: (high + low) / 2) : icon
 
             // One row per distinct NOAA-family forecast (identical columns are the same model).
             var readings: [SourceReading] = []
@@ -417,6 +452,7 @@ public enum ForecastBlender {
                 summary: (highP ?? lowP).map { $0.detailedForecast.isEmpty ? $0.shortForecast : $0.detailedForecast },
                 highSpread: highValues.count > 1 ? highValues.max()! - highValues.min()! : nil)
             forecast.sources = readings.sorted { $0.weight > $1.weight }
+            forecast.snowfallSum = snowSum
             result.append(forecast)
         }
         return result
@@ -490,22 +526,58 @@ public enum Nowcast {
     /// mm per 15 minutes considered "precipitating".
     public static let threshold = 0.1
 
-    public static func summary(_ minutely: [MinutelyPrecipitation], now: Date, temperature: Double) -> String? {
-        let upcoming = minutely.filter { $0.time >= now.addingTimeInterval(-15 * 60) }
-        guard let first = upcoming.first else { return nil }
-        let kind = temperature <= 0 ? "Snow" : "Rain"
-        func minutes(_ m: MinutelyPrecipitation) -> Int {
-            max(15, Int((m.time.timeIntervalSince(now) / 60 / 5).rounded()) * 5)
+    /// One rule for "when does rain start / stop", shared by the nowcast line (and so the briefing) and
+    /// the rain notification, so they can't disagree (batch 5: the briefing said "in about 30 min" for
+    /// rain the notification said starts in 15). Each value covers the 15 minutes *ending* at its time,
+    /// so rain in a quarter starts at its beginning.
+    static func quarters(_ minutely: [MinutelyPrecipitation], now: Date) -> [MinutelyPrecipitation] {
+        minutely.filter { $0.time > now }.sorted { $0.time < $1.time }
+    }
+
+    public static func isWet(_ m: MinutelyPrecipitation) -> Bool { m.precipitation >= threshold }
+
+    /// When rain starts: the first of two wet quarters in a row (or one heavier quarter). nil when it's
+    /// already raining or no sustained rain is coming.
+    public static func rainStart(_ minutely: [MinutelyPrecipitation], now: Date) -> Date? {
+        let q = quarters(minutely, now: now)
+        guard let first = q.first, !isWet(first) else { return nil }
+        for (i, m) in q.enumerated() where isWet(m) {
+            let sustained = (i + 1 < q.count && isWet(q[i + 1])) || m.precipitation >= 0.25
+            if sustained { return m.time.addingTimeInterval(-15 * 60) }
         }
-        if first.precipitation >= threshold {
-            if let stop = upcoming.first(where: { $0.precipitation < threshold }) {
-                return "\(kind) stopping in about \(minutes(stop)) min"
+        return nil
+    }
+
+    /// When rain stops: the first dry quarter followed by at least 30 dry minutes (or the end of the
+    /// nowcast). nil when it isn't raining now or doesn't stop within the nowcast.
+    public static func rainEnd(_ minutely: [MinutelyPrecipitation], now: Date) -> Date? {
+        let q = quarters(minutely, now: now)
+        guard let first = q.first, isWet(first) else { return nil }
+        for (i, m) in q.enumerated() where !isWet(m) {
+            if q.dropFirst(i + 1).prefix(2).allSatisfy({ !isWet($0) }) { return m.time.addingTimeInterval(-15 * 60) }
+        }
+        return nil
+    }
+
+    /// Minutes from `now`, to the nearest 5 (at least 5).
+    public static func minutes(until date: Date, now: Date) -> Int {
+        max(5, Int((date.timeIntervalSince(now) / 60 / 5).rounded()) * 5)
+    }
+
+    public static func summary(_ minutely: [MinutelyPrecipitation], now: Date, temperature: Double) -> String? {
+        let q = quarters(minutely, now: now)
+        guard let first = q.first else { return nil }
+        let kind = temperature <= 0 ? "Snow" : "Rain"
+        if isWet(first) {
+            if let end = rainEnd(minutely, now: now) {
+                return "\(kind) stopping in about \(minutes(until: end, now: now)) min"
             }
             return "\(kind) continuing for the next 2 hours"
         }
-        if let start = upcoming.first(where: { $0.precipitation >= threshold }) {
-            return "\(kind) starting in about \(minutes(start)) min"
+        if let start = rainStart(minutely, now: now) {
+            return "\(kind) starting in about \(minutes(until: start, now: now)) min"
         }
+        // A single light blip isn't rain starting: no line, just as no notification (QA batch 4).
         return nil
     }
 }

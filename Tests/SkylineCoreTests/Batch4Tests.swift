@@ -165,7 +165,7 @@ final class Batch4Tests: XCTestCase {
         }
         let c = ForecastInsight.confidence(day: tomorrow, hourly: hours, timeZone: ny, now: fixtureTime, hourLabel: hourLabel, delta: toF)
         XCTAssertEqual(c.level, .medium)
-        XCTAssertEqual(c.sentence, "Medium confidence: models disagree on rain timing after 2 PM.")
+        XCTAssertEqual(c.sentence, "Medium confidence: models disagree on rain chances after 2 PM.")
     }
 
     func testSincePhrases() {

@@ -55,6 +55,8 @@ public struct HourlyForecast: Codable, Hashable, Identifiable, Sendable {
     /// Max − min rain chance across contributing sources (percentage points). Large = sources disagree
     /// on whether/when it rains (used for "Models disagree on rain timing", T11).
     public var precipitationProbabilitySpread: Double?
+    /// Blended snowfall in the hour (cm of snow, Open-Meteo's unit; 7 cm ≈ 10 mm of water). T13.
+    public var snowfall: Double?
 
     public var id: Date { time }
     public var condition: WeatherCondition { WeatherCondition(wmoCode: weatherCode) }
@@ -107,8 +109,12 @@ public struct DailyForecast: Codable, Hashable, Identifiable, Sendable {
     public var highSpread: Double?
     /// Per-source highs/lows that went into the blend.
     public var sources: [SourceReading] = []
+    /// Blended snowfall for the day (cm of snow). T13.
+    public var snowfallSum: Double?
 
     public var id: Date { date }
+    /// Worth showing a snow total (≥ 0.5 cm, about 0.2 in).
+    public var hasSnow: Bool { (snowfallSum ?? 0) >= 0.5 }
     public var condition: WeatherCondition { WeatherCondition(wmoCode: weatherCode) }
 
     public init(date: Date, weatherCode: Int, high: Double, low: Double,
@@ -168,6 +174,12 @@ public struct WeatherAlert: Codable, Hashable, Identifiable, Sendable {
     /// True when `polygons` are the affected forecast zones' outlines (filled in by `WeatherService`),
     /// not the alert's own storm-based polygon. Zone-based alerts already cover the queried point.
     public var outlineIsZone = false
+    /// Ids of earlier messages this one updates or replaces (NWS `references`).
+    public var references: [String] = []
+    /// VTEC event keys still in force ("KOKX.FL.W.0006"): the same warning keeps its key across updates.
+    public var trackingKeys: [String] = []
+    /// A cancellation/expiry statement (it keeps the event name, e.g. "Tornado Warning").
+    public var isCancellation = false
 
     public init(id: String, event: String, headline: String?, severity: AlertSeverity, urgency: String?,
                 areaDescription: String?, description: String?, instruction: String?,
@@ -243,6 +255,10 @@ public struct WeatherReport: Codable, Hashable, Sendable {
     public var nwsGridID: String?
     /// The forecast Skyline showed for this place about 12 h earlier (for "why the forecast changed", T11).
     public var earlierOutlook: ForecastSnapshot?
+    /// SPC convective outlooks covering the place (Day 1 / Day 2, marginal risk or higher; US only). L20.
+    public var severeOutlooks: [SevereOutlook] = []
+    /// Each model's hourly temperature next to the blend, for the model comparison chart (L18).
+    public var modelSeries: [ModelSeries] = []
 
     public init(location: WeatherLocation, fetchedAt: Date, timeZoneIdentifier: String,
                 current: CurrentConditions, hourly: [HourlyForecast], daily: [DailyForecast],
@@ -272,7 +288,12 @@ public struct WeatherReport: Codable, Hashable, Sendable {
     public var today: DailyForecast? { daily.first }
 
     /// Short nowcast like "Rain stopping in about 30 min", from 15-minute data.
-    public var nowcastSummary: String? { Nowcast.summary(minutely, now: current.time, temperature: current.temperature) }
+    public var nowcastSummary: String? { nowcastSummary(at: current.time) }
+    /// The nowcast line as of `now` (the briefing notification passes the real time, like the rain
+    /// notification does, so the two give the same start time).
+    public func nowcastSummary(at now: Date) -> String? {
+        Nowcast.summary(minutely, now: now, temperature: current.temperature)
+    }
 }
 
 /// A geocoding search result.

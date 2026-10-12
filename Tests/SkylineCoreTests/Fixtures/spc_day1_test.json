@@ -1,0 +1,8 @@
+{"type":"FeatureCollection","features":[
+{"type":"Feature","geometry":{"type":"MultiPolygon","coordinates":[[[[-100,30],[-80,30],[-80,45],[-100,45],[-100,30]]]]},
+ "properties":{"DN":2,"VALID":"202610121200","EXPIRE":"202610131200","ISSUE":"202610120600","VALID_ISO":"2026-10-12T12:00:00+00:00","EXPIRE_ISO":"2026-10-13T12:00:00+00:00","ISSUE_ISO":"2026-10-12T06:00:00+00:00","LABEL":"TSTM","LABEL2":"General Thunderstorms Risk"}},
+{"type":"Feature","geometry":{"type":"MultiPolygon","coordinates":[[[[-95,33],[-85,33],[-85,40],[-95,40],[-95,33]]]]},
+ "properties":{"DN":3,"VALID":"202610121200","EXPIRE":"202610131200","ISSUE":"202610120600","VALID_ISO":"2026-10-12T12:00:00+00:00","EXPIRE_ISO":"2026-10-13T12:00:00+00:00","ISSUE_ISO":"2026-10-12T06:00:00+00:00","LABEL":"MRGL","LABEL2":"Marginal Risk"}},
+{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[-93,34],[-87,34],[-87,39],[-93,39],[-93,34]],[[-91,36],[-89,36],[-89,37],[-91,37],[-91,36]]]},
+ "properties":{"DN":4,"VALID":"202610121200","EXPIRE":"202610131200","ISSUE":"202610120600","VALID_ISO":"2026-10-12T12:00:00+00:00","EXPIRE_ISO":"2026-10-13T12:00:00+00:00","ISSUE_ISO":"2026-10-12T06:00:00+00:00","LABEL":"SLGT","LABEL2":"Slight Risk"}}
+]}

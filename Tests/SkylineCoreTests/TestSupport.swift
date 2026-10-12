@@ -43,6 +43,7 @@ final class MockHTTPClient: HTTPClient, @unchecked Sendable {
         else if s.contains("api.weather.gov/alerts") { name = "nws_alerts" }
         else if s.contains("api.weather.gov/products/types/AFD") { name = "nws_afd_list" }
         else if s.contains("api.weather.gov/products/") { name = "nws_afd_okx" }
+        else if s.contains("spc.noaa.gov") { name = "spc_day1_test" }
         else if s.contains("rainviewer") { name = "rainviewer" }
         else if s.contains("mesonet.agron.iastate.edu") { name = "iem_n0q" }
         else { throw HTTPError.status(404, url) }

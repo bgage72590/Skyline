@@ -242,7 +242,7 @@ struct PrecipitationTile: View {
         Tile(title: "Precipitation", systemImage: "drop.fill") {
             TileValue(value: units.precipitationString(next24),
                       label: "Next 24h",
-                      detail: report.nowcastSummary.map { $0 + "." }
+                      detail: report.nowcastSummary(at: Date()).map { $0 + "." }
                         ?? chance.map { "\(Int($0.rounded()))% chance today." }
                         ?? "None expected.")
         }

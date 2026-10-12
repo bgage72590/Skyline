@@ -109,6 +109,17 @@ public struct DisplayUnits: Hashable, Sendable {
         return precipitation == .inches ? String(format: "%.2f\"", v) : String(format: "%.1f mm", v)
     }
 
+    /// Snow depth from cm of snowfall: inches with the inch/imperial setting, else cm.
+    /// "0.4 in" / "3 in" / "1.5 cm" / "12 cm" (whole units from 1 in or 10 cm up).
+    public func snowString(_ cm: Double?) -> String {
+        guard let cm else { return "--" }
+        if precipitation == .inches {
+            let inches = cm / 2.54
+            return inches < 1 ? String(format: "%.1f in", inches) : "\(Int(inches.rounded())) in"
+        }
+        return cm < 10 ? String(format: "%.1f cm", cm) : "\(Int(cm.rounded())) cm"
+    }
+
     // MARK: Distance
 
     public func distance(_ metres: Double) -> Double { distance == .miles ? metres / 1609.344 : metres / 1000 }

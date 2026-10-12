@@ -15,6 +15,24 @@ public struct NotificationPrefs: Codable, Equatable, Sendable {
 
     public init() {}
     public var anyOn: Bool { alerts || rain || morningBriefing }
+
+    // Tolerant decoding: a field added later (or removed) keeps the rest of the saved settings instead of
+    // resetting every switch to off (Code Reviewer batch 4, NTH 5).
+    enum CodingKeys: String, CodingKey {
+        case alerts, minimumSeverity, rain, morningBriefing, briefingMinutes, quietHours, quietStartMinutes, quietEndMinutes
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = NotificationPrefs()
+        alerts = (try? c.decodeIfPresent(Bool.self, forKey: .alerts)) ?? d.alerts
+        minimumSeverity = (try? c.decodeIfPresent(AlertSeverity.self, forKey: .minimumSeverity)) ?? d.minimumSeverity
+        rain = (try? c.decodeIfPresent(Bool.self, forKey: .rain)) ?? d.rain
+        morningBriefing = (try? c.decodeIfPresent(Bool.self, forKey: .morningBriefing)) ?? d.morningBriefing
+        briefingMinutes = (try? c.decodeIfPresent(Int.self, forKey: .briefingMinutes)) ?? d.briefingMinutes
+        quietHours = (try? c.decodeIfPresent(Bool.self, forKey: .quietHours)) ?? d.quietHours
+        quietStartMinutes = (try? c.decodeIfPresent(Int.self, forKey: .quietStartMinutes)) ?? d.quietStartMinutes
+        quietEndMinutes = (try? c.decodeIfPresent(Int.self, forKey: .quietEndMinutes)) ?? d.quietEndMinutes
+    }
 }
 
 /// What was already sent, so nothing is repeated. Persisted by the app (small JSON in UserDefaults).
@@ -30,7 +48,19 @@ public struct NotificationState: Codable, Equatable, Sendable {
     public var rain: [String: RainNote] = [:]
     /// Location id → local day ("2026-10-12") of the last morning briefing.
     public var briefingDay: [String: String] = [:]
+    /// Alert key (id / VTEC event / referenced id) → highest severity already notified, so an update only
+    /// notifies again when it gets more severe (QA batch 4, must-fix 1).
+    public var alertSeverity: [String: AlertSeverity] = [:]
     public init() {}
+
+    enum CodingKeys: String, CodingKey { case alerts, rain, briefingDay, alertSeverity }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        alerts = (try? c.decodeIfPresent([String: Date].self, forKey: .alerts)) ?? [:]
+        rain = (try? c.decodeIfPresent([String: RainNote].self, forKey: .rain)) ?? [:]
+        briefingDay = (try? c.decodeIfPresent([String: String].self, forKey: .briefingDay)) ?? [:]
+        alertSeverity = (try? c.decodeIfPresent([String: AlertSeverity].self, forKey: .alertSeverity)) ?? [:]
+    }
 }
 
 public struct PlannedNotification: Equatable, Sendable {
@@ -84,6 +114,11 @@ public enum NotificationPlanner {
         return s < e ? (m >= s && m < e) : (m >= s || m < e)
     }
 
+    /// "Unknown" severity counts as Minor, so "All alerts" really means all (QA batch 4).
+    static func effectiveSeverity(_ alert: WeatherAlert) -> AlertSeverity {
+        alert.severity == .unknown ? .minor : alert.severity
+    }
+
     /// Don't repeat a rain notification of the same kind within this long.
     public static let rainRepeatAfter: TimeInterval = 2 * 3600
 
@@ -97,20 +132,39 @@ public enum NotificationPlanner {
         let quiet = isQuiet(now, prefs: prefs, timeZone: timeZone)
         let locID = report.location.id
         state.alerts = state.alerts.filter { $0.value > now }
+        state.alertSeverity = state.alertSeverity.filter { state.alerts[$0.key] != nil }
 
         if prefs.alerts {
             for alert in report.activeAlerts(at: now).sorted(by: { $0.severity > $1.severity })
-            where alert.severity >= prefs.minimumSeverity && state.alerts[alert.id] == nil
+            where Self.effectiveSeverity(alert) >= prefs.minimumSeverity && !alert.isCancellation
                 && alertCovers(alert, report.location.coordinate) {
+                // NWS re-issues a warning as an update with a new id: the VTEC key (else the references)
+                // ties it to the one already sent. An upgrade (watch → warning) has a new key and is news.
+                // Cancellations are never sent (Code Reviewer batch 4, M1/M2).
+                let keys = [alert.id] + (alert.trackingKeys.isEmpty ? alert.references : alert.trackingKeys)
+                let until = alert.endTime ?? now.addingTimeInterval(24 * 3600)
+                let seen = keys.filter { state.alerts[$0] != nil }
+                let sentSeverity = seen.compactMap { state.alertSeverity[$0] }.max()
+                // Already sent: an update/extension stays silent unless it became more severe.
+                if !seen.isEmpty, sentSeverity.map({ alert.severity <= $0 }) ?? true {
+                    for k in keys { state.alerts[k] = max(state.alerts[k] ?? until, until) }
+                    continue
+                }
                 // Quiet hours hold back all but extreme warnings; held ones go out after, if still active.
                 if quiet && alert.severity < .extreme { continue }
                 var body = alert.headline ?? alert.areaDescription ?? alert.event
-                if let end = alert.endTime { body += " Until \(timeLabel(end))." }
+                // NWS headlines usually say "until …" already; don't say it twice (QA batch 4).
+                if let end = alert.endTime, !body.localizedCaseInsensitiveContains("until") {
+                    body += (body.hasSuffix(".") ? "" : ".") + " Until \(timeLabel(end))."
+                }
                 out.append(PlannedNotification(id: "alert-\(alert.id)", kind: .alert,
                                                title: "\(alert.event) · \(locationName)",
                                                body: String(body.prefix(240)), locationID: locID, alertID: alert.id,
                                                timeSensitive: alert.severity == .extreme))
-                state.alerts[alert.id] = alert.endTime ?? now.addingTimeInterval(24 * 3600)
+                for k in keys {
+                    state.alerts[k] = until
+                    state.alertSeverity[k] = max(state.alertSeverity[k] ?? alert.severity, alert.severity)
+                }
             }
         }
 
@@ -127,40 +181,36 @@ public enum NotificationPlanner {
                          timeLabel: (Date) -> String) -> (PlannedNotification, NotificationState.RainKind)? {
         let q = report.minutely.filter { $0.time > now }.sorted { $0.time < $1.time }
         guard let first = q.first, first.time.timeIntervalSince(now) <= 15 * 60 else { return nil }
-        let wet = { (m: MinutelyPrecipitation) in m.precipitation >= Nowcast.threshold }
         let kind = report.current.temperature <= 0 ? "Snow" : "Rain"
         let locID = report.location.id
         let last = state.rain[locID]
-        func recently(_ k: NotificationState.RainKind) -> Bool {
-            guard let last, last.kind == k else { return false }
-            return now.timeIntervalSince(last.sentAt) < rainRepeatAfter
-        }
-        if !wet(first) {
-            // Start: two wet quarters in a row (or one heavier one) beginning within the next hour.
-            for (i, m) in q.enumerated() where wet(m) {
-                let sustained = (i + 1 < q.count && wet(q[i + 1])) || m.precipitation >= 0.25
-                guard sustained else { continue }
-                let startsAt = m.time.addingTimeInterval(-15 * 60)
-                let minutes = Int((startsAt.timeIntervalSince(now) / 60 / 5).rounded()) * 5
-                guard minutes >= 5, minutes <= 60, !recently(.start) else { return nil }
-                return (PlannedNotification(id: "rain-start-\(locID)-\(Int(startsAt.timeIntervalSince1970))", kind: .rainStart,
-                                            title: "\(kind) starting soon · \(locationName)",
-                                            body: "\(kind) starting in about \(minutes) minutes.", locationID: locID), .start)
+        // Hysteresis against showers flapping start/stop/start (Code Reviewer batch 4, M3): a new "starting"
+        // waits 90 min after any rain notice (2 h after another "starting"); "ending" needs the rain to have
+        // lasted about an hour since its "starting" notice, so a passing shower gets one notice, not two.
+        func allowed(_ k: NotificationState.RainKind, at eventTime: Date) -> Bool {
+            guard let last else { return true }
+            let since = now.timeIntervalSince(last.sentAt)
+            switch (k, last.kind) {
+            case (.start, .start), (.stop, .stop): return since >= rainRepeatAfter
+            case (.start, .stop): return since >= 90 * 60
+            case (.stop, .start): return eventTime.timeIntervalSince(last.sentAt) >= 60 * 60
             }
-            return nil
         }
-        // Stop: the first dry quarter followed by at least 30 dry minutes (or the end of the nowcast).
-        for (i, m) in q.enumerated() where !wet(m) {
-            let after = q.dropFirst(i + 1).prefix(2)
-            guard after.allSatisfy({ !wet($0) }) else { continue }
-            let endsAt = m.time.addingTimeInterval(-15 * 60)
-            let minutes = endsAt.timeIntervalSince(now) / 60
-            guard minutes >= 5, minutes <= 90, !recently(.stop) else { return nil }
-            return (PlannedNotification(id: "rain-stop-\(locID)-\(Int(endsAt.timeIntervalSince1970))", kind: .rainStop,
-                                        title: "\(kind) ending · \(locationName)",
-                                        body: "\(kind) ending around \(timeLabel(endsAt)).", locationID: locID), .stop)
+        // Same start/stop rule as the nowcast line and the briefing (`Nowcast.rainStart` / `rainEnd`).
+        if !Nowcast.isWet(first) {
+            guard let startsAt = Nowcast.rainStart(report.minutely, now: now) else { return nil }
+            let minutes = Nowcast.minutes(until: startsAt, now: now)
+            guard startsAt.timeIntervalSince(now) >= 2.5 * 60, minutes <= 60, allowed(.start, at: startsAt) else { return nil }
+            return (PlannedNotification(id: "rain-start-\(locID)-\(Int(startsAt.timeIntervalSince1970))", kind: .rainStart,
+                                        title: "\(kind) starting soon · \(locationName)",
+                                        body: "\(kind) starting in about \(minutes) minutes.", locationID: locID), .start)
         }
-        return nil
+        guard let endsAt = Nowcast.rainEnd(report.minutely, now: now) else { return nil }
+        let minutes = endsAt.timeIntervalSince(now) / 60
+        guard minutes >= 5, minutes <= 90, allowed(.stop, at: endsAt) else { return nil }
+        return (PlannedNotification(id: "rain-stop-\(locID)-\(Int(endsAt.timeIntervalSince1970))", kind: .rainStop,
+                                    title: "\(kind) ending · \(locationName)",
+                                    body: "\(kind) ending around \(timeLabel(endsAt)).", locationID: locID), .stop)
     }
 
     /// The morning briefing (L19): once per local day, from the chosen time until 3 hours after it
@@ -169,9 +219,12 @@ public enum NotificationPlanner {
                                 state: inout NotificationState, now: Date, timeZone: TimeZone = .current) -> PlannedNotification? {
         guard prefs.morningBriefing else { return nil }
         let m = minutesOfDay(now, timeZone)
-        guard m >= prefs.briefingMinutes, m < prefs.briefingMinutes + 180 else { return nil }
+        // The 3-hour window wraps past midnight (a 10 PM briefing still goes out at 12:30 AM), and the
+        // day it belongs to is the day it was due (QA / Code Reviewer batch 4).
+        let elapsed = (m - prefs.briefingMinutes + 1440) % 1440
+        guard elapsed < 180 else { return nil }
         var cal = Calendar(identifier: .gregorian); cal.timeZone = timeZone
-        let c = cal.dateComponents([.year, .month, .day], from: now)
+        let c = cal.dateComponents([.year, .month, .day], from: now.addingTimeInterval(-Double(elapsed) * 60))
         let day = String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
         let locID = report.location.id
         guard state.briefingDay[locID] != day else { return nil }

@@ -8,7 +8,11 @@ import UserNotifications
 @MainActor
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// Called when the user clicks a notification: (location id, alert id).
-    var onOpen: ((String, String?) -> Void)?
+    var onOpen: ((String, String?) -> Void)? {
+        didSet { if let onOpen, let p = pendingOpen { pendingOpen = nil; onOpen(p.0, p.1) } }
+    }
+    /// A click that arrived before the store wired `onOpen` (cold launch).
+    private var pendingOpen: (String, String?)?
     private(set) var authorized: Bool?
     private var center: UNUserNotificationCenter?
 
@@ -23,6 +27,10 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         center = c
         return c
     }
+
+    /// Registers as the center's delegate right away (at launch, when a notification is on), so a click
+    /// that cold-launched Skyline is delivered to us instead of being dropped (Code Reviewer batch 4).
+    func attach() { _ = activeCenter() }
 
     /// Asks macOS for permission (shows the system prompt the first time). Returns whether it's allowed.
     func requestAuthorization() async -> Bool {
@@ -65,7 +73,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         let location = info["location"] as? String
         let alert = info["alert"] as? String
         await MainActor.run {
-            if let location { self.onOpen?(location, alert) }
+            guard let location else { return }
+            if let onOpen = self.onOpen { onOpen(location, alert) } else { self.pendingOpen = (location, alert) }
         }
     }
 }

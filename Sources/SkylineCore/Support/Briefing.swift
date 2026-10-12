@@ -9,7 +9,7 @@ public enum Briefing {
     public static func headline(_ report: WeatherReport, now: Date = Date(),
                                 hourLabel: (Date) -> String, delta: (Double) -> Int) -> String {
         var parts: [String] = []
-        if let nowcast = report.nowcastSummary {
+        if let nowcast = report.nowcastSummary(at: now) {
             parts.append(nowcast + ".")
         } else {
             parts.append(nextChange(report, now: now, hourLabel: hourLabel))
@@ -19,27 +19,37 @@ public enum Briefing {
             let shown = delta(abs(d))
             if shown >= 3 { parts.append("Tomorrow is \(shown)° \(d > 0 ? "warmer" : "cooler").") }
         }
+        if let outlook = report.severeOutlooks.first(where: { $0.day == 1 && $0.isSevere && $0.validUntil > now }) {
+            parts.append(outlook.sentence(now: now, timeZone: report.timeZone) + ".")
+        }
         return parts.joined(separator: " ")
     }
 
     /// "Rain likely from 4 PM (70%)." / "Clearing by 3 PM." / "Cloudy for the next 12 hours."
+    /// An hourly value at T covers the hour *ending* at T, so times are labelled by the hour's start
+    /// ("from 3 PM" for the 3–4 PM hour), the same as the confidence card (QA batch 4). The first hour is the
+    /// one under way, never one that already ended.
     static func nextChange(_ report: WeatherReport, now: Date, hourLabel: (Date) -> String) -> String {
-        let hours = report.upcomingHours(from: now, count: 13)
+        let hours = Array(report.hourly.filter { $0.time > now }.prefix(12))
+        func start(_ h: HourlyForecast) -> Date { h.time.addingTimeInterval(-3600) }
+        func label(_ h: HourlyForecast) -> String { hourLabel(max(start(h), now)) }
         guard let first = hours.first else { return report.current.condition.description + "." }
         let wetNow = report.current.condition.isPrecipitation
         if wetNow {
             if let dry = hours.first(where: { !$0.condition.isPrecipitation && ($0.precipitationProbability ?? 0) < 40 }) {
-                return "\(report.current.condition.description) ending around \(hourLabel(dry.time))."
+                return "\(report.current.condition.description) ending around \(label(dry))."
             }
             return "\(report.current.condition.description) for the next 12 hours."
         }
         if let wet = hours.first(where: { ($0.precipitationProbability ?? 0) >= 50 && $0.condition.isPrecipitation }) {
             let kind = wet.condition.category == .snow ? "Snow" : (wet.condition.category == .thunderstorm ? "Storms" : "Rain")
-            return "\(kind) likely from \(hourLabel(wet.time)) (\(Int((wet.precipitationProbability ?? 0).rounded()))%)."
+            let pct = Int((wet.precipitationProbability ?? 0).rounded())
+            if start(wet) <= now { return "\(kind) likely now (\(pct)%)." }
+            return "\(kind) likely from \(label(wet)) (\(pct)%)."
         }
         let category = first.condition.category
         if let change = hours.first(where: { $0.condition.category != category }) {
-            return "\(first.condition.description) now, \(change.condition.description.lowercased()) by \(hourLabel(change.time))."
+            return "\(first.condition.description) now, \(change.condition.description.lowercased()) by \(label(change))."
         }
         return "\(first.condition.description) for the next 12 hours."
     }

@@ -730,12 +730,19 @@ extension WeatherStore {
             self.activeModule = nil
             self.radarExpanded = false
             if let alertID { self.pendingAlertID = alertID }
-            AppActions.openMainWindow?()
             NSApp.activate()
+            // On a cold launch the scenes may not have registered their window opener yet: retry briefly.
+            Task { @MainActor in
+                for _ in 0..<20 {
+                    if let open = AppActions.openMainWindow { open(); NSApp.activate(); return }
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+            }
         }
         scheduleBriefing()
         // Only look at the permission if something is on; never prompt at launch.
         guard notificationPrefs.anyOn else { return }
+        notifier.attach()
         Task { [weak self] in
             guard let self else { return }
             let status = await self.notifier.refreshAuthorization()
@@ -766,7 +773,7 @@ extension WeatherStore {
         var planned: [PlannedNotification] = []
         if preview || notifies(location) {
             planned = NotificationPlanner.plan(report, locationName: name, prefs: prefs, state: &state, now: Date(),
-                                               timeLabel: { Fmt.time($0, tz) })
+                                               timeLabel: { Self.notificationTime($0, tz) })
         }
         if location.id == menuBarLocation?.id || preview,
            let b = NotificationPlanner.briefing(report, locationName: name, summary: briefingSummary(report), prefs: prefs,
@@ -783,6 +790,14 @@ extension WeatherStore {
         notificationState = state
         if let data = try? JSONEncoder().encode(state) { defaults.set(data, forKey: Keys.notifyState) }
         notifier.post(planned)
+    }
+
+    /// "3:15 PM", plus the zone ("3:15 PM CDT") when the city keeps a different clock from this Mac, so a
+    /// notification about a city elsewhere isn't read in local time (Code Reviewer batch 4).
+    static func notificationTime(_ date: Date, _ tz: TimeZone, local: TimeZone = .current) -> String {
+        let time = Fmt.time(date, tz)
+        guard tz.secondsFromGMT(for: date) != local.secondsFromGMT(for: date) else { return time }
+        return time + " " + (tz.abbreviation(for: date) ?? tz.identifier)
     }
 
     /// "High 64°, low 50°. Rain likely from 4 PM (70%)." for the morning briefing.

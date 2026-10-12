@@ -118,8 +118,8 @@ struct NotificationSettings: View {
                 Picker("Notify for", selection: $store.notificationPrefs.minimumSeverity) {
                     Text("Extreme only (e.g. tornado warnings)").tag(AlertSeverity.extreme)
                     Text("Severe and extreme").tag(AlertSeverity.severe)
-                    Text("Moderate and up (incl. advisories)").tag(AlertSeverity.moderate)
-                    Text("All alerts").tag(AlertSeverity.minor)
+                    Text("Moderate and up (wind, winter advisories)").tag(AlertSeverity.moderate)
+                    Text("All alerts (incl. frost, flood advisories)").tag(AlertSeverity.minor)
                 }
             }
             Toggle("Rain starting or stopping", isOn: on(\.rain))
@@ -170,8 +170,10 @@ struct NotificationSettings: View {
     /// Minutes after midnight shown as a time of day.
     private func minutes(_ key: WritableKeyPath<NotificationPrefs, Int>) -> Binding<Date> {
         Binding(get: {
-            Calendar.current.date(byAdding: .minute, value: store.notificationPrefs[keyPath: key],
-                                  to: Calendar.current.startOfDay(for: Date())) ?? Date()
+            // Wall-clock hour and minute (not "midnight + N minutes"), so 10 PM still reads 10 PM on the
+            // DST change days (Code Reviewer / QA batch 4).
+            let m = store.notificationPrefs[keyPath: key]
+            return Calendar.current.date(bySettingHour: m / 60, minute: m % 60, second: 0, of: Date()) ?? Date()
         }, set: { date in
             let c = Calendar.current.dateComponents([.hour, .minute], from: date)
             store.notificationPrefs[keyPath: key] = (c.hour ?? 0) * 60 + (c.minute ?? 0)

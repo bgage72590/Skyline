@@ -108,8 +108,8 @@ final class BlendingTests: XCTestCase {
         func series(_ v: [Double]) -> [MinutelyPrecipitation] {
             v.enumerated().map { MinutelyPrecipitation(time: now.addingTimeInterval(Double($0.offset) * 900), precipitation: $0.element) }
         }
-        XCTAssertEqual(Nowcast.summary(series([0, 0, 0.5, 1]), now: now, temperature: 10), "Rain starting in about 30 min")
-        XCTAssertEqual(Nowcast.summary(series([0.4, 0.3, 0, 0]), now: now, temperature: 10), "Rain stopping in about 30 min")
+        XCTAssertEqual(Nowcast.summary(series([0, 0, 0.5, 1]), now: now, temperature: 10), "Rain starting in about 15 min") // batch 5: quarter start, like the notification
+        XCTAssertEqual(Nowcast.summary(series([0.4, 0.3, 0, 0]), now: now, temperature: 10), "Rain stopping in about 15 min")
         XCTAssertEqual(Nowcast.summary(series([0.4, 0.4]), now: now, temperature: -2), "Snow continuing for the next 2 hours")
         XCTAssertNil(Nowcast.summary(series([0, 0, 0]), now: now, temperature: 10))
         XCTAssertNil(Nowcast.summary([], now: now, temperature: 10))

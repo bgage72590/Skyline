@@ -86,7 +86,7 @@ struct MenuBarContentView: View {
                     .buttonStyle(.plain)
                     .help("Read the full alert")
                 }
-                Text(Briefing.headline(report, now: report.current.time,
+                Text(Briefing.headline(report, now: Date(),
                                        hourLabel: { Fmt.hour($0, report.timeZone) },
                                        delta: { Int(store.units.temperatureDelta($0).rounded()) }))
                     .font(.callout)
@@ -208,7 +208,7 @@ struct MenuBarContentView: View {
     @ViewBuilder
     private func details(_ report: WeatherReport) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            if Briefing.rainDueSoon(report, now: report.current.time) {
+            if Briefing.rainDueSoon(report, now: Date()) {
                 MiniNowcast(report: report).frame(height: 46)
             }
             hourly(report)
@@ -389,6 +389,6 @@ struct MiniNowcast: View {
             }
             .font(.caption2.weight(.medium)).opacity(0.9)
         }
-        .accessibilityLabel(report.nowcastSummary ?? "Rain in the next two hours")
+        .accessibilityLabel(report.nowcastSummary(at: Date()) ?? "Rain in the next two hours")
     }
 }

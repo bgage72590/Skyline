@@ -41,17 +41,23 @@ struct RadarMapView: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> RadarMapContainer {
+        SwiftUIUpdatePass.enter(); defer { SwiftUIUpdatePass.leave() }
         let container = RadarMapContainer(interactive: interactive)
-        container.map.delegate = context.coordinator
         context.coordinator.container = container
+        // The new map isn't in a window yet, and its delegate is attached only afterwards, so this first
+        // region set fires no delegate callbacks inside the SwiftUI update.
         context.coordinator.recenter(on: center, span: spanDegrees)
+        container.map.delegate = context.coordinator
         apply(to: container, coordinator: context.coordinator)
         return container
     }
 
     func updateNSView(_ container: RadarMapContainer, context: Context) {
+        SwiftUIUpdatePass.enter(); defer { SwiftUIUpdatePass.leave() }
         let c = context.coordinator
-        if c.center != center { c.recenter(on: center, span: spanDegrees) }
+        // L1: never move the map inside a SwiftUI update (setRegion → delegate callbacks → layer work and
+        // a layout pass). Note the new centre now (no double dispatch), move on the next main-queue turn.
+        if c.center != center { c.scheduleRecenter(on: center, span: spanDegrees) }
         apply(to: container, coordinator: c)
     }
 
@@ -103,6 +109,16 @@ struct RadarMapView: NSViewRepresentable {
             if rect.size.height < minSide { rect = rect.insetBy(dx: 0, dy: -(minSide - rect.size.height) / 2) }
             let side = 60 + (container?.overscan ?? 0)
             map.setVisibleMapRect(rect, edgePadding: NSEdgeInsets(top: 90, left: side, bottom: 140, right: side), animated: true)
+        }
+
+        /// Deferred recenter for `updateNSView`. If the location changes again before it runs, only the
+        /// latest centre is applied.
+        func scheduleRecenter(on c: Coordinate, span: Double) {
+            center = c
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.center == c else { return }
+                self.recenter(on: c, span: span)
+            }
         }
 
         func recenter(on c: Coordinate, span: Double) {
@@ -395,7 +411,8 @@ final class RadarLayerView: NSView {
     weak var map: MKMapView?
 
     /// Each map may hold at most this many decoded tiles (≈256 KB each → ~40 MB, plus its GPU copy).
-    static let tileBudget = 160
+    /// Measurement hook `-SkylineTileBudget N` (playback-memory experiments); default unchanged.
+    static let tileBudget = max(40, UserDefaults.standard.object(forKey: "SkylineTileBudget") as? Int ?? 160)
 
     /// One prefetched set of frames. A new set (fresh scans) is built hidden as `pending` and only
     /// swapped in once its tiles are loaded, so the radar never blanks.
@@ -416,10 +433,14 @@ final class RadarLayerView: NSView {
             missing = Array(repeating: [], count: frames.count)
             root.frame = bounds
             root.actions = Self.noActions
+            // Tiles in a frame never overlap, so per-tile opacity looks the same as group opacity, and
+            // Core Animation then needs no offscreen buffer per faded frame (memory while playing).
+            root.allowsGroupOpacity = false
             for _ in frames {
                 let layer = CALayer()
                 layer.frame = bounds
                 layer.opacity = 0
+                layer.allowsGroupOpacity = false
                 layer.actions = ["bounds": NSNull(), "position": NSNull(), "sublayers": NSNull()]
                 root.addSublayer(layer)
                 frameLayers.append(layer)
@@ -762,5 +783,21 @@ final class RadarLayerView: NSView {
         let yTop = (r.y - v.origin.y) * scale
         let size = r.width * scale
         return CGRect(x: x, y: Double(bounds.height) - yTop - size, width: size, height: size)
+    }
+}
+
+/// DEBUG tripwire for the crash rule above (L1): set while SwiftUI runs `makeNSView`/`updateNSView`, and
+/// checked by `RadarPlayback`'s observed setters, so a future synchronous state write from inside an
+/// update pass fails loudly in debug builds instead of looping in release.
+@MainActor
+enum SwiftUIUpdatePass {
+    private(set) static var depth = 0
+    static var isActive: Bool { depth > 0 }
+    static func enter() { depth += 1 }
+    static func leave() { depth -= 1 }
+    static func assertOutside(_ what: @autoclosure () -> String) {
+        #if DEBUG
+        assert(!isActive, "Observed state (\(what())) written inside a SwiftUI view update")
+        #endif
     }
 }

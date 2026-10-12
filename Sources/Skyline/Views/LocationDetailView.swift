@@ -16,6 +16,9 @@ struct LocationDetailView: View {
     @Environment(WeatherStore.self) private var store
     @Namespace private var radarNamespace
     @State private var isWide = true
+    /// Forecast column width in the wide layout: 420 pt, growing in 40 pt steps to 540 on big windows so
+    /// the radar stays around 70 % of the detail area (T18). Changed only on a step, never per pixel.
+    @State private var columnWidth: CGFloat = 420
     @State private var widthBox = WidthBox()
     @FocusState private var contentFocused: Bool
 
@@ -69,6 +72,8 @@ struct LocationDetailView: View {
                 let latest = widthBox.width
                 let wide = isWide ? latest >= Self.wideOff : latest >= Self.wideOn
                 if wide != isWide { isWide = wide }
+                let column = Self.columnWidth(forDetailWidth: latest, current: columnWidth)
+                if column != columnWidth { columnWidth = column }
             }
         }
         .environment(\.colorScheme, .dark)
@@ -85,6 +90,15 @@ struct LocationDetailView: View {
         .focused($contentFocused)
         .focusEffectDisabled()
         .onChange(of: store.focusContentRequest) { _, _ in contentFocused = true }
+    }
+
+    /// 30 % of the detail width in 40 pt steps between 420 and 540. Grows as soon as a step fits and
+    /// shrinks only 20 pt past it, so a window edge resting on a boundary doesn't flicker.
+    static func columnWidth(forDetailWidth w: CGFloat, current: CGFloat) -> CGFloat {
+        let ideal = w * 0.30
+        let target = min(540, max(420, (ideal / 40).rounded(.down) * 40))
+        if target < current, ideal >= current - 20 { return current }
+        return target
     }
 
     // MARK: Wide
@@ -111,8 +125,8 @@ struct LocationDetailView: View {
                         .transition(.move(edge: .leading).combined(with: .opacity))
                 }
             }
-            .frame(width: 420)
-            .frame(width: showColumn ? 420 : 0, alignment: .leading)
+            .frame(width: columnWidth)
+            .frame(width: showColumn ? columnWidth : 0, alignment: .leading)
             .clipped()
             .padding(.trailing, showColumn ? 14 : 0)
             // Memory: the map is sized to the visible panel (no overscan under the column): its Metal
@@ -219,7 +233,7 @@ struct ForecastColumn: View {
                     if !report.activeAlerts().isEmpty {
                         AlertBanner(alerts: report.activeAlerts(), timeZone: report.timeZone)
                     }
-                    if Briefing.rainDueSoon(report, now: report.current.time) {
+                    if Briefing.rainDueSoon(report, now: Date()) {
                         NowcastCard(report: report, units: units)
                     }
                     HourlyCard(report: report, units: units) { onOpen(.conditions, nil) }
@@ -227,6 +241,8 @@ struct ForecastColumn: View {
                         .id(ScrollProbe.dailyID)
                     OutlookCard(report: report, units: units)
                         .id("forecast-outlook")
+                    ModelComparisonCard(report: report, units: units)
+                        .id("forecast-models")
                     if showsRadarCard {
                         RadarCard(location: location, pinText: units.temperatureString(report.current.temperature),
                                   alerts: report.activeAlerts(), namespace: radarNamespace)
@@ -314,6 +330,7 @@ enum ScrollProbe {
 struct HeroView: View {
     let report: WeatherReport
     let units: DisplayUnits
+    @Environment(\.isWideLayout) private var isWide
 
     var body: some View {
         VStack(spacing: 0) {
@@ -328,7 +345,8 @@ struct HeroView: View {
                     .font(.system(size: 34, weight: .regular))
             }
             Text(units.temperatureString(report.current.temperature))
-                .font(.system(size: 102, weight: .thin))
+                // Smaller in the wide layout's column, so the forecast starts higher (T18).
+                .font(.system(size: isWide ? 84 : 102, weight: .thin))
                 .padding(.leading, 28) // optically centre despite the trailing degree sign
             Text(report.current.condition.description)
                 .font(.title3.weight(.medium))
@@ -337,9 +355,13 @@ struct HeroView: View {
                 Text("H:\(units.temperatureString(today.high))  L:\(units.temperatureString(today.low))")
                     .font(.title3.weight(.medium))
             }
+            if let outlook = report.severeOutlooks.min(by: { $0.day < $1.day }) {
+                SevereOutlookChip(outlook: outlook, timeZone: report.timeZone)
+                    .padding(.top, 10)
+            }
         }
         .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
-        .padding(.top, 30)
+        .padding(.top, isWide ? 18 : 30)
         .padding(.bottom, 16)
     }
 }
@@ -486,7 +508,14 @@ struct DailyCard: View {
                 }
             VStack(spacing: 0) {
                 WeatherSymbol(condition: day.condition, isDay: true, size: 18)
-                if let p = day.precipitationProbability, p >= 20 {
+                if day.hasSnow {
+                    // Snow days show the expected total instead of a percentage (T13).
+                    Text(units.snowString(day.snowfallSum))
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1).fixedSize()
+                        .accessibilityLabel("Snow \(units.snowString(day.snowfallSum))")
+                } else if let p = day.precipitationProbability, p >= 20 {
                     Text("\(Int((p / 10).rounded() * 10))%")
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(Color(red: 0.55, green: 0.82, blue: 1.0))
@@ -575,7 +604,7 @@ struct LoadingStateView: View {
                 Text("Loading weather for \(location.isCurrentLocation ? "your location" : location.name)…")
                     .font(.title3)
                 Text(slow ? "Still waiting for the weather services. This can take a little longer when they’re busy."
-                     : location.coordinate.isLikelyInNWSCoverage
+                     : location.isLikelyInNWSCoverage
                         ? "Blending forecast models with the National Weather Service"
                         : "Blending forecast models")
                     .font(.callout)
@@ -586,6 +615,35 @@ struct LoadingStateView: View {
             .padding(28)
             .glassCard(cornerRadius: 18)
             .foregroundStyle(.white)
+        }
+    }
+}
+
+/// L20: the SPC convective outlook under the hero ("Slight risk of severe storms today"), shown before
+/// any watch or warning exists. Tinted by SPC's own category colours; hover says where it's from.
+struct SevereOutlookChip: View {
+    let outlook: SevereOutlook
+    let timeZone: TimeZone
+
+    var body: some View {
+        let text = outlook.sentence(now: Date(), timeZone: timeZone)
+        Label(text, systemImage: "cloud.bolt.fill")
+            .font(.callout.weight(.semibold))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Capsule().fill(tint.opacity(0.32)))
+            .overlay(Capsule().stroke(tint.opacity(0.9), lineWidth: 1))
+            .help("Storm Prediction Center Day \(outlook.day) convective outlook")
+            .accessibilityLabel(text)
+    }
+
+    private var tint: Color {
+        switch outlook.risk {
+        case .thunder, .marginal: Color(red: 0.36, green: 0.75, blue: 0.36)
+        case .slight: Color(red: 0.96, green: 0.90, blue: 0.35)
+        case .enhanced: Color(red: 0.95, green: 0.62, blue: 0.25)
+        case .moderate: Color(red: 0.92, green: 0.30, blue: 0.27)
+        case .high: Color(red: 0.95, green: 0.35, blue: 0.95)
         }
     }
 }

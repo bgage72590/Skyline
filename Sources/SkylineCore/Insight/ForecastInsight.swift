@@ -17,7 +17,7 @@ public enum ForecastInsight {
 
     public struct Confidence: Equatable, Sendable {
         public var level: Level
-        /// One short reason ("Models disagree on rain timing after 2 PM"), nil if there's nothing to say.
+        /// One short reason ("Models disagree on rain chances after 2 PM"), nil if there's nothing to say.
         public var reason: String?
         public var sentence: String { reason.map { "\(level.label): \($0.prefix(1).lowercased() + $0.dropFirst())." } ?? "\(level.label)." }
     }
@@ -34,7 +34,12 @@ public enum ForecastInsight {
                                   hourLabel: (Date) -> String, delta: (Double) -> Int) -> Confidence {
         var level = Level.high
         var reason: String?
-        if let spread = day.highSpread {
+        let highs = day.sources.filter { $0.weight > 0 }.compactMap(\.high)
+        if !day.sources.isEmpty, highs.count < 2 {
+            // One forecast can't agree with anything: don't claim High (Code Reviewer batch 4, NTH 6).
+            level = .medium
+            reason = "Only one forecast available for this day"
+        } else if let spread = trimmedSpread(highs) ?? day.highSpread {
             let t: Level = spread >= highSpreadLow ? .low : (spread >= highSpreadMedium ? .medium : .high)
             if t > .high { level = t; reason = "Models differ by \(delta(spread))° on the high" }
             else if day.sources.count >= 3 || spread > 0 { reason = "Models agree on the high within \(max(1, delta(spread)))°" }
@@ -49,10 +54,22 @@ public enum ForecastInsight {
             if r >= level {
                 level = r
                 // Rain chance at T covers the hour ending at T, so the disagreement starts an hour earlier.
-                reason = "Models disagree on rain timing after \(hourLabel(first.time.addingTimeInterval(-3600)))"
+                reason = "Models disagree on rain chances after \(hourLabel(first.time.addingTimeInterval(-3600)))"
             }
         }
         return Confidence(level: level, reason: reason)
+    }
+
+    /// Max − min of the highs, ignoring the single value farthest from the median when there are four or
+    /// more: one outlier model shouldn't make the day "Low confidence" on its own.
+    static func trimmedSpread(_ values: [Double]) -> Double? {
+        guard values.count >= 2 else { return nil }
+        var v = values.sorted()
+        if v.count >= 4 {
+            let median = v.count % 2 == 1 ? v[v.count / 2] : (v[v.count / 2 - 1] + v[v.count / 2]) / 2
+            if abs(v.first! - median) > abs(v.last! - median) { v.removeFirst() } else { v.removeLast() }
+        }
+        return v.last! - v.first!
     }
 
     /// "since this morning" / "since last night" / "since yesterday afternoon", for a snapshot time.

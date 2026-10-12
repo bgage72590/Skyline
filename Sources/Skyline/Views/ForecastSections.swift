@@ -10,7 +10,7 @@ struct BriefingBar: View {
 
     var body: some View {
         let tz = report.timeZone
-        let text = Briefing.headline(report, now: report.current.time,
+        let text = Briefing.headline(report, now: Date(),
                                      hourLabel: { Fmt.hour($0, tz) },
                                      delta: { Int(units.temperatureDelta($0).rounded()) })
         HStack(alignment: .center, spacing: 10) {
@@ -197,7 +197,7 @@ struct NowcastCard: View {
             .environment(\.timeZone, tz)
             .frame(height: 130)
             .accessibilityLabel("Rain intensity over the next two hours")
-            .accessibilityValue(report.nowcastSummary ?? "")
+            .accessibilityValue(report.nowcastSummary(at: Date()) ?? "")
         }
     }
 
@@ -213,10 +213,10 @@ struct NowcastCard: View {
     /// The nowcast sentence, unless the pinned briefing above already says it (UI/UX #8); then the
     /// peak instead ("Heaviest around 5:15 PM").
     private func subtitle(_ samples: [NowcastCurve.Sample], tz: TimeZone) -> String? {
-        let briefing = Briefing.headline(report, now: report.current.time, hourLabel: { Fmt.hour($0, tz) },
+        let briefing = Briefing.headline(report, now: Date(), hourLabel: { Fmt.hour($0, tz) },
                                          delta: { Int(units.temperatureDelta($0).rounded()) })
-        guard TextTidy.isRepeated(report.nowcastSummary, in: briefing) else {
-            return report.nowcastSummary.map { $0 + "." }
+        guard TextTidy.isRepeated(report.nowcastSummary(at: Date()), in: briefing) else {
+            return report.nowcastSummary(at: Date()).map { $0 + "." }
         }
         guard let peak = samples.max(by: { $0.rate < $1.rate }), peak.rate >= 0.1 else { return nil }
         return "Heaviest around \(Fmt.time(peak.time, tz)) (\(NowcastCurve.intensityName(peak.rate).lowercased()))."

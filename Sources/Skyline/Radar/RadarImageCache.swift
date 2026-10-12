@@ -52,7 +52,9 @@ final class RadarImageCache {
         // Tile hosts (IEM, RainViewer) get the plain User-Agent; only api.weather.gov gets the contact.
         config.httpAdditionalHeaders = ["User-Agent": URLSessionHTTPClient.genericUserAgent]
         session = URLSession(configuration: config)
-        images.totalCostLimit = 24 << 20 // decoded RGBA bytes; live tiles are held by their layers anyway
+        // Decoded RGBA bytes; live tiles are held by their layers anyway. `-SkylineDecodedCacheMB N` is a
+        // measurement hook for the playback-memory work.
+        images.totalCostLimit = max(4, UserDefaults.standard.object(forKey: "SkylineDecodedCacheMB") as? Int ?? 24) << 20
         pathMonitor.pathUpdateHandler = { [weak self] path in
             let ok = path.status == .satisfied
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.networkChanged(satisfied: ok) } }

@@ -1,4 +1,5 @@
 import AppKit
+import MapKit
 import SwiftUI
 import SkylineCore
 
@@ -13,7 +14,9 @@ struct SkylineApp: App {
                 .environment(store)
                 .frame(minWidth: 860, minHeight: 600)
         }
-        .defaultSize(width: 1180, height: 820)
+        // T18: wide enough on a fresh install for the three-column layout (sidebar 290 + detail ≥ 1000);
+        // macOS clamps it to smaller screens, where the narrow layout takes over as before.
+        .defaultSize(width: 1360, height: 860)
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandMenu("Weather") {
@@ -109,11 +112,12 @@ enum AppActions {
             return control.isEnabled && control.acceptsFirstResponder
         }
         // SwiftUI plain buttons aren't NSControls. They only take focus with keyboard navigation on
-        // (System Settings › Keyboard), and then the first responder is a SwiftUI-hosted responder other
-        // than the window's root view; leave Space to it (Code Reviewer batch 3).
-        if NSApp.isFullKeyboardAccessEnabled, !(responder is NSWindow), !(responder is NSTableView),
-           (responder as? NSView) !== (responder as? NSView)?.window?.contentView,
-           String(reflecting: type(of: responder)).contains("SwiftUI") {
+        // (System Settings › Keyboard), and then the first responder is a hosted view other than the
+        // window's root view; leave Space to it (Code Reviewer batch 3). Decided with public API only (no
+        // private SwiftUI type names, Code Reviewer batch 4): any focused NSView that isn't the root,
+        // a table, or part of the map.
+        if NSApp.isFullKeyboardAccessEnabled, let view = responder as? NSView, !(view is NSTableView),
+           view !== view.window?.contentView, Bundle(for: type(of: view)) != Bundle(for: MKMapView.self) {
             return true
         }
         return false

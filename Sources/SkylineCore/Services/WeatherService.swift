@@ -16,6 +16,12 @@ public actor WeatherService {
         public static let afdList: TimeInterval = 30 * 60
         /// A text product never changes once issued.
         public static let product: TimeInterval = 7 * 86400
+        /// A point NWS answered 404 for (outside its grids: Canadian border towns, offshore) isn't asked
+        /// again for a week. Before, a failure wasn't cached, so it was re-requested on every refresh.
+        public static let nwsMissing: TimeInterval = 7 * 24 * 3600
+        /// SPC updates its outlooks a handful of times a day; one file serves every US city.
+        public static let spcOutlook: TimeInterval = 30 * 60
+        public static let hrrrRun: TimeInterval = 10 * 60
     }
 
     /// The oldest cached copy that may stand in when the network fails ("offline fallback").
@@ -92,7 +98,9 @@ public actor WeatherService {
         return try? AFDParser.notes(product, office: office.uppercased())
     }
 
-    public func radarFrames(_ provider: RadarProvider, range: RadarRange = .oneHour,
+    /// - Parameter future: append HRRR future-radar frames after the newest scan (NEXRAD only, T12). If the
+    ///   HRRR run time can't be fetched, the observed loop is returned on its own.
+    public func radarFrames(_ provider: RadarProvider, range: RadarRange = .oneHour, future: Bool = false,
                             forceRefresh: Bool = false) async throws -> [RadarFrame] {
         switch provider {
         case .rainViewer:
@@ -101,7 +109,11 @@ public actor WeatherService {
         case .nexrad:
             let data = try await fetch(Endpoints.iemLatest, ttl: TTL.radarIndex, force: forceRefresh)
             let latest = try IEMNexrad.latestValidTime(data) ?? now()
-            return IEMNexrad.frames(latest: latest, range: range)
+            let past = IEMNexrad.frames(latest: latest, range: range)
+            guard future,
+                  let run = await optionalFetch(Endpoints.iemHRRRLatest, ttl: TTL.hrrrRun, force: false, maxStale: 6 * 3600),
+                  let initTime = try? IEMHRRR.initTime(run) else { return past }
+            return past + IEMHRRR.frames(initTime: initTime, after: latest)
         }
     }
 
@@ -110,17 +122,19 @@ public actor WeatherService {
     private func buildReport(for location: WeatherLocation, forceRefresh force: Bool) async throws -> WeatherReport {
         // "My Location" goes out at ~1 km (the store already coarsens the fix; this is defense in depth).
         let coord = location.isCurrentLocation ? location.coordinate.coarse : location.coordinate.rounded
-        let models = ForecastModel.models(for: coord)
+        // US-only sources (HRRR, NWS) follow the border outlines and the saved city's country (QA 4).
+        let models = ForecastModel.models(inCONUS: location.isInCONUS)
 
         async let omFetch = fetchEntry(Endpoints.openMeteoForecast(coord, models: models), ttl: TTL.forecast,
                                        force: force, maxStale: MaxStale.forecast)
         async let aqData = optionalFetch(Endpoints.openMeteoAirQuality(coord), ttl: TTL.airQuality, force: force,
                                          maxStale: MaxStale.airQuality)
-        let inNWS = coord.isLikelyInNWSCoverage
+        let inNWS = location.isLikelyInNWSCoverage ? !(await nwsKnownMissing(coord)) : false
         async let nwsBundle = inNWS ? fetchNWS(coord, force: force) : nil
         // Warnings don't need the /points lookup: fetched on their own so a /points failure (first
         // launch during an NWS hiccup) can't hide them (L2).
         async let alertsFetch = inNWS ? fetchAlerts(coord, force: force) : []
+        async let outlooksFetch = location.isInCONUS ? fetchOutlooks(coord) : []
 
         let omEntry = try await omFetch
         let om = try OpenMeteoResponse.decode(omEntry.data)
@@ -128,6 +142,7 @@ public actor WeatherService {
         let nws = await nwsBundle
         let alerts = await alertsFetch
         let air = await aqData.flatMap { try? OpenMeteoAirQualityResponse.decode($0) }
+        let outlooks = await outlooksFetch
 
         let tz = TimeZone(identifier: om.timezone) ?? location.timeZone
         let key = VerificationKey.key(for: location)
@@ -184,6 +199,9 @@ public actor WeatherService {
                              dataAsOf: dataAsOf, isOfflineFallback: omEntry.isFallback)
         report.nwsGridID = nws?.point.gridID
         report.earlierOutlook = earlier
+        report.severeOutlooks = outlooks
+        report.modelSeries = ForecastBlender.modelSeries(openMeteo: om, nwsHourly: nws?.hourly ?? [], blended: hourly,
+                                                         now: current.time)
         return report
     }
 
@@ -197,8 +215,18 @@ public actor WeatherService {
 
     /// Everything NWS for a point; nil when the point is outside NWS coverage or the API is down.
     private func fetchNWS(_ c: Coordinate, force: Bool) async -> NWSBundle? {
-        guard let pointData = await optionalFetch(Endpoints.nwsPoint(c), ttl: TTL.nwsPoint, force: false),
-              let point = try? NWSPoint.decode(pointData) else { return nil }
+        let pointURL = Endpoints.nwsPoint(c)
+        let pointData: Data
+        do {
+            pointData = try await fetch(pointURL, ttl: TTL.nwsPoint, force: false)
+        } catch HTTPError.status(404, _) {
+            // Not an NWS point: remember it (on disk) so we stop asking on every refresh.
+            await cache.store(Data("404".utf8), for: Self.nwsMissingKey(pointURL))
+            return nil
+        } catch {
+            return nil
+        }
+        guard let point = try? NWSPoint.decode(pointData) else { return nil }
         let headers = ["Accept": "application/geo+json"]
         async let f = optionalFetchEntry(point.forecastURL, ttl: TTL.nwsForecast, force: force, headers: headers,
                                          maxStale: MaxStale.nwsForecast)
@@ -217,6 +245,26 @@ public actor WeatherService {
         if !periods.isEmpty, let fEntry { storedAt.append(fEntry.storedAt) }
         if !hourly.isEmpty, let hEntry { storedAt.append(hEntry.storedAt) }
         return NWSBundle(point: point, periods: periods, hourly: hourly, forecastStoredAt: storedAt)
+    }
+
+    /// SPC Day 1 and Day 2 outlooks at the point (marginal risk or higher). Failures just mean no line.
+    private func fetchOutlooks(_ c: Coordinate) async -> [SevereOutlook] {
+        var out: [SevereOutlook] = []
+        for day in 1...2 {
+            guard let data = await optionalFetch(Endpoints.spcOutlook(day: day), ttl: TTL.spcOutlook, force: false,
+                                                 maxStale: 6 * 3600),
+                  let o = try? SPCOutlookParser.outlook(data, day: day, point: c), o.isSevere, o.validUntil > now()
+            else { continue }
+            out.append(o)
+        }
+        return out
+    }
+
+    static func nwsMissingKey(_ pointURL: URL) -> String { "nws-404:" + pointURL.absoluteString }
+
+    /// True when NWS said 404 for this point within the last week.
+    func nwsKnownMissing(_ c: Coordinate) async -> Bool {
+        await cache.entry(Self.nwsMissingKey(Endpoints.nwsPoint(c)), maxAge: TTL.nwsMissing) != nil
     }
 
     /// Active NWS warnings for a point (with zone outlines for zone-based ones). Independent of `/points`.

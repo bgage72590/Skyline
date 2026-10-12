@@ -6,13 +6,13 @@ import SkylineCore
 enum InsightFormat {
     static func confidence(_ report: WeatherReport, day: DailyForecast, units: DisplayUnits) -> ForecastInsight.Confidence {
         let tz = report.timeZone
-        return ForecastInsight.confidence(day: day, hourly: report.hourly, timeZone: tz, now: report.current.time,
+        return ForecastInsight.confidence(day: day, hourly: report.hourly, timeZone: tz, now: Date(),
                                           hourLabel: { Fmt.hour($0, tz) },
                                           delta: { Int(units.temperatureDelta($0).rounded()) })
     }
 
     static func changes(_ report: WeatherReport, units: DisplayUnits) -> [String] {
-        ForecastInsight.changes(report, now: report.current.time, delta: { Int(units.temperatureDelta($0).rounded()) })
+        ForecastInsight.changes(report, now: Date(), delta: { Int(units.temperatureDelta($0).rounded()) })
     }
 }
 

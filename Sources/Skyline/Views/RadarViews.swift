@@ -44,7 +44,7 @@ struct RadarCard: View {
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .matchedGeometryEffect(id: "radar-map", in: namespace, isSource: !expanded)
         }
-        .task(id: location.id) { radar.configure(for: location.coordinate) }
+        .task(id: location.id) { radar.configure(for: location) }
     }
 
     private func expand() {
@@ -116,7 +116,7 @@ struct ExpandedRadarView: View {
                 .padding(12)
                 Spacer()
                 HStack(alignment: .bottom) {
-                    RadarLegend(provider: radar.provider)
+                    RadarLegend(provider: radar.provider, layer: radar.layer, showsForecastNote: radar.hasForecastFrames)
                         .padding(10)
                         .glassChip(RoundedRectangle(cornerRadius: 10, style: .continuous))
                     Spacer()
@@ -145,7 +145,8 @@ struct ExpandedRadarView: View {
         .modifier(MatchedIfExpanded(enabled: false, namespace: namespace, isSource: store.radarExpanded))
         .foregroundStyle(.white)
         .task(id: location.id) {
-            radar.configure(for: location.coordinate)
+            // One index load (L7): configure doesn't start its own when we await one here.
+            radar.configure(for: location, load: false)
             await radar.loadFrames()
             // Expanding is an explicit "show me the loop"; the always-on panel waits for Space/Play.
             if !isPanel, radar.frames.count > 1 { radar.setPlaying(true) }
@@ -251,19 +252,29 @@ struct RadarTimeLabel: View {
             .overlay(Capsule(style: .continuous).stroke(.white.opacity(0.35), lineWidth: 1))
             .fixedSize()
         } else if let frame = radar.currentFrame {
-            Text(label(frame)).monospacedDigit()
+            Text(Self.label(frame, frames: radar.frames, nowIndex: radar.nowIndex, layer: radar.layer, timeZone: timeZone))
+                .monospacedDigit()
                 .font(compact ? .caption.weight(.semibold) : .callout.weight(.semibold))
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .glassChip(Capsule())
+                // Model forecast frames are tinted and say so: they look like radar but aren't (T12).
+                .overlay {
+                    if frame.isForecast {
+                        Capsule().stroke(Color(red: 0.78, green: 0.62, blue: 1.0), lineWidth: 1.5)
+                    }
+                }
+                .help(frame.isForecast ? "Model forecast (NOAA HRRR via Iowa Environmental Mesonet), not observed radar" : "")
         }
     }
 
-    private func label(_ frame: RadarFrame) -> String {
+    static func label(_ frame: RadarFrame, frames: [RadarFrame], nowIndex: Int, layer: RadarLayer, timeZone: TimeZone) -> String {
         let time = Fmt.time(frame.time, timeZone)
-        guard let last = radar.frames.last else { return time }
-        let minutes = Int((last.time.timeIntervalSince(frame.time) / 60).rounded())
-        return minutes == 0 ? "\(time) · Now" : "\(time) · −\(minutes) min"
+        if layer.isRainfallTotal { return "\(layer.label) · as of \(time)" }
+        guard frames.indices.contains(nowIndex) else { return time }
+        let minutes = Int((frame.time.timeIntervalSince(frames[nowIndex].time) / 60).rounded())
+        if frame.isForecast { return "\(time) · +\(minutes) min · Forecast" }
+        return minutes == 0 ? "\(time) · Now" : "\(time) · −\(-minutes) min"
     }
 }
 
@@ -313,7 +324,26 @@ struct RadarOptions: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .frame(width: 280)
-            if radar.provider == .nexrad {
+            if radar.provider == .nexrad && !radar.inCONUS {
+                // QA 4: say why there are holes instead of silently showing a US-only mosaic.
+                Text("NEXRAD covers the US only. RainViewer shows this area.")
+                    .font(.caption).foregroundStyle(.yellow)
+                    .frame(width: 280, alignment: .trailing)
+            }
+            if radar.provider == .nexrad && radar.inCONUS {
+                Picker("Layer", selection: Binding(get: { radar.layer }, set: { radar.setLayer($0) })) {
+                    ForEach(RadarLayer.allCases) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 280)
+                .help("Radar loop, or rainfall totals for the last hour / 24 hours (MRMS)")
+            }
+            if radar.provider == .nexrad && radar.layer == .reflectivity {
+                Toggle("Future radar (model)", isOn: Binding(get: { radar.showsFuture }, set: { radar.setShowsFuture($0) }))
+                    .toggleStyle(.checkbox)
+                    .font(.caption.weight(.semibold))
+                    .help("Adds the next 2 hours from the NOAA HRRR model after “Now”. It's a forecast, not radar.")
                 HStack(spacing: 6) {
                     Text("Loop").font(.caption2.weight(.semibold)).foregroundStyle(Glass.secondaryText)
                     Picker("Loop length", selection: Binding(get: { radar.range }, set: { radar.setRange($0) })) {
@@ -373,6 +403,18 @@ struct RadarTimeline: View {
                         }
                     }
                     .overlay(alignment: .topLeading) {
+                        // "Now" tick between the observed scans and the model forecast frames (T12).
+                        if radar.hasForecastFrames, radar.frames.count > 1 {
+                            GeometryReader { geo in
+                                let f = Double(radar.nowIndex) / Double(radar.frames.count - 1)
+                                Rectangle().fill(.white.opacity(0.85))
+                                    .frame(width: 2, height: 14)
+                                    .position(x: 8 + (geo.size.width - 16) * f, y: geo.size.height / 2)
+                            }
+                            .allowsHitTesting(false)
+                        }
+                    }
+                    .overlay(alignment: .topLeading) {
                         // Same callout as the charts while scrubbing (drawn, never measured back into state).
                         if showCallout, let frame = radar.currentFrame, radar.frames.count > 1 {
                             GeometryReader { geo in
@@ -390,7 +432,12 @@ struct RadarTimeline: View {
                     Spacer()
                     Text("← → step · Space play").opacity(0.8)
                     Spacer()
-                    Text("Now")
+                    if radar.hasForecastFrames, let last = radar.frames.last {
+                        Text("Forecast to \(Fmt.time(last.time, timeZone))")
+                            .foregroundStyle(Color(red: 0.78, green: 0.62, blue: 1.0))
+                    } else {
+                        Text("Now")
+                    }
                 }
                 .font(.caption2)
                 .opacity(0.75)
@@ -408,6 +455,9 @@ struct RadarTimeline: View {
 /// labelled in dBZ with plain-English intensity.
 struct RadarLegend: View {
     let provider: RadarProvider
+    var layer: RadarLayer = .reflectivity
+    var showsForecastNote = false
+    @Environment(WeatherStore.self) private var store
 
     static let nexradStops: [(dbz: Int, color: Color)] = [
         (5, Color(red: 0.25, green: 0.91, blue: 0.91)), (10, Color(red: 0.0, green: 0.62, blue: 0.96)),
@@ -420,6 +470,38 @@ struct RadarLegend: View {
     ]
 
     var body: some View {
+        if layer.isRainfallTotal { rainfallLegend } else { reflectivityLegend }
+    }
+
+    /// IEM's MRMS ramp, labelled in the user's precipitation unit (L21).
+    private var rainfallLegend: some View {
+        let stops = IEMMRMS.legendStops
+        let inches = store.units.precipitation == .inches
+        return VStack(alignment: .leading, spacing: 3) {
+            Text(layer == .rain1h ? "RAIN, LAST HOUR" : "RAIN, LAST 24 HOURS")
+                .font(.caption2.weight(.semibold)).foregroundStyle(Glass.secondaryText)
+            HStack(spacing: 0) {
+                ForEach(stops.indices, id: \.self) { i in
+                    let hex = stops[i].hex
+                    Rectangle().fill(Color(red: Double((hex >> 16) & 0xFF) / 255, green: Double((hex >> 8) & 0xFF) / 255,
+                                           blue: Double(hex & 0xFF) / 255))
+                        .frame(width: 22, height: 8)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 2))
+            HStack(spacing: 0) {
+                ForEach([0, 2, 4, 6, 8], id: \.self) { i in
+                    let mm = stops[i].mm
+                    Text(inches ? String(format: mm / 25.4 < 1 ? "%.1f″" : "%.0f″", mm / 25.4) : "\(Int(mm)) mm")
+                        .frame(width: 44, alignment: .leading)
+                }
+            }
+            .font(.system(size: 10, weight: .medium)).monospacedDigit()
+            Text("MRMS (radar + gauges) via Iowa Environmental Mesonet").font(.system(size: 10)).foregroundStyle(Glass.secondaryText)
+        }
+    }
+
+    private var reflectivityLegend: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(provider == .nexrad ? "REFLECTIVITY (dBZ)" : "PRECIPITATION")
                 .font(.caption2.weight(.semibold)).foregroundStyle(Glass.secondaryText)
@@ -450,6 +532,11 @@ struct RadarLegend: View {
                     .font(.caption2).frame(width: 196).foregroundStyle(Glass.secondaryText)
             }
             Text(provider.attribution).font(.system(size: 9)).foregroundStyle(Glass.secondaryText)
+            if showsForecastNote {
+                Text(provider == .nexrad ? "After “Now”: NOAA HRRR model forecast via IEM" : "After “Now”: RainViewer nowcast")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Color(red: 0.78, green: 0.62, blue: 1.0))
+            }
         }
     }
 
