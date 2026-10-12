@@ -14,6 +14,8 @@ public struct SourceScore: Codable, Hashable, Sendable {
     /// Distinct UTC days with a verified pair, per kind. Hours from one afternoon are strongly correlated,
     /// so learning requires several *days* of evidence per bucket and source, not just many hours.
     public var tempDays: Set<Int> = [], windDays: Set<Int> = [], rainDays: Set<Int> = []
+    /// Real (unweighted) hour counts, for wording like "41 of 48 rainy hours" and sample-size checks.
+    public var tempHours = 0, wetHours = 0, wetHoursCaught = 0
 
     public init(source: VerificationSource) { self.source = source }
 
@@ -34,6 +36,7 @@ public struct SourceScore: Codable, Hashable, Sendable {
         if let ft = f.t, let ot = o.t {
             tempN += weight; tempAbs += weight * abs(ft - ot); tempBias += weight * (ft - ot)
             tempDays.insert(day)
+            tempHours += 1
         }
         if let fw = f.w, let ow = o.w {
             windN += weight; windAbs += weight * abs(fw - ow)
@@ -45,6 +48,7 @@ public struct SourceScore: Codable, Hashable, Sendable {
             rainDays.insert(day)
         }
         if let wet = o.wet, let call = f.callsRain {
+            if wet { wetHours += 1; if call { wetHoursCaught += 1 } }
             switch (call, wet) {
             case (true, true): hits += weight
             case (false, true): misses += weight

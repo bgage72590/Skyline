@@ -12,6 +12,10 @@ public actor WeatherService {
         public static let airQuality: TimeInterval = 30 * 60
         public static let geocoding: TimeInterval = 30 * 24 * 3600
         public static let radarIndex: TimeInterval = 2 * 60
+        /// The forecast office's discussion list (new ones come out a few times a day).
+        public static let afdList: TimeInterval = 30 * 60
+        /// A text product never changes once issued.
+        public static let product: TimeInterval = 7 * 86400
     }
 
     /// The oldest cached copy that may stand in when the network fails ("offline fallback").
@@ -37,16 +41,24 @@ public actor WeatherService {
     /// Hosts that answered 429/503: no requests to them until this time (Retry-After, else 1 → 2 → 4 … min).
     private var backoffUntil: [String: Date] = [:]
     private var backoffStrikes: [String: Int] = [:]
+    /// Bumped each time a host throttles us. A success only clears the back-off if no throttle was noted
+    /// while it was in flight: NWS requests run concurrently, and a slower success must not cancel a 503
+    /// that arrived meanwhile (QA batch 2).
+    private var throttleEpoch: [String: Int] = [:]
     /// Forecast verification + adaptive weights (nil = fixed weights, nothing recorded; used by tests).
     public nonisolated let verifier: ForecastVerifier?
+    /// Recent daily-forecast snapshots for "why the forecast changed" (nil = none kept; used by tests).
+    public nonisolated let history: ForecastHistory?
 
     public init(client: HTTPClient = URLSessionHTTPClient(),
                 cache: ResponseCache = ResponseCache(directory: ResponseCache.defaultDirectory()),
                 verifier: ForecastVerifier? = nil,
+                history: ForecastHistory? = nil,
                 now: @escaping @Sendable () -> Date = { Date() }) {
         self.client = client
         self.cache = cache
         self.verifier = verifier
+        self.history = history
         self.now = now
     }
 
@@ -66,6 +78,18 @@ public actor WeatherService {
         guard q.count >= 2 else { return [] }
         let data = try await fetch(Endpoints.geocoding(q), ttl: TTL.geocoding)
         return try OpenMeteoGeocodingResponse.decode(data)
+    }
+
+    /// Key messages from the NWS office's latest Area Forecast Discussion (T17). Two small requests,
+    /// cached (list 30 min, product a week); nil when the office has none or NWS is unreachable.
+    public func forecasterNotes(office: String) async -> ForecasterNotes? {
+        let headers = ["Accept": "application/ld+json"]
+        guard let listURL = Endpoints.nwsAFDList(office: office),
+              let list = await optionalFetch(listURL, ttl: TTL.afdList, force: false, headers: headers, maxStale: 12 * 3600),
+              let id = try? AFDParser.latestID(list), let productURL = Endpoints.nwsProduct(id: id),
+              let product = await optionalFetch(productURL, ttl: TTL.product, force: false, headers: headers)
+        else { return nil }
+        return try? AFDParser.notes(product, office: office.uppercased())
     }
 
     public func radarFrames(_ provider: RadarProvider, range: RadarRange = .oneHour,
@@ -92,12 +116,17 @@ public actor WeatherService {
                                        force: force, maxStale: MaxStale.forecast)
         async let aqData = optionalFetch(Endpoints.openMeteoAirQuality(coord), ttl: TTL.airQuality, force: force,
                                          maxStale: MaxStale.airQuality)
-        async let nwsBundle = coord.isLikelyInNWSCoverage ? fetchNWS(coord, force: force) : nil
+        let inNWS = coord.isLikelyInNWSCoverage
+        async let nwsBundle = inNWS ? fetchNWS(coord, force: force) : nil
+        // Warnings don't need the /points lookup: fetched on their own so a /points failure (first
+        // launch during an NWS hiccup) can't hide them (L2).
+        async let alertsFetch = inNWS ? fetchAlerts(coord, force: force) : []
 
         let omEntry = try await omFetch
         let om = try OpenMeteoResponse.decode(omEntry.data)
         guard var current = om.currentConditions() else { throw HTTPError.invalidResponse }
         let nws = await nwsBundle
+        let alerts = await alertsFetch
         let air = await aqData.flatMap { try? OpenMeteoAirQualityResponse.decode($0) }
 
         let tz = TimeZone(identifier: om.timezone) ?? location.timeZone
@@ -113,6 +142,14 @@ public actor WeatherService {
         if let blended = ForecastBlender.temperature(at: current.time, hourly: hourly) {
             current.apparentTemperature += blended.temperature - current.temperature
             current.temperature = blended.temperature
+        }
+
+        // "Why the forecast changed": compare with the outlook from ~12 h ago, then save this one.
+        var earlier: ForecastSnapshot?
+        if let history, !omEntry.isFallback {
+            let t = now()
+            earlier = await history.earlier(key, now: t)
+            await history.record(key, daily: daily, now: t)
         }
 
         // Verification runs detached at utility priority: never delays the report.
@@ -139,19 +176,21 @@ public actor WeatherService {
 
         // The data is as old as its oldest forecast input (a cached copy keeps its download time).
         let dataAsOf = ([omEntry.storedAt] + (nws?.forecastStoredAt ?? [])).min() ?? omEntry.storedAt
-        return WeatherReport(location: loc, fetchedAt: now(), timeZoneIdentifier: om.timezone,
+        var report = WeatherReport(location: loc, fetchedAt: now(), timeZoneIdentifier: om.timezone,
                              current: current, hourly: hourly, daily: daily,
-                             minutely: minutely, alerts: nws?.alerts ?? [],
+                             minutely: minutely, alerts: alerts,
                              airQuality: air, sources: sources,
                              nwsOffice: nws.map { [$0.point.city, $0.point.state].compactMap { $0 }.joined(separator: ", ") },
                              dataAsOf: dataAsOf, isOfflineFallback: omEntry.isFallback)
+        report.nwsGridID = nws?.point.gridID
+        report.earlierOutlook = earlier
+        return report
     }
 
     struct NWSBundle: Sendable {
         var point: NWSPoint
         var periods: [NWSPeriod]
         var hourly: [NWSPeriod]
-        var alerts: [WeatherAlert]
         /// Download times of the NWS forecasts that were used.
         var forecastStoredAt: [Date] = []
     }
@@ -165,8 +204,6 @@ public actor WeatherService {
                                          maxStale: MaxStale.nwsForecast)
         async let h = optionalFetchEntry(point.forecastHourlyURL, ttl: TTL.nwsForecast, force: force, headers: headers,
                                          maxStale: MaxStale.nwsForecast)
-        async let a = optionalFetch(Endpoints.nwsAlerts(c), ttl: TTL.alerts, force: force, headers: headers,
-                                    maxStale: MaxStale.alerts)
         let t = now()
         // Out-of-date NWS forecasts (old cached copies, or a "stuck" NWS grid) are ignored, not blended.
         func recentPeriods(_ e: Fetched?) -> [NWSPeriod]? {
@@ -176,12 +213,18 @@ public actor WeatherService {
         let fEntry = await f, hEntry = await h
         let periods = recentPeriods(fEntry) ?? []
         let hourly = recentPeriods(hEntry) ?? []
-        var alerts = await a.flatMap { try? NWSAlertParser.decode($0, now: t) } ?? []
-        alerts = await withZoneOutlines(alerts)
         var storedAt: [Date] = []
         if !periods.isEmpty, let fEntry { storedAt.append(fEntry.storedAt) }
         if !hourly.isEmpty, let hEntry { storedAt.append(hEntry.storedAt) }
-        return NWSBundle(point: point, periods: periods, hourly: hourly, alerts: alerts, forecastStoredAt: storedAt)
+        return NWSBundle(point: point, periods: periods, hourly: hourly, forecastStoredAt: storedAt)
+    }
+
+    /// Active NWS warnings for a point (with zone outlines for zone-based ones). Independent of `/points`.
+    private func fetchAlerts(_ c: Coordinate, force: Bool) async -> [WeatherAlert] {
+        let data = await optionalFetch(Endpoints.nwsAlerts(c), ttl: TTL.alerts, force: force,
+                                       headers: ["Accept": "application/geo+json"], maxStale: MaxStale.alerts)
+        let alerts = data.flatMap { try? NWSAlertParser.decode($0, now: now()) } ?? []
+        return await withZoneOutlines(alerts)
     }
 
     /// Zone-based alerts (no polygon of their own) get their forecast zones' outlines, so the map can
@@ -205,6 +248,7 @@ public actor WeatherService {
             guard alert.polygons.isEmpty else { return alert }
             var a = alert
             a.polygons = alert.affectedZones.flatMap { outlines[$0] ?? [] }
+            a.outlineIsZone = !a.polygons.isEmpty
             return a
         }
     }
@@ -222,9 +266,12 @@ public actor WeatherService {
         let host = url.host ?? ""
         do {
             if let until = backoffUntil[host], until > now() { throw HTTPError.backingOff(host: host, until: until) }
+            let epoch = throttleEpoch[host, default: 0]
             let data = try await client.get(url, headers: headers)
-            backoffUntil[host] = nil
-            backoffStrikes[host] = nil
+            if throttleEpoch[host, default: 0] == epoch {
+                backoffUntil[host] = nil
+                backoffStrikes[host] = nil
+            }
             await cache.store(data, for: key)
             return Fetched(data: data, storedAt: now(), isFallback: false)
         } catch {
@@ -240,6 +287,7 @@ public actor WeatherService {
     private func noteThrottled(_ host: String, retryAfter: TimeInterval?) {
         let strikes = backoffStrikes[host, default: 0]
         backoffStrikes[host] = strikes + 1
+        throttleEpoch[host, default: 0] += 1
         let delay = retryAfter.map { min(max($0, 5), 3600) } ?? min(60 * pow(2, Double(min(strikes, 5))), 1800)
         backoffUntil[host] = now().addingTimeInterval(delay)
     }

@@ -141,7 +141,8 @@ final class Batch2Tests: XCTestCase {
 
     func testCurrentLocationRequestsAreCoarse() async throws {
         let client = MockHTTPClient()
-        let service = WeatherService(client: client, cache: ResponseCache(directory: nil), now: { self.fixtureTime })
+        let t = fixtureTime
+        let service = WeatherService(client: client, cache: ResponseCache(directory: nil), now: { t })
         let here = WeatherLocation(id: WeatherLocation.currentLocationID, name: "Here",
                                    coordinate: Coordinate(latitude: 40.712345, longitude: -74.006789), isCurrentLocation: true)
         _ = try await service.report(for: here)

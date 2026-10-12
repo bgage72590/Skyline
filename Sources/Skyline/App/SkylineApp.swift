@@ -108,6 +108,14 @@ enum AppActions {
         if let control = responder as? NSControl, !(control is NSTableView) {
             return control.isEnabled && control.acceptsFirstResponder
         }
+        // SwiftUI plain buttons aren't NSControls. They only take focus with keyboard navigation on
+        // (System Settings › Keyboard), and then the first responder is a SwiftUI-hosted responder other
+        // than the window's root view; leave Space to it (Code Reviewer batch 3).
+        if NSApp.isFullKeyboardAccessEnabled, !(responder is NSWindow), !(responder is NSTableView),
+           (responder as? NSView) !== (responder as? NSView)?.window?.contentView,
+           String(reflecting: type(of: responder)).contains("SwiftUI") {
+            return true
+        }
         return false
     }
 }

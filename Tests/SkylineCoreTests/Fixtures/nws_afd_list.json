@@ -1,0 +1,16 @@
+{
+ "@graph": [
+  {
+   "id": "8e7067ae-fc2b-41dc-b7be-de8f9f4c3990",
+   "issuingOffice": "KOKX",
+   "issuanceTime": "2026-10-11T21:08:00+00:00",
+   "productCode": "AFD"
+  },
+  {
+   "id": "4abbf29b-df94-4246-a1e4-0791aa48d67e",
+   "issuingOffice": "KOKX",
+   "issuanceTime": "2026-10-11T23:55:00+00:00",
+   "productCode": "AFD"
+  }
+ ]
+}

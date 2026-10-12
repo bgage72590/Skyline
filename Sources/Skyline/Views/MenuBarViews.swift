@@ -45,7 +45,9 @@ struct MenuBarLabel: View {
         .foregroundStyle(Color.black.opacity(spec.dimmed ? 0.45 : 1))
         .padding(.horizontal, 1)
         let renderer = ImageRenderer(content: content)
-        renderer.scale = NSScreen.main?.backingScaleFactor ?? 2
+        // Always 2×: sharp on Retina, cleanly downsampled on a 1× display, so moving between displays
+        // never leaves a soft image (Code Reviewer batch 3).
+        renderer.scale = 2
         guard let image = renderer.nsImage else { return nil }
         image.isTemplate = true
         return image
@@ -89,6 +91,13 @@ struct MenuBarContentView: View {
                                        delta: { Int(store.units.temperatureDelta($0).rounded()) }))
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
+                if let change = InsightFormat.changes(report, units: store.units).first {
+                    // "Tomorrow's high is down 5° since this morning" (T11).
+                    Label(change, systemImage: change.contains(" up ") ? "arrow.up.right" : "arrow.down.right")
+                        .font(.caption.weight(.medium))
+                        .opacity(0.9)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 // Everything below the headline scrolls if the dropdown would be taller than the screen (T21).
                 ViewThatFits(in: .vertical) {
                     details(report)

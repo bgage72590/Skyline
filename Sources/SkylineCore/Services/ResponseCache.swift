@@ -39,18 +39,32 @@ public actor ResponseCache {
         memory = memory.filter { $0.value.storedAt >= cutoff }
         recency.removeAll { memory[$0] == nil }
         guard let directory else { return }
-        await Task.detached(priority: .utility) { Self.pruneFiles(in: directory, cutoff: cutoff) }.value
+        sweepWrites = []
+        defer { sweepWrites = nil }
+        let candidates = await Task.detached(priority: .utility) { Self.pruneCandidates(in: directory, cutoff: cutoff) }.value
+        deleteStale(candidates, cutoff: cutoff)
     }
 
-    private nonisolated static func pruneFiles(in directory: URL, cutoff: Date) {
+    /// Off-actor scan: files that were old or unreadable when read. Nothing is deleted here.
+    nonisolated static func pruneCandidates(in directory: URL, cutoff: Date) -> [URL] {
         guard let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-        else { return }
-        for url in files where url.pathExtension == "plist" {
+        else { return [] }
+        return files.filter { url in
+            guard url.pathExtension == "plist" else { return false }
             guard let raw = try? Data(contentsOf: url),
-                  let e = try? PropertyListDecoder().decode(Entry.self, from: raw) else {
-                try? FileManager.default.removeItem(at: url); continue
-            }
-            if e.storedAt < cutoff { try? FileManager.default.removeItem(at: url) }
+                  let e = try? PropertyListDecoder().decode(Entry.self, from: raw) else { return true }
+            return e.storedAt < cutoff
+        }
+    }
+
+    /// Files written while a sweep is scanning (nil when no sweep is running).
+    private var sweepWrites: Set<String>?
+
+    /// Back on the actor (no `store` can interleave): skip any candidate rewritten during the scan.
+    func deleteStale(_ candidates: [URL], cutoff: Date) {
+        let rewritten = sweepWrites ?? []
+        for url in candidates where !rewritten.contains(url.lastPathComponent) {
+            try? FileManager.default.removeItem(at: url)
         }
     }
 
@@ -77,6 +91,7 @@ public actor ResponseCache {
         let e = Entry(storedAt: now(), data: data)
         remember(e, for: key)
         guard let url = fileURL(key) else { return }
+        sweepWrites?.insert(url.lastPathComponent)
         if let encoded = try? PropertyListEncoder().encode(e) {
             try? encoded.write(to: url, options: .atomic)
         }

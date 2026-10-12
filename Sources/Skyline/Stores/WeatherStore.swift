@@ -73,6 +73,30 @@ final class WeatherStore {
     private(set) var menuBarImage: NSImage?
     @ObservationIgnored private var menuBarImageKey: String?
 
+    // MARK: Notifications (T8, L19) and forecaster's notes (T17)
+
+    /// What to notify about (Settings → Notifications). All off until the user turns something on.
+    var notificationPrefs: NotificationPrefs {
+        didSet {
+            guard notificationPrefs != oldValue else { return }
+            if let data = try? JSONEncoder().encode(notificationPrefs) { defaults.set(data, forKey: Keys.notifyPrefs) }
+            scheduleBriefing()
+            if notificationPrefs.alerts != oldValue.alerts || notificationPrefs.rain != oldValue.rain { startRefreshLoop() }
+        }
+    }
+    /// Locations that notify. nil = just the menu-bar city (the default until the user picks).
+    var notifyLocationIDs: Set<String>? {
+        didSet { defaults.set(notifyLocationIDs.map { Array($0) }, forKey: Keys.notifyIDs) }
+    }
+    /// macOS permission as last seen (nil = never asked). Settings explains a "denied".
+    private(set) var notificationPermission: Bool?
+    /// Latest forecaster's notes per NWS office (loaded only while the card is on screen).
+    private(set) var forecasterNotes: [String: ForecasterNotes] = [:]
+    @ObservationIgnored private var notesFetched: [String: Date] = [:]
+    @ObservationIgnored let notifier = Notifier()
+    @ObservationIgnored private var notificationState = NotificationState()
+    @ObservationIgnored private var briefingTask: Task<Void, Never>?
+
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let locationProvider = LocationProvider()
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
@@ -98,6 +122,9 @@ final class WeatherStore {
         static let distanceUnit = "unit.distance"
         static let clock = "clockStyle"
         static let menuBarPin = "menuBarLocationID"
+        static let notifyPrefs = "notifications.prefs.v1"
+        static let notifyIDs = "notifications.locations.v1"
+        static let notifyState = "notifications.state.v1"
     }
 
     /// A report younger than this is shown without refetching.
@@ -117,6 +144,13 @@ final class WeatherStore {
         self.distanceUnit = defaults.string(forKey: Keys.distanceUnit).flatMap(DistanceUnit.init(rawValue:))
         self.clockStyle = ClockStyle(rawValue: defaults.string(forKey: Keys.clock) ?? "") ?? .system
         self.menuBarPinID = defaults.string(forKey: Keys.menuBarPin)
+        self.notificationPrefs = defaults.data(forKey: Keys.notifyPrefs)
+            .flatMap { try? JSONDecoder().decode(NotificationPrefs.self, from: $0) } ?? NotificationPrefs()
+        self.notifyLocationIDs = (defaults.array(forKey: Keys.notifyIDs) as? [String]).map(Set.init)
+        if let data = defaults.data(forKey: Keys.notifyState),
+           let state = try? JSONDecoder().decode(NotificationState.self, from: data) {
+            self.notificationState = state
+        }
         let minutes = defaults.integer(forKey: Keys.refresh)
         self.refreshMinutes = minutes >= 5 ? minutes : 15
         self.selectedID = defaults.string(forKey: Keys.selected)
@@ -153,6 +187,7 @@ final class WeatherStore {
         observeWake()
         startRefreshLoop()
         trackMenuBarImage()
+        setUpNotifications()
         // Download-cache clean-up (entries older than 14 days), off the launch path.
         let service = self.service
         Task.detached(priority: .utility) {
@@ -260,6 +295,7 @@ final class WeatherStore {
                 retryAttempts[location.id] = nil
             }
             scheduleHousekeeping()
+            if !report.isOfflineFallback { considerNotifications(report, for: location) }
             await refreshAccuracy(for: location)
         } catch is CancellationError {
         } catch {
@@ -306,7 +342,8 @@ final class WeatherStore {
             guard !Task.isCancelled, let self else { return }
             self.retryTasks[id] = nil
             guard let current = self.allLocations.first(where: { $0.id == id }),
-                  self.isMainWindowVisible || self.menuBarLocation?.id == id else { return }
+                  self.isMainWindowVisible || self.menuBarLocation?.id == id
+                    || ((self.notificationPrefs.alerts || self.notificationPrefs.rain) && self.notifies(current)) else { return }
             await self.load(current)
         }
     }
@@ -352,7 +389,7 @@ final class WeatherStore {
         case "cold":
             return WeatherService(client: OfflineHTTPClient(), cache: ResponseCache(directory: nil))
         default:
-            return WeatherService(verifier: ForecastVerifier())
+            return WeatherService(verifier: ForecastVerifier(), history: ForecastHistory(directory: ForecastHistory.defaultDirectory()))
         }
     }
 
@@ -365,6 +402,8 @@ final class WeatherStore {
     func refreshDue() async {
         var targets: [WeatherLocation] = []
         if let m = menuBarLocation { targets.append(m) }
+        // Cities with warning/rain notifications stay current even with the window closed.
+        if notificationPrefs.alerts || notificationPrefs.rain { targets += allLocations.filter(notifies) }
         if isMainWindowVisible { targets += allLocations }
         await refresh(locations: targets, force: false)
     }
@@ -386,7 +425,9 @@ final class WeatherStore {
             while !Task.isCancelled {
                 await self?.refreshDue()
                 // Menu bar only: a slower cadence (the window reopening refreshes immediately).
-                guard let minutes = self.map({ $0.isMainWindowOpen ? $0.refreshMinutes : $0.menuBarOnlyMinutes }) else { return }
+                // Warning/rain notifications keep the normal cadence (a 30-min gap would miss "rain in 20 min").
+                guard let minutes = self.map({ $0.isMainWindowOpen || $0.notificationPrefs.alerts || $0.notificationPrefs.rain
+                                                   ? $0.refreshMinutes : $0.menuBarOnlyMinutes }) else { return }
                 try? await Task.sleep(for: .seconds(Double(minutes) * 60), tolerance: .seconds(90))
             }
         }
@@ -582,25 +623,36 @@ final class WeatherStore {
     func remove(_ location: WeatherLocation, undoManager: UndoManager? = nil) {
         guard !location.isCurrentLocation, let index = savedLocations.firstIndex(where: { $0.id == location.id }) else { return }
         let wasSelected = selectedID == location.id
+        // A removed city stops being the menu-bar pick (Settings would show a choice that no longer
+        // exists); undo puts the pin back.
+        let wasPinned = menuBarPinID == location.id
+        let notified = notifyLocationIDs?.contains(location.id) == true
         savedLocations.remove(at: index)
         reports[location.id] = nil
         errors[location.id] = nil
+        if wasPinned { menuBarPinID = nil }
+        if notified { notifyLocationIDs?.remove(location.id) }
         if wasSelected { selectedID = allLocations.first?.id }
         if let undoManager {
-            undoManager.registerUndo(withTarget: self) { store in
+            // Weak: the manager owns this action, so a strong capture would be a (small) retain cycle.
+            undoManager.registerUndo(withTarget: self) { [weak undoManager] store in
                 MainActor.assumeIsolated {
-                    store.restore(location, at: index, select: wasSelected, undoManager: undoManager)
+                    store.restore(location, at: index, select: wasSelected, pinned: wasPinned, notified: notified,
+                                  undoManager: undoManager)
                 }
             }
             undoManager.setActionName("Remove \(location.name)")
         }
     }
 
-    func restore(_ location: WeatherLocation, at index: Int, select: Bool, undoManager: UndoManager? = nil) {
+    func restore(_ location: WeatherLocation, at index: Int, select: Bool, pinned: Bool = false, notified: Bool = false,
+                 undoManager: UndoManager? = nil) {
         savedLocations = LocationList.restoring(location, at: index, into: savedLocations)
         if select { selectedID = location.id }
+        if pinned { menuBarPinID = location.id }
+        if notified { notifyLocationIDs?.insert(location.id) }
         if let undoManager {
-            undoManager.registerUndo(withTarget: self) { store in
+            undoManager.registerUndo(withTarget: self) { [weak undoManager] store in
                 MainActor.assumeIsolated { store.remove(location, undoManager: undoManager) }
             }
             undoManager.setActionName("Remove \(location.name)")
@@ -646,5 +698,143 @@ final class WeatherStore {
         if let data = try? JSONEncoder().encode(savedLocations) {
             defaults.set(data, forKey: Keys.locations)
         }
+    }
+}
+
+// MARK: - Notifications (T8, L19) and forecaster's notes (T17)
+
+extension WeatherStore {
+    /// Whether this location sends notifications (default: only the menu-bar city).
+    func notifies(_ location: WeatherLocation) -> Bool {
+        if let ids = notifyLocationIDs { return ids.contains(location.id) }
+        return location.id == menuBarLocation?.id
+    }
+
+    func setNotifies(_ location: WeatherLocation, _ on: Bool) {
+        var ids = notifyLocationIDs ?? Set(allLocations.filter(notifies).map(\.id))
+        if on { ids.insert(location.id) } else { ids.remove(location.id) }
+        notifyLocationIDs = ids
+    }
+
+    /// Settings turns a notification on: ask macOS once (system prompt), remember the answer.
+    func ensureNotificationPermission() async {
+        let granted = await notifier.requestAuthorization()
+        if notificationPermission != granted { notificationPermission = granted }
+        if granted { for location in allLocations { if let r = reports[location.id] { considerNotifications(r, for: location) } } }
+    }
+
+    func setUpNotifications() {
+        notifier.onOpen = { [weak self] locationID, alertID in
+            guard let self else { return }
+            if self.allLocations.contains(where: { $0.id == locationID }) { self.selectedID = locationID }
+            self.activeModule = nil
+            self.radarExpanded = false
+            if let alertID { self.pendingAlertID = alertID }
+            AppActions.openMainWindow?()
+            NSApp.activate()
+        }
+        scheduleBriefing()
+        // Only look at the permission if something is on; never prompt at launch.
+        guard notificationPrefs.anyOn else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let status = await self.notifier.refreshAuthorization()
+            let allowed = status.map { $0 == .authorized || $0 == .provisional }
+            if self.notificationPermission != allowed { self.notificationPermission = allowed }
+            if allowed == true {
+                for location in self.allLocations { if let r = self.reports[location.id] { self.considerNotifications(r, for: location) } }
+            }
+        }
+    }
+
+    /// Runs the planner on a fresh report and posts the result. QA hook `-SkylineNotifyPreview YES`
+    /// prints what would be posted (every kind on, nothing sent, nothing remembered) instead.
+    func considerNotifications(_ report: WeatherReport, for location: WeatherLocation) {
+        let preview = UserDefaults.standard.bool(forKey: "SkylineNotifyPreview")
+        var prefs = notificationPrefs
+        var state = notificationState
+        if preview {
+            prefs.alerts = true; prefs.rain = true; prefs.morningBriefing = true
+            prefs.minimumSeverity = .minor; prefs.quietHours = false
+            prefs.briefingMinutes = max(0, NotificationPlannerClock.minutesNow() - 1)
+            state = NotificationState()
+        } else {
+            guard prefs.anyOn, notifier.authorized == true else { return }
+        }
+        let tz = report.timeZone
+        let name = location.name
+        var planned: [PlannedNotification] = []
+        if preview || notifies(location) {
+            planned = NotificationPlanner.plan(report, locationName: name, prefs: prefs, state: &state, now: Date(),
+                                               timeLabel: { Fmt.time($0, tz) })
+        }
+        if location.id == menuBarLocation?.id || preview,
+           let b = NotificationPlanner.briefing(report, locationName: name, summary: briefingSummary(report), prefs: prefs,
+                                                state: &state, now: Date()) {
+            planned.append(b)
+        }
+        if preview {
+            for p in planned { print("[notify] \(p.kind.rawValue) | \(p.title) | \(p.body)") }
+            if planned.isEmpty { print("[notify] none for \(name)") }
+            fflush(stdout)
+            return
+        }
+        guard state != notificationState else { return }
+        notificationState = state
+        if let data = try? JSONEncoder().encode(state) { defaults.set(data, forKey: Keys.notifyState) }
+        notifier.post(planned)
+    }
+
+    /// "High 64°, low 50°. Rain likely from 4 PM (70%)." for the morning briefing.
+    func briefingSummary(_ report: WeatherReport) -> String {
+        let tz = report.timeZone
+        var parts: [String] = []
+        if let today = report.today {
+            parts.append("High \(units.temperatureString(today.high)), low \(units.temperatureString(today.low)).")
+        }
+        parts.append(Briefing.headline(report, now: Date(), hourLabel: { Fmt.hour($0, tz) },
+                                       delta: { Int(self.units.temperatureDelta($0).rounded()) }))
+        if let alert = report.activeAlerts().first { parts.append("\(alert.event) in effect.") }
+        return parts.joined(separator: " ")
+    }
+
+    /// One sleeping task per day: wakes at the briefing time, makes sure the menu-bar city is fresh, and
+    /// lets `considerNotifications` send the briefing. A Mac asleep then gets it on wake (within 3 h).
+    func scheduleBriefing() {
+        briefingTask?.cancel()
+        briefingTask = nil
+        guard notificationPrefs.morningBriefing else { return }
+        let next = NotificationPlanner.nextBriefing(after: Date(), prefs: notificationPrefs)
+        briefingTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(max(1, next.timeIntervalSinceNow + 5)), tolerance: .seconds(30))
+            guard !Task.isCancelled, let self, let location = self.menuBarLocation else { return }
+            await self.load(location)
+            if let report = self.reports[location.id], !report.isOfflineFallback {
+                self.considerNotifications(report, for: location)
+            }
+            self.scheduleBriefing()
+        }
+    }
+
+    /// Forecaster's notes for an office: at most one check per 30 min (the service caches too).
+    func loadForecasterNotes(office: String) async {
+        if let at = notesFetched[office], Date().timeIntervalSince(at) < 30 * 60, forecasterNotes[office] != nil { return }
+        notesFetched[office] = Date()
+        let notes = await service.forecasterNotes(office: office)
+        if UserDefaults.standard.bool(forKey: "SkylineNotifyPreview") {
+            print("[notes] office=\(office) loaded=\(notes != nil) keyMessages=\(notes?.areKeyMessages ?? false) "
+                  + "points=\(notes?.points.count ?? 0) changed=\(notes?.whatChanged != nil) first=\(notes?.points.first?.prefix(90) ?? "-")")
+            fflush(stdout)
+        }
+        guard let notes else { return }
+        if forecasterNotes[office] != notes { forecasterNotes[office] = notes }
+    }
+}
+
+/// Local minutes since midnight (for the notification preview hook).
+enum NotificationPlannerClock {
+    static func minutesNow() -> Int {
+        let c = Calendar.current.dateComponents([.hour, .minute], from: Date())
+        return (c.hour ?? 0) * 60 + (c.minute ?? 0)
     }
 }

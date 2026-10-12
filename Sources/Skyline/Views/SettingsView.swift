@@ -50,6 +50,8 @@ struct SettingsView: View {
                 }
             }
 
+            NotificationSettings()
+
             Section("Units") {
                 Picker("Preset", selection: $store.unitPreset) {
                     ForEach(UnitPreference.allCases) { Text($0.label).tag($0) }
@@ -82,9 +84,13 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 480)
+        .frame(width: 480, height: 640)
         .padding()
         .onAppear { loginItem = LoginItem.status() }
+        // Approving Skyline in System Settings happens in another app: re-check when Skyline is active again.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            loginItem = LoginItem.status()
+        }
     }
 
     /// "Automatic (°F)" follows the preset; any other choice overrides just this dimension.
@@ -95,6 +101,81 @@ struct SettingsView: View {
             Text("Automatic (\(preset.label))").tag(U?.none)
             ForEach(Array(U.allCases)) { unit in Text(unit.label).tag(Optional(unit)) }
         }
+    }
+}
+
+/// Settings → Notifications (T8, L19). Everything starts off; the first switch turned on asks macOS for
+/// permission. Severe warnings cover the point (storm polygons are checked), rain notices come from the
+/// 15-minute nowcast, and quiet hours hold back everything except extreme warnings.
+struct NotificationSettings: View {
+    @Environment(WeatherStore.self) private var store
+
+    var body: some View {
+        @Bindable var store = store
+        Section {
+            Toggle("Weather warnings", isOn: on(\.alerts))
+            if store.notificationPrefs.alerts {
+                Picker("Notify for", selection: $store.notificationPrefs.minimumSeverity) {
+                    Text("Extreme only (e.g. tornado warnings)").tag(AlertSeverity.extreme)
+                    Text("Severe and extreme").tag(AlertSeverity.severe)
+                    Text("Moderate and up (incl. advisories)").tag(AlertSeverity.moderate)
+                    Text("All alerts").tag(AlertSeverity.minor)
+                }
+            }
+            Toggle("Rain starting or stopping", isOn: on(\.rain))
+            Toggle("Morning briefing", isOn: on(\.morningBriefing))
+            if store.notificationPrefs.morningBriefing {
+                DatePicker("Briefing time", selection: minutes(\.briefingMinutes), displayedComponents: .hourAndMinute)
+            }
+            Toggle("Quiet hours", isOn: $store.notificationPrefs.quietHours)
+            if store.notificationPrefs.quietHours {
+                DatePicker("From", selection: minutes(\.quietStartMinutes), displayedComponents: .hourAndMinute)
+                DatePicker("Until", selection: minutes(\.quietEndMinutes), displayedComponents: .hourAndMinute)
+            }
+            if store.notificationPrefs.alerts || store.notificationPrefs.rain {
+                ForEach(store.allLocations) { location in
+                    Toggle(isOn: Binding(get: { store.notifies(location) }, set: { store.setNotifies(location, $0) })) {
+                        Text("Notify for \(location.name)")
+                    }
+                }
+            }
+            if store.notificationPermission == false {
+                HStack {
+                    Text("Notifications for Skyline are turned off in System Settings.")
+                        .font(.caption).foregroundStyle(.orange)
+                    Button("Open") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    .controlSize(.small)
+                }
+            }
+        } header: {
+            Text("Notifications")
+        } footer: {
+            Text("Rain notices use the 15-minute nowcast, so timing is approximate. Quiet hours hold back everything except extreme warnings, and the morning briefing comes for the menu-bar city.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    /// A switch that asks for permission when it's turned on.
+    private func on(_ key: WritableKeyPath<NotificationPrefs, Bool>) -> Binding<Bool> {
+        Binding(get: { store.notificationPrefs[keyPath: key] }, set: { value in
+            store.notificationPrefs[keyPath: key] = value
+            if value { Task { await store.ensureNotificationPermission() } }
+        })
+    }
+
+    /// Minutes after midnight shown as a time of day.
+    private func minutes(_ key: WritableKeyPath<NotificationPrefs, Int>) -> Binding<Date> {
+        Binding(get: {
+            Calendar.current.date(byAdding: .minute, value: store.notificationPrefs[keyPath: key],
+                                  to: Calendar.current.startOfDay(for: Date())) ?? Date()
+        }, set: { date in
+            let c = Calendar.current.dateComponents([.hour, .minute], from: date)
+            store.notificationPrefs[keyPath: key] = (c.hour ?? 0) * 60 + (c.minute ?? 0)
+        })
     }
 }
 

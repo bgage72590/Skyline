@@ -64,6 +64,18 @@ public enum Endpoints {
         URL(string: String(format: "https://api.weather.gov/alerts/active?point=%.4f,%.4f", c.latitude, c.longitude))!
     }
 
+    /// Latest Area Forecast Discussions issued by an NWS office (e.g. "OKX").
+    public static func nwsAFDList(office: String) -> URL? {
+        guard office.count <= 4, office.allSatisfy({ $0.isLetter && $0.isASCII }) else { return nil }
+        return URL(string: "https://api.weather.gov/products/types/AFD/locations/\(office.uppercased())")
+    }
+
+    /// One NWS text product by id.
+    public static func nwsProduct(id: String) -> URL? {
+        guard !id.isEmpty, id.allSatisfy({ $0.isHexDigit || $0 == "-" }) else { return nil }
+        return URL(string: "https://api.weather.gov/products/\(id)")
+    }
+
     public static let rainViewerMaps = URL(string: "https://api.rainviewer.com/public/weather-maps.json")!
     public static let iemLatest = URL(string: "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.json")!
 }

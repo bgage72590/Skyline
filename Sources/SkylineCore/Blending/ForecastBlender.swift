@@ -113,6 +113,12 @@ public enum ForecastBlender {
                          "relative_humidity_2m", "dew_point_2m", "pressure_msl", "visibility", "wind_gusts_10m"]
         var columns: [ForecastModel: [String: [Double?]]] = [:]
         for m in models { columns[m] = Dictionary(uniqueKeysWithValues: variables.map { ($0, col($0, m)) }) }
+        // Per variable: is best_match just GFS/HRRR (US), or an independent model (elsewhere)?
+        var bestMatchCopy: [String: Bool] = [:]
+        for v in variables {
+            bestMatchCopy[v] = bestMatchIsCopy(columns[.bestMatch]?[v] ?? [],
+                                               of: [ForecastModel.gfs, .hrrr].filter { !ignores($0, v) }.map { columns[$0]?[v] ?? [] })
+        }
 
         var result: [HourlyForecast] = []
         result.reserveCapacity(times.count)
@@ -129,7 +135,7 @@ public enum ForecastBlender {
             func samples(_ variable: String, nwsValue: Double? = nil) -> [(value: Double?, weight: Double)] {
                 var s = dedupedFamily(models.map { m in
                     (model: m, value: modelValue(columns[m]?[variable] ?? [], i, m, variable), weight: w(.model(m), variable))
-                })
+                }, bestMatchIsCopy: bestMatchCopy[variable] ?? false)
                 if let nwsValue { s.append((nwsValue, w(.nws, variable))) }
                 return s
             }
@@ -139,7 +145,10 @@ public enum ForecastBlender {
             let temps = tempSamples.compactMap(\.value)
             let spread = temps.count > 1 ? (temps.max()! - temps.min()!) : nil
 
-            var pop = weightedMean(samples("precipitation_probability", nwsValue: nwsPrecip?.probabilityOfPrecipitation))
+            let popSamples = samples("precipitation_probability", nwsValue: nwsPrecip?.probabilityOfPrecipitation)
+            var pop = weightedMean(popSamples)
+            let pops = popSamples.compactMap(\.value)
+            let popSpread = pops.count > 1 ? pops.max()! - pops.min()! : nil
             var precip = weightedMean(samples("precipitation"))
             // Short range: lean on the 15-minute nowcast for the hour ending at `time`.
             // `time` ends the hour; the hour under way (start before now) counts as lead 0.
@@ -177,6 +186,7 @@ public enum ForecastBlender {
                 pressure: weightedMean(samples("pressure_msl")),
                 visibility: weightedMean(samples("visibility")),
                 windGust: weightedMean(samples("wind_gusts_10m"))))
+            result[result.count - 1].precipitationProbabilitySpread = popSpread
         }
         return result
     }
@@ -306,6 +316,13 @@ public enum ForecastBlender {
         func dailyWeight(_ m: ForecastModel, _ dayIndex: Int, _ kind: BlendWeights.Kind = .temperature) -> Double {
             baseDailyWeight(m, dayIndex) * learned.multiplier(kind, VerificationSource(m), leadHours: learnedLead(dayIndex))
         }
+        var copyCache: [String: Bool] = [:]
+        func bmCopy(_ v: String) -> Bool {
+            if let c = copyCache[v] { return c }
+            let c = bestMatchIsCopy(col(v, .bestMatch), of: [ForecastModel.gfs, .hrrr].filter { !ignores($0, v) }.map { col(v, $0) })
+            copyCache[v] = c
+            return c
+        }
         func firstValue(_ v: String, _ i: Int) -> Double? {
             ([.bestMatch] + models).lazy.compactMap { at(col(v, $0), i) }.first
         }
@@ -319,7 +336,8 @@ public enum ForecastBlender {
             let nwsRainW = weight(.nws, leadHours: Double(i) * 24) * learned.multiplier(.rain, .nws, leadHours: learnedLead(i))
 
             func modelSamples(_ v: String, _ kind: BlendWeights.Kind = .temperature) -> [(value: Double?, weight: Double)] {
-                dedupedFamily(models.map { (model: $0, value: modelValue(v, $0, i), weight: dailyWeight($0, i, kind)) })
+                dedupedFamily(models.map { (model: $0, value: modelValue(v, $0, i), weight: dailyWeight($0, i, kind)) },
+                              bestMatchIsCopy: bmCopy(v))
             }
             var highs = modelSamples("temperature_2m_max")
             if let h = highP?.temperatureC { highs.append((h, nwsW)) }
@@ -328,14 +346,15 @@ public enum ForecastBlender {
             var pops = dedupedFamily(models.map { m in
                 (model: m, value: daytimePoP(m, day) ?? modelValue("precipitation_probability_max", m, i),
                  weight: dailyWeight(m, i, .rain))
-            })
+            }, bestMatchIsCopy: bmCopy("precipitation_probability_max"))
             // NWS rain chance for D: the daytime period's. The night that *ended* on D (mostly the evening
             // before) must not leak into D. With no daytime period left, use tonight's (starting on D).
             let nwsPop = highP?.probabilityOfPrecipitation ?? (highP == nil ? nwsEvening[day]?.probabilityOfPrecipitation : nil)
             if let nwsPop { pops.append((nwsPop, nwsRainW)) }
             // HRRR's daily sum covers only part of the day (its run ends at ~48 h), so it's left out.
             let sums = dedupedFamily(models.filter { $0 != .hrrr }
-                .map { (model: $0, value: at(col("precipitation_sum", $0), i), weight: dailyWeight($0, i, .rain)) })
+                .map { (model: $0, value: at(col("precipitation_sum", $0), i), weight: dailyWeight($0, i, .rain)) },
+                bestMatchIsCopy: bmCopy("precipitation_sum"))
 
             guard var high = weightedMean(highs), var low = weightedMean(lows) else { continue }
             if low > high { swap(&low, &high) }
@@ -361,11 +380,15 @@ public enum ForecastBlender {
             // One row per distinct NOAA-family forecast (identical columns are the same model).
             var readings: [SourceReading] = []
             var noaaRows: Set<Int> = []
+            let bmIsCopy = bmCopy("temperature_2m_max") && bmCopy("temperature_2m_min")
             for m in models {
-                let w = dailyWeight(m, i)
+                // A best_match that is GFS/HRRR carries no weight of its own (it's listed with the model it is).
+                let copy = m == .bestMatch && bmIsCopy
+                let w = copy ? 0 : dailyWeight(m, i)
                 let h = at(col("temperature_2m_max", m), i), l = at(col("temperature_2m_min", m), i)
-                guard w > 0, h != nil || l != nil else { continue }
-                if noaaFamily.contains(m),
+                guard w > 0 || copy, h != nil || l != nil else { continue }
+                let inFamily = noaaFamily.contains(m) && (m != .bestMatch || bmIsCopy)
+                if inFamily,
                    let j = noaaRows.sorted().first(where: { readings[$0].high == h && readings[$0].low == l }) {
                     // The member with the largest weight is named first (it's the weight the blend uses).
                     readings[j].name = w > readings[j].weight ? "\(m.displayName) = \(readings[j].name)"
@@ -373,7 +396,7 @@ public enum ForecastBlender {
                     readings[j].weight = max(readings[j].weight, w)
                     continue
                 }
-                if noaaFamily.contains(m) { noaaRows.insert(readings.count) }
+                if inFamily { noaaRows.insert(readings.count) }
                 readings.append(SourceReading(name: m.displayName, high: h, low: l, weight: w))
             }
             if highP != nil || lowP != nil {
@@ -405,17 +428,35 @@ public enum ForecastBlender {
     /// very same number as `gfs_hrrr`. Count one NOAA value once (with the largest of their weights).
     public static let noaaFamily: Set<ForecastModel> = [.hrrr, .bestMatch, .gfs]
 
-    public static func dedupedFamily(_ s: [(model: ForecastModel, value: Double?, weight: Double)]) -> [(value: Double?, weight: Double)] {
+    /// - Parameter bestMatchIsCopy: true when best_match's column is GFS/HRRR (see `bestMatchIsCopy(_:of:)`).
+    ///   Then it merges with the model it is and the merged vote keeps *that* model's weight, not
+    ///   best_match's 2.0 (QA: GFS outweighed ECMWF). False (outside the US) makes best_match an independent
+    ///   model that never merges with GFS on coincidentally equal values.
+    public static func dedupedFamily(_ s: [(model: ForecastModel, value: Double?, weight: Double)],
+                                     bestMatchIsCopy: Bool = true) -> [(value: Double?, weight: Double)] {
         var out: [(value: Double?, weight: Double)] = []
         var familyIndex: [Double: Int] = [:]
-        for x in s {
-            if noaaFamily.contains(x.model), let v = x.value {
+        for var x in s {
+            if x.model == .bestMatch && bestMatchIsCopy { x.weight = 0 }
+            if noaaFamily.contains(x.model), x.model != .bestMatch || bestMatchIsCopy, let v = x.value {
                 if let j = familyIndex[v] { out[j].weight = max(out[j].weight, x.weight); continue }
                 familyIndex[v] = out.count
             }
             out.append((x.value, x.weight))
         }
         return out
+    }
+
+    /// best_match is a copy of GFS/HRRR when every value it has equals one of theirs at the same index
+    /// (in the US: 168/168 hours). A few coincidental matches (London rain amounts, mostly 0 mm) don't count.
+    public static func bestMatchIsCopy(_ bestMatch: [Double?], of others: [[Double?]]) -> Bool {
+        var n = 0
+        for (i, value) in bestMatch.enumerated() {
+            guard let value else { continue }
+            guard others.contains(where: { i < $0.count && $0[i] == value }) else { return false }
+            n += 1
+        }
+        return n >= 3
     }
 
     /// Open-Meteo's `precipitation_probability_gfs_hrrr` (hourly and daily) is the GFS-family probability

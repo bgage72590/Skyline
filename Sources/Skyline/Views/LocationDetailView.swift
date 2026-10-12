@@ -225,9 +225,15 @@ struct ForecastColumn: View {
                     HourlyCard(report: report, units: units) { onOpen(.conditions, nil) }
                     DailyCard(report: report, units: units) { onOpen(.conditions, $0) }
                         .id(ScrollProbe.dailyID)
+                    OutlookCard(report: report, units: units)
+                        .id("forecast-outlook")
                     if showsRadarCard {
                         RadarCard(location: location, pinText: units.temperatureString(report.current.temperature),
                                   alerts: report.activeAlerts(), namespace: radarNamespace)
+                    }
+                    if let office = report.nwsGridID {
+                        ForecasterNotesCard(office: office, timeZone: report.timeZone)
+                            .id("forecast-notes")
                     }
                     DetailTilesGrid(report: report, units: units) { onOpen($0, nil) }
                     SourcesFooter(report: report)
@@ -243,7 +249,10 @@ struct ForecastColumn: View {
         .scrollIndicators(.never)
         .task {
             // Serve overscan hit-test scroll requests; also run the optional scroll-preservation QA.
-            for _ in 0..<120 { // ~30 s
+            // QA hook `-SkylineScrollToCard outlook|notes`: brings that card on screen after ~3 s.
+            let card = UserDefaults.standard.string(forKey: "SkylineScrollToCard")
+            for i in 0..<120 { // ~30 s
+                if i == 12, let card { proxy.scrollTo("forecast-\(card)", anchor: .center) }
                 if ScrollProbe.pendingScrollToDaily {
                     ScrollProbe.pendingScrollToDaily = false
                     proxy.scrollTo(ScrollProbe.dailyID, anchor: .top)
@@ -464,6 +473,17 @@ struct DailyCard: View {
         HStack(spacing: 10) {
             Text(offset == 0 ? "Today" : Fmt.weekday(day.date, report.timeZone))
                 .frame(width: 58, alignment: .leading)
+                .overlay(alignment: .trailing) {
+                    // Low-confidence days get a small marker; hover says why (T11).
+                    let c = InsightFormat.confidence(report, day: day, units: units)
+                    if c.level == .low {
+                        Image(systemName: "questionmark.circle")
+                            .font(.caption2.weight(.semibold))
+                            .opacity(0.8)
+                            .help(c.sentence)
+                            .accessibilityLabel(c.sentence)
+                    }
+                }
             VStack(spacing: 0) {
                 WeatherSymbol(condition: day.condition, isDay: true, size: 18)
                 if let p = day.precipitationProbability, p >= 20 {

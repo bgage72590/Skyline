@@ -52,6 +52,9 @@ public struct HourlyForecast: Codable, Hashable, Identifiable, Sendable {
     public var pressure: Double?                 // hPa
     public var visibility: Double?               // metres
     public var windGust: Double?                 // km/h
+    /// Max − min rain chance across contributing sources (percentage points). Large = sources disagree
+    /// on whether/when it rains (used for "Models disagree on rain timing", T11).
+    public var precipitationProbabilitySpread: Double?
 
     public var id: Date { time }
     public var condition: WeatherCondition { WeatherCondition(wmoCode: weatherCode) }
@@ -162,6 +165,9 @@ public struct WeatherAlert: Codable, Hashable, Identifiable, Sendable {
     public var polygons: [[Coordinate]] = []
     /// NWS forecast-zone URLs, used to look up an outline when the alert has no polygon of its own.
     public var affectedZones: [URL] = []
+    /// True when `polygons` are the affected forecast zones' outlines (filled in by `WeatherService`),
+    /// not the alert's own storm-based polygon. Zone-based alerts already cover the queried point.
+    public var outlineIsZone = false
 
     public init(id: String, event: String, headline: String?, severity: AlertSeverity, urgency: String?,
                 areaDescription: String?, description: String?, instruction: String?,
@@ -233,6 +239,10 @@ public struct WeatherReport: Codable, Hashable, Sendable {
     public var dataAsOf: Date
     /// True when the network failed and the forecast came from Skyline's offline cache.
     public var isOfflineFallback: Bool
+    /// NWS forecast office (e.g. "OKX") when the location is in NWS coverage; used for Forecaster's notes.
+    public var nwsGridID: String?
+    /// The forecast Skyline showed for this place about 12 h earlier (for "why the forecast changed", T11).
+    public var earlierOutlook: ForecastSnapshot?
 
     public init(location: WeatherLocation, fetchedAt: Date, timeZoneIdentifier: String,
                 current: CurrentConditions, hourly: [HourlyForecast], daily: [DailyForecast],
