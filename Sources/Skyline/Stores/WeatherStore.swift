@@ -94,6 +94,7 @@ final class WeatherStore {
     private(set) var forecasterNotes: [String: ForecasterNotes] = [:]
     @ObservationIgnored private var notesFetched: [String: Date] = [:]
     @ObservationIgnored let notifier = Notifier()
+    @ObservationIgnored let widgetPublisher = WidgetPublisher()
     @ObservationIgnored private var notificationState = NotificationState()
     @ObservationIgnored private var briefingTask: Task<Void, Never>?
 
@@ -188,6 +189,7 @@ final class WeatherStore {
         startRefreshLoop()
         trackMenuBarImage()
         setUpNotifications()
+        IntentStore.shared = self
         // Download-cache clean-up (entries older than 14 days), off the launch path.
         let service = self.service
         Task.detached(priority: .utility) {
@@ -250,6 +252,13 @@ final class WeatherStore {
         guard key != menuBarImageKey else { return }
         menuBarImageKey = key
         menuBarImage = spec.flatMap(MenuBarLabel.render)
+        publishWidget()
+    }
+
+    /// Widget snapshot for the menu-bar city (T22). Cheap when nothing changed.
+    func publishWidget() {
+        guard let location = menuBarLocation, let report = reports[location.id] else { return }
+        widgetPublisher.publish(report, name: location.isCurrentLocation ? "My Location" : location.name, units: units)
     }
 
     func isLoading(_ location: WeatherLocation) -> Bool { loadingIDs.contains(location.id) }
@@ -285,6 +294,7 @@ final class WeatherStore {
             if defaults.bool(forKey: "SkylineDemoAlert"), report.alerts.isEmpty { report.alerts = [Self.demoAlert(near: location)] }
             if defaults.bool(forKey: "SkylineDemoRain") { report.minutely = Self.demoRain(from: report.current.time) }
             reports[location.id] = report
+            publishWidget()
             if report.isOfflineFallback {
                 // Old data is better than none, but it must say so, and we try again soon.
                 setError("Couldn’t reach the weather service; showing saved data.", for: location.id)

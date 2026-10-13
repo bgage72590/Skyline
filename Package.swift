@@ -32,6 +32,18 @@ targets.append(
     )
 )
 products.append(.executable(name: "Skyline", targets: ["Skyline"]))
+// Desktop / Notification Center widget extension (T22). build-app.sh wraps the binary into
+// Skyline.app/Contents/PlugIns/SkylineWidget.appex and signs it sandboxed.
+targets.append(
+    .executableTarget(
+        name: "SkylineWidget",
+        dependencies: ["SkylineCore"],
+        path: "Sources/SkylineWidget",
+        swiftSettings: [.unsafeFlags(["-application-extension"])],
+        linkerSettings: [.unsafeFlags(["-Xlinker", "-application_extension"])]
+    )
+)
+products.append(.executable(name: "SkylineWidget", targets: ["SkylineWidget"]))
 #endif
 
 let package = Package(

@@ -19,6 +19,13 @@ struct SkylineApp: App {
         .defaultSize(width: 1360, height: 860)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            // ⌘Q closes the window and leaves Skyline in the menu bar (batch 6); ⌥⌘Q really quits.
+            CommandGroup(replacing: .appTermination) {
+                Button("Close Skyline Window") { AppExit.perform(.commandQ) }
+                    .keyboardShortcut("q", modifiers: .command)
+                Button("Quit Skyline Completely") { AppExit.perform(.quitCompletely) }
+                    .keyboardShortcut("q", modifiers: [.command, .option])
+            }
             CommandMenu("Weather") {
                 Button("Refresh") {
                     Task { await store.refreshAll(force: true) }
@@ -140,6 +147,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Keep running in the menu bar after the main window is closed.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            GlobalHotkey.apply()
+            AppExit.runQuitKeyTestIfRequested()
+            GlobalHotkey.runTestIfRequested()
+        }
+    }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {

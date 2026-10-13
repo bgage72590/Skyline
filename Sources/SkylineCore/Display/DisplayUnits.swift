@@ -37,7 +37,7 @@ public enum DistanceUnit: String, Codable, Sendable, CaseIterable, Identifiable 
 }
 
 /// The units every view formats with. Built from a preset plus optional per-dimension overrides.
-public struct DisplayUnits: Hashable, Sendable {
+public struct DisplayUnits: Codable, Hashable, Sendable {
     public var temperature: TemperatureUnit
     public var speed: SpeedUnit
     public var precipitation: PrecipitationUnit

@@ -193,8 +193,39 @@ public struct WeatherAlert: Codable, Hashable, Identifiable, Sendable {
     /// When the hazard is over: `ends` if given, else when the message `expires`. Nil = open-ended.
     public var endTime: Date? { ends ?? expires }
 
-    /// False once the alert has ended (an expired warning must never stay on screen).
-    public func isActive(at now: Date) -> Bool { endTime.map { $0 > now } ?? true }
+    /// False once the alert has ended (an expired warning must never stay on screen), and for a
+    /// cancellation/expiry statement (CAN/EXP): the warning it ends is over, so nothing shows it as
+    /// active (banner, menu bar, sidebar, radar outline, briefing, widget, intents; QA batch 5 #1).
+    public func isActive(at now: Date) -> Bool { !isCancellation && (endTime.map { $0 > now } ?? true) }
+
+    enum CodingKeys: String, CodingKey {
+        case id, event, headline, severity, urgency, areaDescription, description, instruction, effective, expires, ends,
+             senderName, polygons, affectedZones, outlineIsZone, references, trackingKeys, isCancellation
+    }
+
+    /// Tolerant: fields added after batch 4 (references, tracking keys, cancellation, outlines) default
+    /// when missing, so an older cached alert still decodes (QA batch 5 #4).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        event = try c.decode(String.self, forKey: .event)
+        headline = try c.decodeIfPresent(String.self, forKey: .headline)
+        severity = (try? c.decodeIfPresent(AlertSeverity.self, forKey: .severity)) ?? .unknown
+        urgency = try c.decodeIfPresent(String.self, forKey: .urgency)
+        areaDescription = try c.decodeIfPresent(String.self, forKey: .areaDescription)
+        description = try c.decodeIfPresent(String.self, forKey: .description)
+        instruction = try c.decodeIfPresent(String.self, forKey: .instruction)
+        effective = try c.decodeIfPresent(Date.self, forKey: .effective)
+        expires = try c.decodeIfPresent(Date.self, forKey: .expires)
+        ends = try c.decodeIfPresent(Date.self, forKey: .ends)
+        senderName = try c.decodeIfPresent(String.self, forKey: .senderName)
+        polygons = (try? c.decodeIfPresent([[Coordinate]].self, forKey: .polygons)) ?? []
+        affectedZones = (try? c.decodeIfPresent([URL].self, forKey: .affectedZones)) ?? []
+        outlineIsZone = (try? c.decodeIfPresent(Bool.self, forKey: .outlineIsZone)) ?? false
+        references = (try? c.decodeIfPresent([String].self, forKey: .references)) ?? []
+        trackingKeys = (try? c.decodeIfPresent([String].self, forKey: .trackingKeys)) ?? []
+        isCancellation = (try? c.decodeIfPresent(Bool.self, forKey: .isCancellation)) ?? false
+    }
 }
 
 /// One timestamped value of an hourly series (AQI forecast etc.).

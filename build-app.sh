@@ -51,6 +51,53 @@ GIT_REV="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 1)"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GIT_REV" "$APP/Contents/Info.plist" >/dev/null
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
+# Widget extension (T22): Contents/PlugIns/SkylineWidget.appex, a sandboxed WidgetKit extension that
+# only reads the forecast snapshot the app writes (no network).
+APPEX="$APP/Contents/PlugIns/SkylineWidget.appex"
+mkdir -p "$APPEX/Contents/MacOS"
+cp "$BIN_DIR/SkylineWidget" "$APPEX/Contents/MacOS/SkylineWidget"
+cp "$ROOT/Resources/Widget/Info.plist" "$APPEX/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GIT_REV" "$APPEX/Contents/Info.plist" >/dev/null 2>&1 ||
+  /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $GIT_REV" "$APPEX/Contents/Info.plist" >/dev/null
+
+# App Intents metadata (L22). SwiftPM doesn't run Xcode's extraction step, so do it here: gather the
+# intents' const values with the compiler, then run Apple's appintentsmetadataprocessor, which writes
+# Contents/Resources/Metadata.appintents. Without it Shortcuts/Spotlight don't list Skyline's actions.
+echo "==> App Intents metadata"
+AI_DIR="$BUILD_DIR/appintents"; rm -rf "$AI_DIR"; mkdir -p "$AI_DIR"
+SDK="$(xcrun --show-sdk-path)"
+NATIVE_BIN="$(swift build -c release --show-bin-path)"
+[[ -d "$NATIVE_BIN/Modules" ]] || swift build -c release >/dev/null
+TRIPLE="$(uname -m)-apple-macosx14.0"
+TOOLCHAIN="$(dirname "$(dirname "$(dirname "$(xcrun -f swiftc)")")")"
+SOURCES=$(find "$ROOT/Sources/Skyline" -name '*.swift' | sort)
+printf '%s\n' $SOURCES > "$AI_DIR/sources.txt"
+CV_LIST="$AI_DIR/constvals.txt"; : > "$CV_LIST"
+ai_ok=1
+for f in $(grep -l 'AppIntent\|AppShortcutsProvider\|AppEntity' $SOURCES); do
+  name="$(basename "$f" .swift)"
+  if xcrun swiftc -frontend -c -primary-file "$f" $(echo "$SOURCES" | grep -vx "$f") \
+      -module-name "$APP_NAME" -sdk "$SDK" -target "$TRIPLE" -I "$NATIVE_BIN/Modules" -I "$NATIVE_BIN" \
+      -swift-version 5 -parse-as-library -O -plugin-path "$TOOLCHAIN/usr/lib/swift/host/plugins" \
+      -const-gather-protocols-file "$ROOT/scripts/appintents-protocols.json" \
+      -emit-const-values-path "$AI_DIR/$name.swiftconstvalues" -o "$AI_DIR/$name.o" 2>"$AI_DIR/$name.log"; then
+    echo "$AI_DIR/$name.swiftconstvalues" >> "$CV_LIST"
+  else
+    ai_ok=0; echo "    WARNING: const-value extraction failed for $name (see $AI_DIR/$name.log)" >&2
+  fi
+done
+if [[ $ai_ok -eq 1 ]] && xcrun appintentsmetadataprocessor --output "$APP/Contents/Resources" \
+    --toolchain-dir "$TOOLCHAIN" --module-name "$APP_NAME" \
+    --sdk-root "$SDK" --xcode-version "$(xcodebuild -version | awk '/Build version/ {print $3}')" \
+    --platform-family macOS --deployment-target 14.0 --target-triple "$TRIPLE" \
+    --source-file-list "$AI_DIR/sources.txt" --swift-const-vals-list "$CV_LIST" \
+    --no-app-shortcuts-localization --deployment-aware-processing >"$AI_DIR/processor.log" 2>&1 &&
+   [[ -d "$APP/Contents/Resources/Metadata.appintents" ]]; then
+  echo "    $(ls "$APP/Contents/Resources/Metadata.appintents" | tr '\n' ' ')"
+else
+  echo "    WARNING: no App Intents metadata; Shortcuts won't list Skyline (see $AI_DIR/processor.log)" >&2
+fi
+
 # App icon: Resources/AppIcon.png -> AppIcon.icns
 if [[ -f "$ROOT/Resources/AppIcon.png" ]]; then
   ICONSET="$BUILD_DIR/AppIcon.iconset"
@@ -110,11 +157,19 @@ else
   echo "    WARNING: could not create/find \"$SIGN_NAME\"; falling back to ad-hoc signing." >&2
   echo "    macOS will re-ask for Location access after every rebuild." >&2
 fi
-if ! codesign --force --deep --sign "$SIGN_ID" --identifier "$BUNDLE_ID" "$APP" 2>/tmp/skyline-codesign.log; then
+# Inside-out, no --deep: the widget is signed first with its own sandbox entitlements, then the app.
+sign_all() {
+  codesign --force --sign "$1" --identifier "$BUNDLE_ID.Widget" --options runtime \
+      --entitlements "$ROOT/Resources/Widget/SkylineWidget.entitlements" "$APPEX" &&
+  codesign --force --sign "$1" --identifier "$BUNDLE_ID" "$APP"
+}
+if ! sign_all "$SIGN_ID" 2>/tmp/skyline-codesign.log; then
   echo "    WARNING: signing with \"$SIGN_NAME\" failed ($(tail -1 /tmp/skyline-codesign.log)); using ad-hoc." >&2
-  codesign --force --deep --sign - --identifier "$BUNDLE_ID" "$APP"
+  sign_all -
 fi
-codesign --verify --strict "$APP"
+codesign --verify --strict --deep "$APP"
+# The widget must start, find nothing it may not read, and stay sandboxed.
+"$APPEX/Contents/MacOS/SkylineWidget" --selftest || { echo "    ERROR: widget self-test failed" >&2; exit 1; }
 codesign -d -r- "$APP" 2>&1 | sed -n 's/^designated => /    designated requirement: /p'
 
 if [[ $ZIP -eq 1 ]]; then
@@ -143,6 +198,8 @@ if [[ $INSTALL -eq 1 ]]; then
   fi
   rm -rf "$INSTALL_DIR/$APP_NAME.app"
   ditto "$APP" "$INSTALL_DIR/$APP_NAME.app"
+  # Register the widget with the system (it shows in the widget gallery after this).
+  pluginkit -a "$INSTALL_DIR/$APP_NAME.app/Contents/PlugIns/SkylineWidget.appex" 2>/dev/null || true
   if [[ $LAUNCH -eq 1 ]]; then
     echo "==> Launching"
     open "$INSTALL_DIR/$APP_NAME.app"

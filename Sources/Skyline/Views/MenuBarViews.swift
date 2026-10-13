@@ -9,6 +9,7 @@ import SkylineCore
 /// offline the image is drawn at reduced strength.
 struct MenuBarLabel: View {
     let store: WeatherStore
+    @Environment(\.openWindow) private var openWindow
 
     struct Spec: Equatable {
         var symbol: String
@@ -18,6 +19,16 @@ struct MenuBarLabel: View {
     }
 
     var body: some View {
+        labelContent
+            .onAppear {
+                // The label lives as long as the app, so the Dock icon, a relaunch and Shortcuts can
+                // reopen the window even before the dropdown or window has ever been shown (batch 6).
+                let open = openWindow
+                AppActions.openMainWindow = { open(id: SceneID.main) }
+            }
+    }
+
+    @ViewBuilder private var labelContent: some View {
         // Only reads the pre-rendered image (WeatherStore.trackMenuBarImage); no rendering in body.
         if let image = store.menuBarImage {
             Image(nsImage: image)
@@ -56,7 +67,6 @@ struct MenuBarLabel: View {
 
 struct MenuBarContentView: View {
     @Environment(WeatherStore.self) private var store
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         let report = store.menuBarReport
@@ -71,7 +81,7 @@ struct MenuBarContentView: View {
                         store.activeModule = nil
                         store.radarExpanded = false
                         store.pendingAlertID = alert.id
-                        openWindow(id: SceneID.main)
+                        AppExit.showMainWindow(); GlobalHotkey.closePanel()
                         NSApp.activate()
                     } label: {
                         HStack(spacing: 4) {
@@ -132,14 +142,14 @@ struct MenuBarContentView: View {
             Rectangle().fill(.white.opacity(0.25)).frame(height: 0.5)
             HStack {
                 Button("Open Skyline") {
-                    openWindow(id: SceneID.main)
+                    AppExit.showMainWindow(); GlobalHotkey.closePanel()
                     NSApp.activate()
                 }
                 Button("Radar") {
                     if let location = store.menuBarLocation { store.selectedID = location.id }
                     store.activeModule = nil
                     store.radarExpanded = true
-                    openWindow(id: SceneID.main)
+                    AppExit.showMainWindow(); GlobalHotkey.closePanel()
                     NSApp.activate()
                 }
                 Spacer()
@@ -167,11 +177,11 @@ struct MenuBarContentView: View {
                         .help("Refreshing…")
                 }
                 Button {
-                    NSApp.terminate(nil)
+                    AppExit.perform(.menuBarQuit)
                 } label: {
-                    Image(systemName: "power")
+                    Label("Quit Skyline", systemImage: "power").labelStyle(.titleAndIcon).font(.caption)
                 }
-                .help("Quit Skyline")
+                .help("Quit Skyline completely (closing the window or ⌘Q keeps it in the menu bar)")
             }
             .buttonStyle(.borderless)
         }
@@ -189,10 +199,6 @@ struct MenuBarContentView: View {
         .environment(\.colorScheme, .dark)
         .task {
             if let location = store.menuBarLocation { await store.load(location) }
-        }
-        .onAppear {
-            let open = openWindow
-            AppActions.openMainWindow = { open(id: SceneID.main) }
         }
     }
 
@@ -311,7 +317,7 @@ struct MenuBarContentView: View {
                     let r = store.reports[location.id]
                     Button {
                         store.selectedID = location.id
-                        openWindow(id: SceneID.main)
+                        AppExit.showMainWindow(); GlobalHotkey.closePanel()
                         NSApp.activate()
                     } label: {
                         HStack(spacing: 8) {

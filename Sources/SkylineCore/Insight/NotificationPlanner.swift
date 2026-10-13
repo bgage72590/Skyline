@@ -53,6 +53,11 @@ public struct NotificationState: Codable, Equatable, Sendable {
     public var alertSeverity: [String: AlertSeverity] = [:]
     public init() {}
 
+    /// "<location id>|<alert id or VTEC key>".
+    public static func alertKey(_ locationID: String, _ key: String) -> String { locationID + "|" + key }
+    /// How long a sent alert is remembered after its message ends.
+    public static let alertGrace: TimeInterval = 12 * 3600
+
     enum CodingKeys: String, CodingKey { case alerts, rain, briefingDay, alertSeverity }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -141,8 +146,18 @@ public enum NotificationPlanner {
                 // NWS re-issues a warning as an update with a new id: the VTEC key (else the references)
                 // ties it to the one already sent. An upgrade (watch → warning) has a new key and is news.
                 // Cancellations are never sent (Code Reviewer batch 4, M1/M2).
-                let keys = [alert.id] + (alert.trackingKeys.isEmpty ? alert.references : alert.trackingKeys)
-                let until = alert.endTime ?? now.addingTimeInterval(24 * 3600)
+                // Per city (QA batch 5 #3): a warning extended over another saved city is news there.
+                let raw = [alert.id] + (alert.trackingKeys.isEmpty ? alert.references : alert.trackingKeys)
+                let keys = raw.map { NotificationState.alertKey(locID, $0) }
+                // Kept 12 h past the message's end: an alert with only a short `expires` is updated by a new
+                // message later, and a Mac that slept past `expires` mustn't announce it again (QA batch 5 #2).
+                let until = (alert.endTime ?? now.addingTimeInterval(24 * 3600)).addingTimeInterval(NotificationState.alertGrace)
+                // Entries written before keys were per city (batch 5) still count, so upgrading doesn't
+                // repeat a warning that's in force.
+                for (k, r) in zip(keys, raw) where state.alerts[k] == nil {
+                    if let legacy = state.alerts[r] { state.alerts[k] = legacy }
+                    if let sev = state.alertSeverity[r] { state.alertSeverity[k] = sev }
+                }
                 let seen = keys.filter { state.alerts[$0] != nil }
                 let sentSeverity = seen.compactMap { state.alertSeverity[$0] }.max()
                 // Already sent: an update/extension stays silent unless it became more severe.

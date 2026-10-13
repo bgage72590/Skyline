@@ -7,6 +7,7 @@ import SkylineCore
 struct SettingsView: View {
     @Environment(WeatherStore.self) private var store
     @AppStorage(DockIcon.key) private var showInDock = true
+    @AppStorage(GlobalHotkey.key) private var globalHotkey = false
     @State private var loginItem = LoginItem.status()
     @State private var loginError: String?
 
@@ -34,9 +35,11 @@ struct SettingsView: View {
                 Toggle("Show Skyline in the Dock", isOn: $showInDock)
                     .onChange(of: showInDock) { _, _ in DockIcon.apply() }
                 if !showInDock {
-                    Text("Skyline stays in the menu bar; open the window from there.")
+                    Text("Skyline stays in the menu bar; open the window from there. Closing the window or ⌘Q always leaves it there; use Quit Skyline in the dropdown to exit.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                Toggle("Open the menu-bar forecast with \(GlobalHotkey.label) from any app", isOn: $globalHotkey)
+                    .onChange(of: globalHotkey) { _, _ in GlobalHotkey.apply() }
                 Picker("Menu bar shows", selection: $store.menuBarPinID) {
                     Text(store.currentLocation == nil ? "Automatic (first city)" : "Automatic (My Location)")
                         .tag(String?.none)

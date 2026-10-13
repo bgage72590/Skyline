@@ -147,6 +147,25 @@ A new set of scans (every ~5 min) is built hidden and swapped in only once loade
 * **Model comparison.** "Model Comparison" (below Forecast Confidence) charts each model's next 48 h of
   temperature, NWS dashed, the Skyline blend in white. A Best Match that copies GFS/HRRR is one line.
 
+## Widgets, Shortcuts and quitting (batch 6)
+
+- **Widgets** (small / medium / large): current conditions, next-2-hours rain line, 6-hour strip and
+  5-day list. Add them from the desktop or Notification Center widget gallery ("Skyline"). The widget is
+  a sandboxed extension with no network access: the app writes
+  `~/Library/Application Support/com.briangage.Skyline/Widget/widget-snapshot.json` (menu-bar city)
+  whenever data changes and asks WidgetKit to reload; the widget may only read that folder. Data older
+  than 2 hours shows "Updated N ago" in orange; with no snapshot it says "Open Skyline to load the forecast".
+- **Shortcuts / Siri / Spotlight**: "Get Skyline Weather", "Will It Rain Soon", "Show Skyline Radar",
+  each with an optional City. Phrases: "Will it rain in Skyline", "Skyline forecast", "Show Skyline radar".
+  `build-app.sh` generates the App Intents metadata (SwiftPM doesn't), from the compiler's const values
+  plus `appintentsmetadataprocessor`.
+- **Global hotkey**: Settings › "Open the menu-bar forecast with ⌃⌥W from any app" (off by default;
+  Carbon hot key, no Accessibility permission).
+- **Quitting**: closing the window or ⌘Q closes the window and leaves Skyline in the menu bar (the map
+  and radar are torn down as before). "Quit Skyline" in the dropdown, Skyline › Quit Skyline Completely
+  (⌥⌘Q), the Dock menu's Quit and logout really quit. Reopen with the dropdown's window button, the Dock
+  icon, or by launching Skyline again. Works the same with "Show in Dock" off.
+
 ## Notifications and Focus
 
 Extreme warnings are sent as *time-sensitive*. Without Apple's critical-alerts entitlement (which needs
@@ -166,6 +185,9 @@ directly); none is settable from the UI.
 | `-SkylineOpenRadar YES` | Expand the radar at launch |
 | `-SkylinePlayRadar YES` | Start radar playback at launch |
 | `-SkylineStressTest <s>` / `-SkylineStressSeed <n>` / `-SkylineStressQuit YES` | In-process radar stress test; quit when done |
+| `-SkylineQuitKeyTest YES` | Sends ⌘Q through Skyline's own menu, checks the window closed and the app stayed in the menu bar, reopens, logs `[quit-test] PASS/FAIL`, quits |
+| `-SkylineHotkeyTest YES` | Calls the global-hotkey handler in-process, checks the dropdown opened, logs `[hotkey-test] PASS/FAIL`, quits |
+| `SkylineWidget --selftest` (in the appex) | Prints the snapshot path, city, age and whether it runs sandboxed |
 | `-SkylineScrollTest YES` | Scroll-position preservation check (`[scrolltest]`) |
 | `-SkylineHitTest YES` | Map ignores scroll over the forecast column (`[hittest]`) |
 | `-SkylineScrollToCard outlook\|notes\|models` | Scroll the forecast column to that card after ~3 s |
