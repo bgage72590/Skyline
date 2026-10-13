@@ -48,8 +48,8 @@ struct SkylineWidgetView: View {
                 Text(s.condition.description).lineLimit(1)
             }
             .font(.caption.weight(.medium))
-            if let h = s.high, let l = s.low {
-                Text("H:\(s.units.temperatureString(h)) L:\(s.units.temperatureString(l))").font(.caption.weight(.medium))
+            if let hl = s.highLow(at: entry.date) {
+                Text("H:\(s.units.temperatureString(hl.high)) L:\(s.units.temperatureString(hl.low))").font(.caption.weight(.medium))
             }
         }
     }
@@ -80,18 +80,25 @@ struct SkylineWidgetView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    private func hourStrip(_ s: WidgetSnapshot, count: Int) -> some View {
+    @ViewBuilder private func hourStrip(_ s: WidgetSnapshot, count: Int) -> some View {
+        let hours = s.hours(from: entry.date, count: count)
+        if hours.isEmpty {
+            // Data too old to have hours left (W2): say so instead of an empty row.
+            Text("Open Skyline to update the hourly forecast").font(.caption2).opacity(0.75)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
         HStack(spacing: 0) {
-            ForEach(Array(s.hours(from: entry.date, count: count).enumerated()), id: \.offset) { _, h in
+            ForEach(Array(hours.enumerated()), id: \.offset) { i, h in
                 VStack(spacing: 3) {
-                    // Hour-start label, like the app (the value at T covers the hour ending at T).
-                    Text(Self.hourLabel(h.time.addingTimeInterval(-3600), s.timeZone)).font(.caption2.weight(.semibold))
+                    // Labelled like the app's strip: the hour under way is "Now", then each hour's own time (W1).
+                    Text(i == 0 ? "Now" : Self.hourLabel(h.time, s.timeZone)).font(.caption2.weight(.semibold))
                     Image(systemName: WeatherCondition(wmoCode: h.weatherCode).symbolName(isDay: h.isDay))
                         .symbolRenderingMode(.multicolor).font(.caption)
                     Text(s.units.temperatureString(h.temperature)).font(.caption.weight(.medium))
                 }
                 .frame(maxWidth: .infinity)
             }
+        }
         }
     }
 
@@ -116,9 +123,10 @@ struct SkylineWidgetView: View {
             }
             hourStrip(s, count: 6)
             Divider().overlay(.white.opacity(0.3))
-            ForEach(Array(s.days.enumerated()), id: \.offset) { i, d in
+            ForEach(Array(s.days(from: entry.date).enumerated()), id: \.offset) { _, d in
                 HStack {
-                    Text(i == 0 ? "Today" : Self.weekday(d.date, s.timeZone)).frame(width: 48, alignment: .leading)
+                    Text(s.dayLabel(d, now: entry.date) == "Today" ? "Today" : Self.weekday(d.date, s.timeZone))
+                        .frame(width: 48, alignment: .leading)
                     Image(systemName: WeatherCondition(wmoCode: d.weatherCode).symbolName(isDay: true))
                         .symbolRenderingMode(.multicolor).frame(width: 24)
                     if (d.snowfallSum ?? 0) >= 0.5 {

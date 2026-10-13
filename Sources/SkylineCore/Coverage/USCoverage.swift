@@ -57,6 +57,23 @@ public enum USCoverage {
         "american samoa",
     ]
 
+    /// True when the saved place's country is known to be the US or an NWS-served territory.
+    public static func isKnownUS(country: String?) -> Bool {
+        guard let c = country?.trimmingCharacters(in: .whitespaces).lowercased(), !c.isEmpty else { return false }
+        return usCountries.contains(c)
+    }
+    /// The old coarse boxes: only used when the country is known to be the US, where a border-hugging
+    /// outline can only cause false negatives (Calais ME, Port Huron MI, Roma TX lost NWS + warnings).
+    static func inCoarseCONUS(_ c: Coordinate) -> Bool {
+        c.latitude >= 24.0 && c.latitude <= 50.0 && c.longitude >= -125.5 && c.longitude <= -66.5
+    }
+    static func inCoarseNWS(_ c: Coordinate) -> Bool {
+        if inCoarseCONUS(c) { return true }
+        let boxes: [(Double, Double, Double, Double)] = [(51.0, 71.6, -180.0, -129.0), (51.0, 53.5, 172.0, 180.0),
+            (18.5, 22.5, -160.5, -154.5), (17.5, 18.6, -67.5, -64.5), (13.0, 15.5, 144.5, 146.0), (-14.6, -14.0, -171.2, -169.4)]
+        return boxes.contains { c.latitude >= $0.0 && c.latitude <= $0.1 && c.longitude >= $0.2 && c.longitude <= $0.3 }
+    }
+
     /// True when the saved place's country is known and isn't the US (nil/empty = unknown).
     public static func isKnownOutsideUS(country: String?) -> Bool {
         guard let c = country?.trimmingCharacters(in: .whitespaces).lowercased(), !c.isEmpty else { return false }
@@ -82,7 +99,13 @@ public enum USCoverage {
 
 public extension WeatherLocation {
     /// NEXRAD mosaic, HRRR and future radar apply (lower 48 and the place isn't known to be abroad).
-    var isInCONUS: Bool { !USCoverage.isKnownOutsideUS(country: country) && coordinate.isInCONUS }
+    var isInCONUS: Bool {
+        if USCoverage.isKnownUS(country: country) { return USCoverage.inCoarseCONUS(coordinate) }
+        return !USCoverage.isKnownOutsideUS(country: country) && coordinate.isInCONUS
+    }
     /// NWS forecasts, warnings and discussions apply.
-    var isLikelyInNWSCoverage: Bool { !USCoverage.isKnownOutsideUS(country: country) && coordinate.isLikelyInNWSCoverage }
+    var isLikelyInNWSCoverage: Bool {
+        if USCoverage.isKnownUS(country: country) { return USCoverage.inCoarseNWS(coordinate) }
+        return !USCoverage.isKnownOutsideUS(country: country) && coordinate.isLikelyInNWSCoverage
+    }
 }

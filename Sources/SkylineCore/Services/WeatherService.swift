@@ -129,11 +129,13 @@ public actor WeatherService {
                                        force: force, maxStale: MaxStale.forecast)
         async let aqData = optionalFetch(Endpoints.openMeteoAirQuality(coord), ttl: TTL.airQuality, force: force,
                                          maxStale: MaxStale.airQuality)
-        let inNWS = location.isLikelyInNWSCoverage ? !(await nwsKnownMissing(coord)) : false
+        // A remembered /points 404 skips only the forecast lookup; warnings are asked for regardless (L2).
+        let inNWSArea = location.isLikelyInNWSCoverage
+        let inNWS = inNWSArea ? !(await nwsKnownMissing(coord)) : false
         async let nwsBundle = inNWS ? fetchNWS(coord, force: force) : nil
         // Warnings don't need the /points lookup: fetched on their own so a /points failure (first
         // launch during an NWS hiccup) can't hide them (L2).
-        async let alertsFetch = inNWS ? fetchAlerts(coord, force: force) : []
+        async let alertsFetch = inNWSArea ? fetchAlerts(coord, force: force) : []
         async let outlooksFetch = location.isInCONUS ? fetchOutlooks(coord) : []
 
         let omEntry = try await omFetch

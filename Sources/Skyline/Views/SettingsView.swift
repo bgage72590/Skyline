@@ -8,6 +8,7 @@ struct SettingsView: View {
     @Environment(WeatherStore.self) private var store
     @AppStorage(DockIcon.key) private var showInDock = true
     @AppStorage(GlobalHotkey.key) private var globalHotkey = false
+    @State private var hotkeyError: String? = GlobalHotkey.lastError
     @State private var loginItem = LoginItem.status()
     @State private var loginError: String?
 
@@ -39,7 +40,17 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Toggle("Open the menu-bar forecast with \(GlobalHotkey.label) from any app", isOn: $globalHotkey)
-                    .onChange(of: globalHotkey) { _, _ in GlobalHotkey.apply() }
+                    .onChange(of: globalHotkey) { _, on in
+                        if on {
+                            // Taken by another app: show why and flip the toggle back off (QA batch 6 H1).
+                            if GlobalHotkey.apply() { hotkeyError = nil } else { hotkeyError = GlobalHotkey.lastError; globalHotkey = false }
+                        } else {
+                            GlobalHotkey.apply() // keeps a failure message visible after the flip back
+                        }
+                    }
+                if let hotkeyError {
+                    Text(hotkeyError).font(.caption).foregroundStyle(.orange)
+                }
                 Picker("Menu bar shows", selection: $store.menuBarPinID) {
                     Text(store.currentLocation == nil ? "Automatic (first city)" : "Automatic (My Location)")
                         .tag(String?.none)

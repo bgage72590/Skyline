@@ -59,7 +59,9 @@ public struct WidgetSnapshot: Codable, Equatable, Sendable {
         isDay = report.current.isDay
         high = report.today?.high
         low = report.today?.low
-        hours = report.hourly.filter { $0.time > now }.prefix(12).map {
+        // The hour under way first (same rule as the app's strip), and a day's worth, so a widget the app
+        // hasn't refreshed for a while still has hours to show (QA batch 6 W1/W2).
+        hours = report.upcomingHours(from: now, count: 26).map {
             Hour(time: $0.time, temperature: $0.temperature, weatherCode: $0.weatherCode, isDay: $0.isDay,
                  precipitationProbability: $0.precipitationProbability)
         }
@@ -83,9 +85,34 @@ public struct WidgetSnapshot: Codable, Equatable, Sendable {
         return minutely.contains(where: { $0.time > now }) ? "No rain in the next 2 hours" : ""
     }
 
-    /// Hours still ahead at `now` (the one under way first).
+    /// Hours from the one under way (it started less than an hour ago), like the app's
+    /// `upcomingHours`, so the widget's first slot is the app's "Now".
     public func hours(from now: Date, count: Int) -> [Hour] {
-        Array(hours.filter { $0.time > now }.prefix(count))
+        Array(hours.filter { $0.time > now.addingTimeInterval(-3600) }.prefix(count))
+    }
+
+    private var calendar: Calendar { var c = Calendar(identifier: .gregorian); c.timeZone = timeZone; return c }
+
+    /// Days from the city's current date on: after midnight a snapshot from yesterday rolls forward
+    /// instead of calling yesterday "Today" (QA batch 6 W2).
+    public func days(from now: Date) -> [Day] {
+        let today = calendar.startOfDay(for: now)
+        return days.filter { calendar.startOfDay(for: $0.date) >= today }
+    }
+
+    /// "Today", "Tomorrow" or nil (use the weekday), by date in the city's zone, not by position.
+    public func dayLabel(_ day: Day, now: Date) -> String? {
+        let c = calendar
+        let diff = c.dateComponents([.day], from: c.startOfDay(for: now), to: c.startOfDay(for: day.date)).day ?? 99
+        return diff == 0 ? "Today" : diff == 1 ? "Tomorrow" : nil
+    }
+
+    /// Today's high/low at `now`: the snapshot's own while it's still the same date, else that date's row.
+    public func highLow(at now: Date) -> (high: Double, low: Double)? {
+        if calendar.isDate(now, inSameDayAs: dataTime) || calendar.isDate(now, inSameDayAs: writtenAt),
+           let high, let low { return (high, low) }
+        guard let d = days(from: now).first, calendar.isDate(d.date, inSameDayAs: now) else { return nil }
+        return (d.high, d.low)
     }
 
     /// Timeline entries: now, then every 15 min for 2 h, so "starting in about 20 min" counts down

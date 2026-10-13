@@ -114,8 +114,8 @@ final class Batch5Tests: XCTestCase {
         _ = try await service.report(for: border, forceRefresh: true)
         let points = client.inner.requests.filter { $0.absoluteString.contains("/points/") }
         XCTAssertEqual(points.count, 1, "not re-asked on the next refresh")
-        XCTAssertEqual(client.inner.requests.filter { $0.absoluteString.contains("alerts/active") }.count, 1,
-                       "alerts aren't asked for a known non-NWS point either")
+        XCTAssertEqual(client.inner.requests.filter { $0.absoluteString.contains("alerts/active") }.count, 2,
+                       "warnings are still asked for (L2); only /points is skipped")
         clock.now = fixtureTime.addingTimeInterval(8 * 86400)
         _ = try await service.report(for: border, forceRefresh: true)
         XCTAssertEqual(client.inner.requests.filter { $0.absoluteString.contains("/points/") }.count, 2, "asked again after a week")

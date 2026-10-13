@@ -18,6 +18,7 @@ enum AppExit {
 
     /// Closes Skyline's ordinary windows (main, Settings); the menu-bar extra's panel isn't one of them.
     static func closeWindows() {
+        GlobalHotkey.closePanel() // the hotkey panel is an NSPanel, so close it explicitly (QA batch 6 Q1)
         for w in NSApp.windows where w.isVisible && isAppWindow(w) { w.performClose(nil) }
     }
 
@@ -83,12 +84,27 @@ enum GlobalHotkey {
     private static var ref: EventHotKeyRef?
     private static var handlerInstalled = false
 
-    static func apply() {
+    /// Set when ⌃⌥W couldn't be registered (another app holds it); Settings shows it (QA batch 6 H1).
+    static var lastError: String?
+
+    /// Returns false (and turns the setting back off) when the key couldn't be registered.
+    @discardableResult
+    static func apply() -> Bool {
         let on = UserDefaults.standard.bool(forKey: key)
-        if on, ref == nil { register() } else if !on, let r = ref { UnregisterEventHotKey(r); ref = nil }
+        if on, ref == nil {
+            if register() != noErr || ref == nil {
+                ref = nil
+                lastError = "\(label) is in use by another app, so Skyline couldn't take it."
+                UserDefaults.standard.set(false, forKey: key)
+                return false
+            }
+        } else if !on, let r = ref { UnregisterEventHotKey(r); ref = nil }
+        lastError = nil
+        return true
     }
 
-    private static func register() {
+    @discardableResult
+    private static func register() -> OSStatus {
         if !handlerInstalled {
             var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
             InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
@@ -98,7 +114,9 @@ enum GlobalHotkey {
             handlerInstalled = true
         }
         let id = EventHotKeyID(signature: OSType(0x534B_594C), id: 1) // 'SKYL'
-        RegisterEventHotKey(UInt32(kVK_ANSI_W), UInt32(controlKey | optionKey), id, GetApplicationEventTarget(), 0, &ref)
+        // Exclusive: fails (eventHotKeyExistsErr) instead of sharing when another app already has it.
+        return RegisterEventHotKey(UInt32(kVK_ANSI_W), UInt32(controlKey | optionKey), id, GetApplicationEventTarget(),
+                                   OptionBits(kEventHotKeyExclusive), &ref)
     }
 
     static var isRegistered: Bool { ref != nil }
@@ -147,7 +165,14 @@ enum GlobalHotkey {
         guard UserDefaults.standard.bool(forKey: "SkylineHotkeyTest") else { return }
         Task {
             try? await Task.sleep(for: .seconds(3))
-            if ref == nil { register() }
+            if ref == nil { _ = register() }
+            // A second exclusive registration of the same key must fail: this is the conflict path (H1).
+            var dup: EventHotKeyRef?
+            let conflict = RegisterEventHotKey(UInt32(kVK_ANSI_W), UInt32(controlKey | optionKey),
+                                               EventHotKeyID(signature: OSType(0x534B_594C), id: 2), GetEventDispatcherTarget(),
+                                               OptionBits(kEventHotKeyExclusive), &dup)
+            if let dup { UnregisterEventHotKey(dup) }
+            print("[hotkey-test] duplicateRegistration=\(conflict) (non-zero means a conflict is detected)")
             let registered = isRegistered
             let found = statusButton() != nil
             fire()

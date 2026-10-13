@@ -15,8 +15,11 @@ final class Batch6Tests: XCTestCase {
                              description: nil, instruction: nil, effective: nil, expires: nil,
                              ends: now.addingTimeInterval(3600), senderName: nil)
         let s = WidgetSnapshot(report: report(minutely: wet, alerts: [a]), locationName: "New York", units: .imperial, now: now)
-        XCTAssertEqual(s.hours.count, 12)
-        XCTAssertGreaterThan(s.hours[0].time, now, "the hour under way first, nothing already over")
+        XCTAssertEqual(s.hours.count, 26)
+        // At 9:30 the hour under way is the 9 AM hour, as in the app's strip, not 10 AM (QA batch 6 W1).
+        XCTAssertEqual(s.hours(from: now, count: 6).first?.time, now.addingTimeInterval(-1800), "the hour under way first")
+        XCTAssertEqual(s.hours(from: now, count: 6).map(\.time), report().upcomingHours(from: now, count: 6).map(\.time),
+                       "same hours as the app")
         XCTAssertEqual(s.days.count, 5)
         XCTAssertEqual(s.high, 20)
         XCTAssertEqual(s.alert, "Flood Warning")
@@ -94,9 +97,13 @@ struct Batch6Fixture {
         let cur = CurrentConditions(time: now, temperature: 18, apparentTemperature: 18, humidity: 60, dewPoint: nil,
                                     weatherCode: 3, isDay: true, precipitation: 0, cloudCover: nil, pressure: nil,
                                     windSpeed: 5, windDirection: nil, windGust: nil, visibility: nil, uvIndex: nil)
-        let hours = (-2..<30).map { HourlyForecast(time: now.addingTimeInterval(Double($0) * 3600 + 1800), temperature: 15 + Double($0) * 0.1,
+        // Like real Open-Meteo data: hours on the hour, days at local midnight (QA batch 6 W1).
+        let h0 = (now.timeIntervalSince1970 / 3600).rounded(.down) * 3600
+        let hours = (-2..<30).map { HourlyForecast(time: Date(timeIntervalSince1970: h0 + Double($0) * 3600), temperature: 15 + Double($0) * 0.1,
                                                     precipitationProbability: 10, precipitation: 0, weatherCode: 3, isDay: true) }
-        let days = (0..<8).map { DailyForecast(date: now.addingTimeInterval(Double($0) * 86400), weatherCode: 3,
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = TimeZone(identifier: "America/New_York")!
+        let d0 = cal.startOfDay(for: now)
+        let days = (0..<8).map { DailyForecast(date: cal.date(byAdding: .day, value: $0, to: d0)!, weatherCode: 3,
                                                high: 20 + Double($0), low: 10) }
         let start = (now.timeIntervalSince1970 / 900).rounded(.down) * 900 + 900
         let m = minutely.enumerated().map { MinutelyPrecipitation(time: Date(timeIntervalSince1970: start + Double($0.offset) * 900),
@@ -178,5 +185,34 @@ final class Batch6AlertTests: XCTestCase {
         XCTAssertEqual(a.id, "urn:1"); XCTAssertEqual(a.references, []); XCTAssertFalse(a.isCancellation)
         let round = try JSONDecoder().decode(WeatherAlert.self, from: JSONEncoder().encode(alert("x", cancel: true)))
         XCTAssertTrue(round.isCancellation); XCTAssertEqual(round.trackingKeys, ["KOKX.FL.W.0006"])
+    }
+}
+
+/// QA batch 6 lows W2 (overnight widget) and I1 (stale Siri answers).
+final class Batch6FixupTests: XCTestCase {
+    let f = Batch6Fixture()
+
+    func testWidgetRollsForwardOvernight() {
+        let written = f.now.addingTimeInterval(13.5 * 3600) // 11 PM Sunday
+        let s = WidgetSnapshot(report: f.report(fetched: written), locationName: "NYC", units: .imperial, now: written)
+        let read = written.addingTimeInterval(2 * 3600 + 60)  // 1:01 AM Monday
+        let days = s.days(from: read)
+        XCTAssertEqual(s.dayLabel(days[0], now: read), "Today")
+        XCTAssertEqual(days[0].high, 21, "Monday's row, not Sunday's")
+        XCTAssertEqual(s.highLow(at: read)?.high, 21, "header high/low rolls forward too")
+        XCTAssertEqual(s.highLow(at: written)?.high, s.high)
+        XCTAssertTrue(s.isStale(at: read))
+        XCTAssertFalse(s.hours(from: written.addingTimeInterval(12 * 3600 + 60), count: 6).isEmpty, "hours last ~a day")
+        XCTAssertTrue(s.hours(from: written.addingTimeInterval(40 * 3600), count: 6).isEmpty, "then the widget says to open Skyline")
+    }
+
+    func testIntentAnswersSayWhenDataIsOld() {
+        let fresh = f.report()
+        XCTAssertFalse(IntentText.weather(fresh, name: "NYC", units: .imperial, now: f.now).contains("as of"))
+        let old = f.report(fetched: f.now.addingTimeInterval(-2 * 3600 - 20 * 60)) // 7:10 AM
+        XCTAssertTrue(IntentText.weather(old, name: "NYC", units: .imperial, now: f.now).hasSuffix("(as of 7:10 AM)"))
+        XCTAssertTrue(IntentText.rain(old, name: "NYC", now: f.now).hasSuffix("(as of 7:10 AM)"))
+        var offline = f.report(); offline.isOfflineFallback = true
+        XCTAssertTrue(IntentText.rain(offline, name: "NYC", now: f.now).contains("(as of 9:30 AM)"))
     }
 }
