@@ -115,7 +115,9 @@ struct MenuBarContentView: View {
                 // content's natural height and scrolls only when it's really taller than the screen allows.
                 FitOrScroll(maxHeight: Self.maxDetailsHeight) {
                     details(report)
-                    ScrollView { details(report) }.scrollIndicators(.automatic)
+                    // VoiceOver reads only the first copy (laid out in full even when it's parked off-screen),
+                    // so the cards are never read twice (Code Reviewer should-fix).
+                    ScrollView { details(report) }.scrollIndicators(.automatic).accessibilityHidden(true)
                 }
                 updatedLine(report)
             } else if let location = store.menuBarLocation {
@@ -300,6 +302,7 @@ struct MenuBarContentView: View {
                     let p = Int((hour.precipitationProbability ?? 0).rounded())
                     Text(p >= 20 ? "\(p)%" : " ").font(.caption2.weight(.semibold))
                         .foregroundStyle(Color(red: 0.55, green: 0.80, blue: 1.0))
+                        .accessibilityHidden(p < 20)
                 }
                 .frame(maxWidth: .infinity)
             }
@@ -329,7 +332,8 @@ struct MenuBarContentView: View {
         }
         if let sun = MenuSummary.nextSunEvent(report, now: now) {
             tiles.append((sun.isSunrise ? "sunrise.fill" : "sunset.fill", sun.isSunrise ? "Sunrise" : "Sunset",
-                          Fmt.time(sun.time, tz), Calendar.current.isDate(sun.time, inSameDayAs: now) ? "today" : "tomorrow"))
+                          Fmt.time(sun.time, tz), { var cal = Calendar(identifier: .gregorian); cal.timeZone = tz
+                            return cal.isDate(sun.time, inSameDayAs: now) ? "today" : "tomorrow" }()))
         }
         if tiles.count < 6, let p = c.pressure {
             tiles.append(("gauge.with.dots.needle.50percent", "Pressure", store.units.pressureString(p), ""))
@@ -348,6 +352,7 @@ struct MenuBarContentView: View {
                 }
                 .frame(maxWidth: .infinity, minHeight: 58, alignment: .topLeading)
                 .menuGlass(cornerRadius: 14, padding: 8)
+                .accessibilityElement(children: .combine)
             }
         }
     }

@@ -32,10 +32,17 @@ SRC="${1:-$DEFAULT_ZIP}"
 [[ -e "$SRC" ]] || { echo "Not found: $SRC (is iCloud Drive synced?)" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+STAGE="$(dirname "$DEST")/.$APP_NAME.app.new"
+BACKUP="$(dirname "$DEST")/.$APP_NAME.app.previous"
+trap 'rm -rf "$TMP" "$STAGE"' EXIT
 case "$SRC" in
   *.zip)
     brctl download "$SRC" 2>/dev/null || true   # make sure iCloud has the bytes locally
+    # Before extracting: no absolute paths, no ".." components, no symlinks (a symlinked directory
+    # entry followed by files "inside" it would write outside $TMP before the signature is checked).
+    LISTING="$(zipinfo -l "$SRC")" || { echo "Not a readable zip: $SRC" >&2; exit 1; }
+    if zipinfo -1 "$SRC" | grep -qE '(^/|(^|/)\.\.(/|$))'; then echo "REFUSING: unsafe path in $SRC" >&2; exit 1; fi
+    if grep -qE '^l' <<<"$LISTING"; then echo "REFUSING: symlink entry in $SRC" >&2; exit 1; fi
     ditto -x -k "$SRC" "$TMP"
     NEW="$TMP/$APP_NAME.app" ;;
   *.app)
@@ -43,6 +50,7 @@ case "$SRC" in
     ditto "$SRC" "$NEW" ;;
   *) echo "Expected a .zip or .app: $SRC" >&2; exit 2 ;;
 esac
+[[ -L "$NEW" ]] && { echo "REFUSING: $APP_NAME.app is a symlink" >&2; exit 1; }
 [[ -d "$NEW" ]] || { echo "No $APP_NAME.app in $SRC" >&2; exit 1; }
 
 # The check: a valid, complete signature (no modified or added files) whose designated identity is
@@ -68,10 +76,20 @@ if pgrep -x "$APP_NAME" >/dev/null; then
   for _ in {1..20}; do pgrep -x "$APP_NAME" >/dev/null || break; sleep 0.25; done
   pkill -x "$APP_NAME" 2>/dev/null || true
 fi
-rm -rf "$DEST"
-ditto "$NEW" "$DEST"
-# Quarantine is cleared only now, after the signature check passed (and re-checked in place).
-codesign --verify --strict --deep -R="$REQUIREMENT" "$DEST"
-xattr -dr com.apple.quarantine "$DEST" 2>/dev/null || true
+# Stage next to the destination (same volume, so the swap is two renames), verify the staged copy,
+# then swap. The old app is kept until the new one is in place; any failure puts it back.
+rm -rf "$STAGE"
+ditto "$NEW" "$STAGE"
+if ! codesign --verify --strict --deep -R="$REQUIREMENT" "$STAGE"; then
+  echo "REFUSING: staged copy failed verification; nothing changed." >&2; exit 1
+fi
+xattr -dr com.apple.quarantine "$STAGE" 2>/dev/null || true
+rm -rf "$BACKUP"
+[[ -e "$DEST" ]] && mv "$DEST" "$BACKUP"
+if ! mv "$STAGE" "$DEST"; then
+  [[ -e "$BACKUP" ]] && mv "$BACKUP" "$DEST"
+  echo "Install failed; previous version restored." >&2; exit 1
+fi
+rm -rf "$BACKUP"   # keep it instead for a manual rollback: mv "$BACKUP" "$DEST"
 open "$DEST"
 echo "Installed $DEST (signature verified)"

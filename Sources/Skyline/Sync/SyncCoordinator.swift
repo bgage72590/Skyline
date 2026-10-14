@@ -100,77 +100,49 @@ final class SyncCoordinator {
         }
     }
 
-    /// Fold in local changes, merge with the file, write it, and apply anything that came from elsewhere.
+    /// Fold in local changes, then merge with the file and write it on a background queue (file
+    /// coordination can block for seconds with iCloud), and apply the result back here.
     func pushNow() {
         guard let fileURL, let previous = last else { return }
+        if pushing { pushAgain = true; return }
         var local = SyncDocument.noting(locations: store.savedLocations, settings: currentSettings(), previous: previous, now: Date())
         local.writtenBy = device
-        let remote = readFile()
-        if remote == nil && fileExistsSomewhere(fileURL) {
-            // There is a file (or an iCloud placeholder) we couldn't read yet: never overwrite it with
-            // only this Mac's cities. Try again on the next check.
-            requestDownload(fileURL)
-            lastError = "Waiting for iCloud Drive to download the sync file."
-            return
+        pushing = true
+        let io = SyncFileIO(url: fileURL, device: device)
+        Task.detached(priority: .utility) { [weak self] in
+            let outcome = io.mergeAndWrite(local)
+            guard let self else { return }
+            await self.finishPush(outcome)
         }
-        var merged = remote.map { SyncDocument.merge(local: local, remote: $0) } ?? local
-        merged.writtenBy = device
-        merged.writtenAt = Date()
-        if remote == nil || !merged.sameContent(as: remote!) {
-            do {
-                try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try write(merged, to: fileURL)
-            } catch {
-                lastError = "Couldn’t write the sync file: \(error.localizedDescription)"
-                return
-            }
+    }
+
+    private var pushing = false
+    private var pushAgain = false
+
+    private func finishPush(_ outcome: SyncFileIO.Outcome) {
+        pushing = false
+        switch outcome {
+        case .synced(let doc, let note):
+            apply(doc)
+            lastError = note
+        case .waiting(let message), .failed(let message):
+            lastError = message
         }
-        apply(merged)
+        if pushAgain { pushAgain = false; pushNow() }
     }
 
     /// Another Mac wrote the file since we last looked: merge it in.
     func pullIfChanged(force: Bool = false) {
         guard let fileURL else { return }
         let date = (try? FileManager.default.attributesOfItem(atPath: fileURL.path))?[.modificationDate] as? Date
-        if date == nil { requestDownload(fileURL) }
+        if date == nil { try? FileManager.default.startDownloadingUbiquitousItem(at: fileURL) }
         guard force || date != lastFileDate else { return }
         pushNow()
-    }
-
-    private func readFile() -> SyncDocument? {
-        guard let fileURL else { return nil }
-        var result: SyncDocument?
-        var error: NSError?
-        NSFileCoordinator().coordinate(readingItemAt: fileURL, options: [], error: &error) { url in
-            if let data = try? Data(contentsOf: url) { result = SyncDocument.decode(data) }
-        }
-        return result
-    }
-
-    private func write(_ doc: SyncDocument, to url: URL) throws {
-        let data = try doc.encoded()
-        var coordError: NSError?
-        var writeError: Error?
-        NSFileCoordinator().coordinate(writingItemAt: url, options: .forReplacing, error: &coordError) { u in
-            do { try data.write(to: u, options: .atomic) } catch { writeError = error }
-        }
-        if let e = coordError ?? writeError { throw e }
-    }
-
-    private func fileExistsSomewhere(_ url: URL) -> Bool {
-        let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
-        return FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: placeholder.path)
-    }
-
-    /// iCloud may have the file only in the cloud (a `.sync.json.icloud` placeholder): ask for it.
-    private func requestDownload(_ url: URL) {
-        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
     }
 
     private func apply(_ doc: SyncDocument) {
         last = doc
         lastSynced = Date()
-        lastError = nil
         if let url = fileURL {
             lastFileDate = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
         }
@@ -188,5 +160,90 @@ final class SyncCoordinator {
         }
         if settingsChanged { store.reloadSyncedSettings() }
         if doc.locations != store.savedLocations { store.applySyncedLocations(doc.locations) }
+    }
+}
+
+/// The sync file's read-merge-write, done in ONE coordinated write (`.forMerging`) so no other process
+/// can write between the read and the write, and iCloud's conflict versions (two Macs that wrote while
+/// offline) are merged in and then resolved, so neither Mac's change is lost (Code Reviewer MF4/MF5).
+/// Runs off the main thread.
+struct SyncFileIO: Sendable {
+    let url: URL
+    let device: String
+
+    enum Outcome: Sendable {
+        /// Merged (and written if anything changed). `note` is a message to show (e.g. a corrupt file
+        /// was set aside), else nil.
+        case synced(SyncDocument, note: String?)
+        /// Nothing written: the file is still downloading, or it's from a newer Skyline.
+        case waiting(String)
+        case failed(String)
+    }
+
+    func mergeAndWrite(_ local: SyncDocument) -> Outcome {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var outcome: Outcome = .failed("Couldn’t open the sync file.")
+        var coordError: NSError?
+        NSFileCoordinator().coordinate(writingItemAt: url, options: .forMerging, error: &coordError) { u in
+            outcome = mergeLocked(local, at: u)
+        }
+        if let coordError { return .failed("Couldn’t open the sync file: \(coordError.localizedDescription)") }
+        return outcome
+    }
+
+    private func mergeLocked(_ local: SyncDocument, at u: URL) -> Outcome {
+        let fm = FileManager.default
+        var merged = local
+        var note: String?
+        // 1. iCloud conflict versions: merge every one in.
+        let conflicts = NSFileVersion.unresolvedConflictVersionsOfItem(at: u) ?? []
+        for v in conflicts {
+            if let data = try? Data(contentsOf: v.url), case .document(let d) = SyncDocument.read(data) {
+                merged = SyncDocument.merge(local: merged, remote: d)
+            }
+        }
+        // 2. The current file.
+        var remote: SyncDocument?
+        let placeholder = u.deletingLastPathComponent().appendingPathComponent("." + u.lastPathComponent + ".icloud")
+        if fm.fileExists(atPath: u.path) {
+            guard let data = try? Data(contentsOf: u) else { return .waiting("Waiting for iCloud Drive to download the sync file.") }
+            switch SyncDocument.read(data) {
+            case .document(let d):
+                remote = d
+            case .newerFormat(let n):
+                return .waiting("Another Mac uses a newer Skyline (sync format \(n)). Choose Update Skyline… to keep syncing.")
+            case .unreadable:
+                let status = (try? u.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]))?.ubiquitousItemDownloadingStatus
+                if let status, status != .current {
+                    try? fm.startDownloadingUbiquitousItem(at: u)
+                    return .waiting("Waiting for iCloud Drive to download the sync file.")
+                }
+                // Fully downloaded but not a Skyline sync file (corrupt/truncated): keep a copy, rewrite.
+                let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+                let aside = u.deletingLastPathComponent().appendingPathComponent("sync.corrupt-\(stamp).json")
+                try? fm.moveItem(at: u, to: aside)
+                note = "The sync file was damaged; it was set aside as \(aside.lastPathComponent) and rewritten from this Mac."
+            }
+        } else if fm.fileExists(atPath: placeholder.path) {
+            try? fm.startDownloadingUbiquitousItem(at: u)
+            return .waiting("Waiting for iCloud Drive to download the sync file.")
+        }
+        if let remote { merged = SyncDocument.merge(local: merged, remote: remote) }
+        merged.writtenBy = device
+        if remote == nil || !merged.sameContent(as: remote!) || !conflicts.isEmpty {
+            merged.writtenAt = Date()
+            do {
+                try merged.encoded().write(to: u, options: .atomic)
+            } catch {
+                return .failed("Couldn’t write the sync file: \(error.localizedDescription)")
+            }
+        }
+        // 3. Conflicts are folded in: resolve them so iCloud stops keeping both.
+        if !conflicts.isEmpty {
+            for v in conflicts { v.isResolved = true }
+            try? NSFileVersion.removeOtherVersionsOfItem(at: u)
+        }
+        return .synced(merged, note: note)
     }
 }

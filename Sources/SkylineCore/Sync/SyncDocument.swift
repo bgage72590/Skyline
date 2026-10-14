@@ -20,15 +20,25 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     /// Setting key → encoded value (see `SyncValue`). Missing value with a stamp = reset to default.
     public var settings: [String: String] = [:]
     public var settingStamps: [String: Date] = [:]
+    /// When the city order was last changed on purpose (optional so format-1 files still decode).
+    public var orderStamp: Date?
     public var writtenBy: String = ""
     public var writtenAt: Date = .distantPast
 
     public init() {}
 
+    /// The newest stamp this document has seen. New local stamps are kept later than it, so a change made
+    /// after seeing another Mac's change wins even when this Mac's clock is behind (hybrid logical clock).
+    var latestStamp: Date {
+        ([orderStamp].compactMap { $0 } + Array(locationStamps.values) + Array(removed.values) + Array(settingStamps.values))
+            .max() ?? .distantPast
+    }
+
     /// Rebuild the local side after the user changed something: stamps what differs from `previous`.
     public static func noting(locations: [WeatherLocation], settings: [String: String],
-                              previous: SyncDocument, now: Date) -> SyncDocument {
+                              previous: SyncDocument, now wallClock: Date) -> SyncDocument {
         var doc = previous
+        let now = max(wallClock, previous.latestStamp.addingTimeInterval(0.001))
         let old = Dictionary(previous.locations.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         let new = Set(locations.map(\.id))
         for l in locations where old[l.id] != l {
@@ -39,6 +49,9 @@ public struct SyncDocument: Codable, Equatable, Sendable {
             doc.removed[id] = now
             doc.locationStamps[id] = nil
         }
+        // A reorder (same cities, different order) is its own change.
+        let kept = locations.map(\.id).filter { old[$0] != nil }
+        if kept != previous.locations.map(\.id).filter({ new.contains($0) }) { doc.orderStamp = now }
         doc.locations = locations
         for key in Set(settings.keys).union(previous.settings.keys) where settings[key] != previous.settings[key] {
             doc.settingStamps[key] = now
@@ -65,8 +78,13 @@ public struct SyncDocument: Codable, Equatable, Sendable {
         out.writtenAt = max(local.writtenAt, remote.writtenAt)
         let localByID = Dictionary(local.locations.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         let remoteByID = Dictionary(remote.locations.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        // Order from the side that reordered last; equal stamps pick the same side on every Mac.
+        let lo = local.orderStamp ?? .distantPast, ro = remote.orderStamp ?? .distantPast
+        let lIDs = local.locations.map(\.id), rIDs = remote.locations.map(\.id)
+        let remoteFirst = ro > lo || (ro == lo && rIDs.joined(separator: "\n") < lIDs.joined(separator: "\n"))
+        out.orderStamp = max(lo, ro) == .distantPast ? nil : max(lo, ro)
         var order: [String] = []
-        for id in local.locations.map(\.id) + remote.locations.map(\.id) where !order.contains(id) { order.append(id) }
+        for id in (remoteFirst ? rIDs + lIDs : lIDs + rIDs) where !order.contains(id) { order.append(id) }
         let allRemovedIDs = Set(local.removed.keys).union(remote.removed.keys)
         for id in allRemovedIDs {
             let r = [local.removed[id], remote.removed[id]].compactMap { $0 }.max()
@@ -94,8 +112,10 @@ public struct SyncDocument: Codable, Equatable, Sendable {
         for key in Set(local.settingStamps.keys).union(remote.settingStamps.keys)
             .union(local.settings.keys).union(remote.settings.keys) {
             let l = local.settingStamps[key] ?? .distantPast, r = remote.settingStamps[key] ?? .distantPast
-            // Ties go to this Mac, unless this Mac has never heard of the key.
-            let useRemote = r > l || (r == l && local.settings[key] == nil && local.settingStamps[key] == nil)
+            // Ties: a key this Mac never heard of comes from the other; otherwise the same value wins on
+            // both Macs (larger encoded value), so two Macs never keep rewriting each other's choice.
+            let useRemote = r > l || (r == l && ((local.settings[key] == nil && local.settingStamps[key] == nil)
+                || (remote.settings[key] ?? "") > (local.settings[key] ?? "")))
             out.settingStamps[key] = max(l, r)
             out.settings[key] = useRemote ? remote.settings[key] : local.settings[key]
         }
@@ -104,7 +124,7 @@ public struct SyncDocument: Codable, Equatable, Sendable {
 
     /// Same content (ignores who wrote it and when).
     public func sameContent(as other: SyncDocument) -> Bool {
-        locations == other.locations && settings == other.settings && removed == other.removed
+        locations == other.locations && orderStamp == other.orderStamp && settings == other.settings && removed == other.removed
             && locationStamps == other.locationStamps && settingStamps == other.settingStamps
     }
 
@@ -113,6 +133,20 @@ public struct SyncDocument: Codable, Equatable, Sendable {
         e.outputFormatting = [.prettyPrinted, .sortedKeys]
         e.dateEncodingStrategy = .iso8601
         return try e.encode(self)
+    }
+
+    public enum ReadOutcome: Equatable, Sendable {
+        case document(SyncDocument)
+        /// Written by a newer Skyline: leave it alone and tell the user to update.
+        case newerFormat(Int)
+        /// Not a Skyline sync file (corrupt or truncated): move it aside and rewrite from this Mac.
+        case unreadable
+    }
+
+    public static func read(_ data: Data) -> ReadOutcome {
+        struct Header: Decodable { var format: Int? }
+        if let f = (try? JSONDecoder().decode(Header.self, from: data))?.format, f > currentFormat { return .newerFormat(f) }
+        return decode(data).map(ReadOutcome.document) ?? .unreadable
     }
 
     /// Nil for a file that isn't a Skyline sync file, or is from a newer format this build can't read.
