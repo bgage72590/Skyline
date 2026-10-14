@@ -3,23 +3,26 @@ import Foundation
 /// Sharing the forecast-vs-NWS accuracy learning between Macs (build 31). The scorecard and the adaptive
 /// blend weights are both computed from verified pairs, so the pairs are what travels in sync.json.
 ///
-/// Merge rule: a grow-only set with de-duplication. Two records describe the same verification when they
-/// share location key (the station's place), valid hour and issuance slot (3 h, the issue interval, so one
-/// Mac never has two records in one slot). Within such a group each model is counted once: the earliest
-/// issued record's value wins, other Macs only fill models it lacks. The result is the same whatever order
-/// Macs merge in (commutative, idempotent), so both Macs converge.
-/// A reset ("Reset Accuracy Data") is a stamp: records issued before the newest reset are dropped everywhere.
+/// Merge rule: a grow-only set with de-duplication. Records for the same location key (the station's
+/// place) and valid hour whose issue times are within `sameIssuance` (90 min) of the earliest one in their
+/// run are one verification (build 33, M1: each Mac issues on its own 3 h cadence, so two Macs' copies of
+/// the same forecast can sit on either side of any fixed slot boundary; one Mac's own issuances are always
+/// >= 3 h apart, so they never merge). Within such a cluster each model is counted once: the earliest
+/// issued record's value wins, later ones only fill models it lacks. Clusters are formed from the sorted
+/// union, so the result is the same whatever order Macs merge in (commutative, idempotent).
+/// A reset ("Reset Accuracy Data") drops records issued before it everywhere.
 public enum AccuracySync {
     /// Only the most recent pairs travel (each Mac keeps its own 90-day history locally).
     public static let windowDays = 30.0
     /// Hard cap on synced pairs (~470 bytes each), newest kept.
     public static let maxRecords = 15_000
-    public static let slot: TimeInterval = ForecastVerifier.issueInterval
+    /// Issuances this close to the earliest one in a cluster are the same forecast from two Macs (M1).
+    /// Half the issue interval, so one Mac's own issuances (>= 3 h apart) never merge.
+    public static let sameIssuance: TimeInterval = ForecastVerifier.issueInterval / 2
 
     struct GroupKey: Hashable {
         let loc: String
         let valid: Date
-        let slot: Int64
     }
 
     static func normalized(_ v: VerifiedRecord) -> VerifiedRecord {
@@ -31,7 +34,7 @@ public enum AccuracySync {
     }
 
     static func key(_ v: VerifiedRecord) -> GroupKey {
-        GroupKey(loc: v.r.loc, valid: v.r.valid, slot: Int64((v.r.issued.timeIntervalSince1970 / slot).rounded(.down)))
+        GroupKey(loc: v.r.loc, valid: v.r.valid)
     }
 
     /// Deterministic tie-break for records issued in the same second.
@@ -40,7 +43,7 @@ public enum AccuracySync {
         return (try? e.encode(v)).map { String(decoding: $0, as: UTF8.self) } ?? ""
     }
 
-    /// Union of `a` and `b`, de-duplicated by (location, valid hour, issuance slot, model).
+    /// Union of `a` and `b`, de-duplicated by (location, valid hour, issuance within 90 min, model).
     /// - Parameters:
     ///   - resetAt: drop records issued before this.
     ///   - now: when given, keep only `windowDays` (by valid time) and at most `maxRecords`.
@@ -61,11 +64,17 @@ public enum AccuracySync {
             let sorted = unique.count == 1 ? unique : unique.sorted {
                 $0.r.issued != $1.r.issued ? $0.r.issued < $1.r.issued : tieKey($0) < tieKey($1)
             }
-            var first = sorted[0]
-            for other in sorted.dropFirst() {
-                for (model, values) in other.r.f where first.r.f[model] == nil { first.r.f[model] = values }
+            var i = 0
+            while i < sorted.count {
+                var first = sorted[i]
+                let end = first.r.issued.addingTimeInterval(sameIssuance)
+                i += 1
+                while i < sorted.count, sorted[i].r.issued < end {
+                    for (model, values) in sorted[i].r.f where first.r.f[model] == nil { first.r.f[model] = values }
+                    i += 1
+                }
+                out.append(first)
             }
-            out.append(first)
         }
         out.sort {
             if $0.r.valid != $1.r.valid { return $0.r.valid < $1.r.valid }
@@ -160,10 +169,29 @@ public struct AccuracyFile: Equatable, Sendable {
         var reset: ResetWire?
         var locs: [String]
         var models: [String]
-        var g: [Group]
+        var g: [Group?]
 
         struct ResetWire: Codable { var g: Int; var at: Int64 }
-        struct Group: Codable { var l: Int; var i: Int64; var r: [[Double?]] }
+        /// Lenient (M3): a malformed group or row is skipped, never the whole file.
+        struct Group: Codable {
+            var l: Int; var i: Int64; var r: [[Double?]]
+            init(l: Int, i: Int64, r: [[Double?]]) { self.l = l; self.i = i; self.r = r }
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                l = try c.decode(Int.self, forKey: .l)
+                i = try c.decode(Int64.self, forKey: .i)
+                r = (try c.decode([Lenient<[Double?]>].self, forKey: .r)).compactMap(\.value)
+            }
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            v = try c.decode(Int.self, forKey: .v)
+            reset = try? c.decodeIfPresent(ResetWire.self, forKey: .reset)
+            locs = try c.decode([String].self, forKey: .locs)
+            models = try c.decode([String].self, forKey: .models)
+            g = (try c.decode([Lenient<Group>].self, forKey: .g)).map(\.value)
+        }
 
         init(_ f: AccuracyFile) {
             v = f.format
@@ -179,10 +207,11 @@ public struct AccuracyFile: Equatable, Sendable {
                 let issued = Int64(p.r.issued.timeIntervalSince1970.rounded(.down))
                 let valid = Int64(p.r.valid.timeIntervalSince1970.rounded(.down))
                 let key = Key(l: locIndex[p.r.loc]!, i: issued)
-                var row: [Double?] = [Double(valid - issued), p.o.t, p.o.w, p.o.wet.map { $0 ? 1 : 0 }, p.o.p]
+                // Non-finite values become null (M3): JSONEncoder throws on NaN/Inf.
+                var row: [Double?] = [Double(valid - issued), finite(p.o.t), finite(p.o.w), p.o.wet.map { $0 ? 1 : 0 }, finite(p.o.p)]
                 for name in p.r.f.keys.sorted() {
                     let s = p.r.f[name]!
-                    row += [Double(modelIndex[name]!), s.t, s.pop, s.p, s.w]
+                    row += [Double(modelIndex[name]!), finite(s.t), finite(s.pop), finite(s.p), finite(s.w)]
                 }
                 if groups[key] == nil { order.append(key) }
                 groups[key, default: []].append(row)
@@ -192,15 +221,15 @@ public struct AccuracyFile: Equatable, Sendable {
 
         var file: AccuracyFile? {
             var pairs: [VerifiedRecord] = []
-            for group in g {
-                guard locs.indices.contains(group.l) else { return nil }
+            for case let group? in g {
+                guard locs.indices.contains(group.l) else { continue }
                 let issued = Date(timeIntervalSince1970: TimeInterval(group.i))
-                for row in group.r {
-                    guard row.count >= 5, (row.count - 5) % 5 == 0, let d = row[0] else { return nil }
+                rows: for row in group.r {
+                    guard row.count >= 5, (row.count - 5) % 5 == 0, let d = row[0], d.isFinite else { continue }
                     var f: [String: SourceValues] = [:]
                     var k = 5
                     while k < row.count {
-                        guard let m = row[k], m >= 0, Int(m) < models.count else { return nil }
+                        guard let m = row[k], m >= 0, Int(m) < models.count else { continue rows }
                         f[models[Int(m)]] = SourceValues(t: row[k + 1], pop: row[k + 2], p: row[k + 3], w: row[k + 4])
                         k += 5
                     }
@@ -213,4 +242,12 @@ public struct AccuracyFile: Equatable, Sendable {
                                 pairs: AccuracySync.merge(pairs, []))
         }
     }
+}
+
+private func finite(_ x: Double?) -> Double? { x.flatMap { $0.isFinite ? $0 : nil } }
+
+/// Decodes a `T` or nil instead of failing the surrounding array (M3).
+struct Lenient<T: Decodable>: Decodable {
+    let value: T?
+    init(from decoder: Decoder) throws { value = try? T(from: decoder) }
 }

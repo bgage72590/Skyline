@@ -55,16 +55,20 @@ final class AccuracySyncTests: XCTestCase {
     }
 
     func testSyncDocumentDropsBuild31AccuracyAndOldFilesStillDecode() throws {
-        // Build 32 (H1): pairs moved to accuracy.json; a build-31 sync.json still reads, and merging drops them.
+        // Pairs live in accuracy.json; a build-31 sync.json still reads. Build 33 (build-32 review N-H1):
+        // the legacy fields pass through unmerged and never count as a change, so no ping-pong with build 31.
         var local = SyncDocument(); local.accuracy = [pair(issued: 0, valid: 3600, [.blend: SourceValues(t: 1)])]
         var remote = SyncDocument(); remote.accuracy = [pair(issued: 600, valid: 3600, [.ecmwf: SourceValues(t: 2)])]
         remote.accuracyResetAt = t0
         let back = try XCTUnwrap(SyncDocument.decode(try remote.encoded()))
         XCTAssertEqual(back.accuracy?.count, 1)
         let m = SyncDocument.merge(local: local, remote: remote, now: t0.addingTimeInterval(86400))
-        XCTAssertNil(m.accuracy); XCTAssertNil(m.accuracyResetAt)
-        XCTAssertFalse(m.sameContent(as: remote), "so the next write shrinks a build-31 file")
-        XCTAssertFalse(String(decoding: try m.encoded(), as: UTF8.self).contains("accuracy"))
+        XCTAssertEqual(m.accuracy, remote.accuracy, "the file's legacy pairs, unchanged")
+        XCTAssertEqual(m.accuracyResetAt, t0)
+        XCTAssertTrue(m.sameContent(as: remote), "nothing to write: build 31's file is left alone")
+        var stripped = remote; stripped.accuracy = nil; stripped.accuracyResetAt = nil
+        XCTAssertTrue(stripped.sameContent(as: remote), "legacy fields never trigger a write")
+        XCTAssertNil(SyncDocument.merge(local: SyncDocument(), remote: SyncDocument()).accuracy)
         let old = #"{"format":1,"locations":[],"locationStamps":{},"removed":{},"settings":{},"settingStamps":{},"writtenBy":"","writtenAt":"2026-10-14T00:00:00Z"}"#
         XCTAssertNotNil(SyncDocument.decode(Data(old.utf8)))
         XCTAssertEqual(SyncDocument.currentFormat, 1)

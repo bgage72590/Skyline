@@ -74,8 +74,11 @@ public struct SourceValues: Codable, Hashable, Sendable {
     public var p: Double?
     public var w: Double?
 
+    /// Non-finite values (NaN/Inf from a bad upstream number) are dropped (M3): they would make every
+    /// JSON encode of the record throw.
     public init(t: Double? = nil, pop: Double? = nil, p: Double? = nil, w: Double? = nil) {
-        self.t = t; self.pop = pop; self.p = p; self.w = w
+        func ok(_ x: Double?) -> Double? { x.flatMap { $0.isFinite ? $0 : nil } }
+        self.t = ok(t); self.pop = ok(pop); self.p = ok(p); self.w = ok(w)
     }
 
     public var isEmpty: Bool { t == nil && pop == nil && p == nil && w == nil }
@@ -115,8 +118,10 @@ public struct ObservedHour: Codable, Hashable, Sendable {
     /// Measured precipitation (mm) for that hour, when the station reports it.
     public var p: Double?
 
+    /// Non-finite values are dropped (M3, see `SourceValues.init`).
     public init(t: Double? = nil, w: Double? = nil, wet: Bool? = nil, p: Double? = nil) {
-        self.t = t; self.w = w; self.wet = wet; self.p = p
+        func ok(_ x: Double?) -> Double? { x.flatMap { $0.isFinite ? $0 : nil } }
+        self.t = ok(t); self.w = ok(w); self.wet = wet; self.p = ok(p)
     }
 }
 

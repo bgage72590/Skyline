@@ -151,6 +151,7 @@ final class SyncCoordinator {
                 pushAgain = true
             }
             lastError = note
+            absorbLegacyAccuracy(from: doc)
         case .waiting(let message), .failed(let message):
             lastError = message
         }
@@ -164,8 +165,17 @@ final class SyncCoordinator {
         let date = (try? FileManager.default.attributesOfItem(atPath: fileURL.path))?[.modificationDate] as? Date
         if date == nil { try? FileManager.default.startDownloadingUbiquitousItem(at: fileURL) }
         syncAccuracy(force: force)
-        guard force || date != lastFileDate else { return }
+        // M4: a push that failed (iCloud offline, coordination error) left local edits unsent; retry them on
+        // the next check (refresh, activation, wake) even though the file date hasn't changed.
+        guard force || date != lastFileDate || hasUnsentLocalChanges() else { return }
         pushNow()
+    }
+
+    /// Cities or settings differ from what was last written or applied (cheap: cities and settings only).
+    private func hasUnsentLocalChanges() -> Bool {
+        guard let last, !pushing else { return false }
+        return !SyncDocument.noting(locations: store.savedLocations, settings: currentSettings(), previous: last, now: Date())
+            .sameContent(as: last)
     }
 
     // MARK: Accuracy learning (build 32: accuracy.json, see AccuracyFileSync)
@@ -176,6 +186,18 @@ final class SyncCoordinator {
         guard let accuracySync else { return }
         Task.detached(priority: .utility) { [weak self] in
             guard await accuracySync.run(force: force) else { return }
+            await self?.refreshAllAccuracy()
+        }
+    }
+
+    /// While a build-31 Mac still shares pairs through sync.json, fold them into this Mac's history (off
+    /// main, in the verifier) so the Macs' learning doesn't split (build-32 review N-H1). A build-31 reset
+    /// counts as generation 1.
+    private func absorbLegacyAccuracy(from doc: SyncDocument) {
+        guard let verifier = store.service.verifier, doc.accuracy != nil || doc.accuracyResetAt != nil else { return }
+        let file = AccuracyFile(reset: doc.accuracyResetAt.map { AccuracyReset(generation: 1, at: $0) }, pairs: doc.accuracy ?? [])
+        Task.detached(priority: .utility) { [weak self] in
+            guard await verifier.absorb(file) else { return }
             await self?.refreshAllAccuracy()
         }
     }

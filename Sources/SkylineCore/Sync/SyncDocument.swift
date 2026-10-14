@@ -23,7 +23,8 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     /// When the city order was last changed on purpose (optional so format-1 files still decode).
     public var orderStamp: Date?
     /// Build 31 only: verified pairs were shared here. Build 32 moved them to accuracy.json
-    /// (`AccuracyFile`); still decoded so a build-31 file reads, and dropped by `merge`.
+    /// (`AccuracyFile`). Still decoded and passed through unchanged so a build-31 Mac on the same iCloud
+    /// isn't fought over; build 33 also folds them into the local history (SyncCoordinator).
     public var accuracy: [VerifiedRecord]?
     /// Build 31 only (see `accuracy`).
     public var accuracyResetAt: Date?
@@ -31,6 +32,28 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     public var writtenAt: Date = .distantPast
 
     public init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case format, locations, locationStamps, removed, settings, settingStamps, orderStamp, accuracy, accuracyResetAt,
+             writtenBy, writtenAt
+    }
+
+    /// Same as the synthesized decoder, except the build-31 `accuracy` pairs are decoded leniently (M3): a
+    /// malformed or non-finite pair is skipped and never makes the cities and settings unreadable.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        format = try c.decode(Int.self, forKey: .format)
+        locations = try c.decode([WeatherLocation].self, forKey: .locations)
+        locationStamps = try c.decode([String: Date].self, forKey: .locationStamps)
+        removed = try c.decode([String: Date].self, forKey: .removed)
+        settings = try c.decode([String: String].self, forKey: .settings)
+        settingStamps = try c.decode([String: Date].self, forKey: .settingStamps)
+        orderStamp = try c.decodeIfPresent(Date.self, forKey: .orderStamp)
+        accuracy = (try? c.decodeIfPresent([Lenient<VerifiedRecord>].self, forKey: .accuracy))??.compactMap(\.value)
+        accuracyResetAt = try? c.decodeIfPresent(Date.self, forKey: .accuracyResetAt)
+        writtenBy = try c.decode(String.self, forKey: .writtenBy)
+        writtenAt = try c.decode(Date.self, forKey: .writtenAt)
+    }
 
     /// The newest stamp this document has seen. New local stamps are kept later than it, so a change made
     /// after seeing another Mac's change wins even when this Mac's clock is behind (hybrid logical clock).
@@ -124,10 +147,11 @@ public struct SyncDocument: Codable, Equatable, Sendable {
             out.settingStamps[key] = max(l, r)
             out.settings[key] = useRemote ? remote.settings[key] : local.settings[key]
         }
-        // Build 32 (H1): accuracy pairs live in accuracy.json now. The build-31 fields are dropped here, so
-        // the next write shrinks sync.json back to cities and settings.
-        out.accuracy = nil
-        out.accuracyResetAt = nil
+        // Accuracy pairs live in accuracy.json since build 32. The build-31 fields are passed through as the
+        // file has them (never merged, never a reason to write; build-32 review N-H1): stripping them made a
+        // build-31 and a build-32 Mac rewrite sync.json back and forth on every refresh.
+        out.accuracy = remote.accuracy ?? local.accuracy
+        out.accuracyResetAt = remote.accuracyResetAt ?? local.accuracyResetAt
         return out
     }
 
@@ -143,11 +167,11 @@ public struct SyncDocument: Codable, Equatable, Sendable {
         return out
     }
 
-    /// Same content (ignores who wrote it and when).
+    /// Same content (ignores who wrote it and when, and the build-31 accuracy fields, see `merge`).
     public func sameContent(as other: SyncDocument) -> Bool {
         locations == other.locations && orderStamp == other.orderStamp && settings == other.settings && removed == other.removed
             && locationStamps == other.locationStamps && settingStamps == other.settingStamps
-            && accuracy == other.accuracy && accuracyResetAt == other.accuracyResetAt
+
     }
 
     public func encoded() throws -> Data {
