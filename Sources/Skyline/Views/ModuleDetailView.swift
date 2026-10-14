@@ -362,22 +362,43 @@ struct ModuleDetailView: View {
         }
     }
 
+    /// Build 35 (weighting-check.md fix 1, labels only, no change to the math): each source's weight is
+    /// shown per field with its share of that field's blend, "–" where it has no value (e.g. NWS without
+    /// a low), and a merged NOAA row of identical values is labelled as the one vote it is.
     private func confidenceTable(_ d: DailyForecast) -> some View {
-        VStack(spacing: 0) {
+        let highTotal = d.sources.filter { $0.high != nil }.reduce(0) { $0 + $1.weight }
+        let lowTotal = d.sources.filter { $0.low != nil }.reduce(0) { $0 + $1.weight }
+        func share(_ w: Double, _ value: Double?, _ total: Double) -> String {
+            guard value != nil, w > 0 else { return "–" }
+            return total > 0 ? String(format: "%.1f× · %.0f%%", w, 100 * w / total) : String(format: "%.1f×", w)
+        }
+        return VStack(spacing: 0) {
             HStack {
                 Text("Source").frame(maxWidth: .infinity, alignment: .leading)
-                Text("High").frame(width: 60, alignment: .trailing)
-                Text("Low").frame(width: 60, alignment: .trailing)
-                Text("Weight").frame(width: 70, alignment: .trailing)
+                Text("High").frame(width: 50, alignment: .trailing)
+                Text("Low").frame(width: 50, alignment: .trailing)
+                Text("High weight").frame(width: 96, alignment: .trailing)
+                Text("Low weight").frame(width: 96, alignment: .trailing)
             }
             .font(.caption.weight(.semibold)).opacity(0.7).padding(.vertical, 6)
             ForEach(d.sources) { s in
                 Divider().overlay(Color.white.opacity(0.2))
                 HStack {
-                    Text(s.name).frame(maxWidth: .infinity, alignment: .leading)
-                    Text(units.temperatureString(s.high)).frame(width: 60, alignment: .trailing)
-                    Text(units.temperatureString(s.low)).frame(width: 60, alignment: .trailing)
-                    Text(String(format: "%.1f×", s.weight)).frame(width: 70, alignment: .trailing).opacity(0.7)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(s.name)
+                        if s.name.contains(" = ") {
+                            Text("Identical forecasts · 1 vote").font(.caption).opacity(0.65)
+                        } else if s.high != nil, s.low == nil {
+                            Text("High only (no low today)").font(.caption).opacity(0.65)
+                        } else if s.high == nil, s.low != nil {
+                            Text("Low only").font(.caption).opacity(0.65)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(units.temperatureString(s.high)).frame(width: 50, alignment: .trailing)
+                    Text(units.temperatureString(s.low)).frame(width: 50, alignment: .trailing)
+                    Text(share(s.weight, s.high, highTotal)).frame(width: 96, alignment: .trailing).opacity(0.7)
+                    Text(share(s.weight, s.low, lowTotal)).frame(width: 96, alignment: .trailing).opacity(0.7)
                 }
                 .font(.callout.monospacedDigit())
                 .padding(.vertical, 7)
@@ -385,9 +406,9 @@ struct ModuleDetailView: View {
             Divider().overlay(Color.white.opacity(0.2))
             HStack {
                 Text("Skyline blend").font(.callout.weight(.semibold)).frame(maxWidth: .infinity, alignment: .leading)
-                Text(units.temperatureString(d.high)).frame(width: 60, alignment: .trailing)
-                Text(units.temperatureString(d.low)).frame(width: 60, alignment: .trailing)
-                Text("").frame(width: 70)
+                Text(units.temperatureString(d.high)).frame(width: 50, alignment: .trailing)
+                Text(units.temperatureString(d.low)).frame(width: 50, alignment: .trailing)
+                Text("").frame(width: 196)
             }
             .font(.callout.weight(.semibold).monospacedDigit())
             .padding(.vertical, 7)
