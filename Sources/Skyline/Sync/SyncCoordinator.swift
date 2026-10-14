@@ -111,7 +111,16 @@ final class SyncCoordinator {
         pushing = true
         inFlight = local
         let io = SyncFileIO(url: fileURL, device: device)
-        Task.detached(priority: .utility) { [weak self] in
+        let verifier = store.service.verifier
+        Task.detached(priority: .utility) { [weak self, local] in
+            var local = local
+            // Build 31: this Mac's recent accuracy pairs ride along (merged without double counting).
+            if let verifier {
+                let mine = await verifier.syncPayload()
+                local.accuracyResetAt = [local.accuracyResetAt, mine.resetAt].compactMap { $0 }.max()
+                local.accuracy = AccuracySync.merge(local.accuracy ?? [], mine.records,
+                                                    resetAt: local.accuracyResetAt, now: Date())
+            }
             let outcome = io.mergeAndWrite(local)
             guard let self else { return }
             await self.finishPush(outcome)
@@ -143,6 +152,7 @@ final class SyncCoordinator {
                 pushAgain = true
             }
             lastError = note
+            absorbAccuracy(from: doc)
         case .waiting(let message), .failed(let message):
             lastError = message
         }
@@ -155,8 +165,33 @@ final class SyncCoordinator {
         guard let fileURL else { return }
         let date = (try? FileManager.default.attributesOfItem(atPath: fileURL.path))?[.modificationDate] as? Date
         if date == nil { try? FileManager.default.startDownloadingUbiquitousItem(at: fileURL) }
-        guard force || date != lastFileDate else { return }
+        guard force || date != lastFileDate else { pushIfNewAccuracy(); return }
         pushNow()
+    }
+
+    // MARK: Accuracy learning (build 31)
+
+    /// Merged pairs from the file go into this Mac's verifier, so its scorecard and weights include
+    /// what the other Macs verified.
+    private func absorbAccuracy(from doc: SyncDocument) {
+        guard let verifier = store.service.verifier, doc.accuracy != nil || doc.accuracyResetAt != nil else { return }
+        let records = doc.accuracy ?? [], reset = doc.accuracyResetAt
+        Task { [weak self] in
+            guard await verifier.absorb(records, resetAt: reset), let self else { return }
+            for location in self.store.allLocations { await self.store.refreshAccuracy(for: location) }
+        }
+    }
+
+    /// New pairs verified here (or a reset) since the last sync: send them even if nothing else changed.
+    private func pushIfNewAccuracy() {
+        guard let verifier = store.service.verifier, let last, !pushing else { return }
+        Task { [weak self] in
+            let mine = await verifier.syncPayload()
+            let reset = [last.accuracyResetAt, mine.resetAt].compactMap { $0 }.max()
+            let merged = AccuracySync.merge(last.accuracy ?? [], mine.records, resetAt: reset, now: Date())
+            guard merged != (last.accuracy ?? []) || reset != last.accuracyResetAt else { return }
+            self?.pushNow()
+        }
     }
 
     /// Persist the merged document as "last written" (state file + stamps) without touching the store.

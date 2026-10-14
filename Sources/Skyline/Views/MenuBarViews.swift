@@ -110,9 +110,13 @@ struct MenuBarContentView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 // Everything below the headline scrolls if the dropdown would be taller than the screen (T21).
-                // One details tree only (QA #8): scroll when taller than the screen, otherwise leave it still.
-                ScrollableWhenTall(maxHeight: Self.maxDetailsHeight) {
-                    details(report)
+                // Build 31: back to build 26's FitOrScroll sizing (natural height when it fits, scroll only
+                // when taller than the screen allows), with a single copy of the details: the layout
+                // measures the scroll view's ideal height, which is its content's natural height.
+                FitOrScroll(maxHeight: Self.maxDetailsHeight) {
+                    ScrollView { details(report) }
+                        .scrollIndicators(.automatic)
+                        .scrollBounceBehavior(.basedOnSize)
                 }
                 updatedLine(report)
             } else if let location = store.menuBarLocation {
@@ -471,29 +475,20 @@ extension View {
     }
 }
 
-/// One copy of the content: scrolls only when its natural height exceeds `maxHeight` (QA #8).
-struct ScrollableWhenTall<Content: View>: View {
+/// Gives its single subview (a ScrollView around the content) the content's natural height when that
+/// fits under `maxHeight`, else `maxHeight`, so it scrolls only when really taller (build 26 sizing,
+/// one copy of the content). Pure layout: no state is written while measuring, so the dropdown window
+/// never sizes itself from a not-yet-measured height (the "squeezed" dropdown of builds 27-30).
+struct FitOrScroll: Layout {
     var maxHeight: CGFloat
-    @ViewBuilder var content: () -> Content
-    @State private var contentHeight: CGFloat = 0
 
-    var body: some View {
-        let needsScroll = contentHeight > maxHeight + 0.5
-        ScrollView(.vertical, showsIndicators: needsScroll) {
-            content()
-                .background {
-                    GeometryReader { geo in
-                        Color.clear.preference(key: DetailsHeightKey.self, value: geo.size.height)
-                    }
-                }
-        }
-        .scrollDisabled(!needsScroll)
-        .frame(maxHeight: maxHeight)
-        .onPreferenceChange(DetailsHeightKey.self) { contentHeight = $0 }
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        let natural = content.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil))
+        return CGSize(width: proposal.width ?? natural.width, height: min(natural.height, maxHeight))
     }
-}
 
-private struct DetailsHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, proposal: ProposedViewSize(width: bounds.width, height: bounds.height))
+    }
 }

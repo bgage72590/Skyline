@@ -22,6 +22,11 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     public var settingStamps: [String: Date] = [:]
     /// When the city order was last changed on purpose (optional so format-1 files still decode).
     public var orderStamp: Date?
+    /// Verified forecast/observation pairs shared between Macs (build 31, see `AccuracySync`). Optional and
+    /// unknown to older builds, which ignore it when reading (the sync format number is unchanged).
+    public var accuracy: [VerifiedRecord]?
+    /// Newest "Reset Accuracy Data" on any Mac: pairs issued before it are dropped everywhere.
+    public var accuracyResetAt: Date?
     public var writtenBy: String = ""
     public var writtenAt: Date = .distantPast
 
@@ -119,6 +124,11 @@ public struct SyncDocument: Codable, Equatable, Sendable {
             out.settingStamps[key] = max(l, r)
             out.settings[key] = useRemote ? remote.settings[key] : local.settings[key]
         }
+        // Accuracy pairs: union without double counting; newest reset wins (max stamp).
+        out.accuracyResetAt = [local.accuracyResetAt, remote.accuracyResetAt].compactMap { $0 }.max()
+        if local.accuracy != nil || remote.accuracy != nil {
+            out.accuracy = AccuracySync.merge(local.accuracy ?? [], remote.accuracy ?? [], resetAt: out.accuracyResetAt, now: now)
+        }
         return out
     }
 
@@ -138,6 +148,7 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     public func sameContent(as other: SyncDocument) -> Bool {
         locations == other.locations && orderStamp == other.orderStamp && settings == other.settings && removed == other.removed
             && locationStamps == other.locationStamps && settingStamps == other.settingStamps
+            && accuracy == other.accuracy && accuracyResetAt == other.accuracyResetAt
     }
 
     public func encoded() throws -> Data {

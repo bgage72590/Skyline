@@ -176,6 +176,59 @@ public actor ForecastVerifier {
         for name in ["pending.jsonl", "verified.jsonl", "meta.json"] {
             try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
         }
+        // Build 31: the reset travels to the other Macs through sync.json (AccuracySync).
+        resetAt = now()
+        saveResetAt()
+    }
+
+    // MARK: Sharing between Macs (build 31)
+
+    /// When "Reset Accuracy Data" last ran here or on another Mac (pairs issued earlier are dropped).
+    private var resetAt: Date?
+
+    /// The recent verified pairs and reset stamp to put in sync.json.
+    public func syncPayload() -> (records: [VerifiedRecord], resetAt: Date?) {
+        load()
+        return (AccuracySync.merge(verified, [], resetAt: resetAt, now: now()), resetAt)
+    }
+
+    /// Folds in pairs from the other Macs (de-duplicated, see `AccuracySync`) and a newer reset.
+    /// Returns true when the local history changed.
+    @discardableResult
+    public func absorb(_ records: [VerifiedRecord], resetAt remoteReset: Date?) -> Bool {
+        load()
+        var changed = false
+        if let remoteReset, remoteReset > (resetAt ?? .distantPast) {
+            resetAt = remoteReset
+            saveResetAt()
+            pending.removeAll { $0.issued < remoteReset }
+            writeAll(pending, to: "pending.jsonl")
+            for key in meta.keys {
+                if let f = meta[key]?.firstIssued, f < remoteReset { meta[key]?.firstIssued = nil }
+            }
+            changed = true
+        }
+        let cutoff = now().addingTimeInterval(-Self.retentionDays * 86400)
+        let merged = AccuracySync.merge(verified, records.filter { $0.r.valid >= cutoff }, resetAt: resetAt)
+        if changed || Set(merged) != Set(verified.map(AccuracySync.normalized)) {
+            verified = merged
+            writeAll(verified, to: "verified.jsonl")
+            cachedScores = [:]; cachedWeights = [:]
+            changed = true
+        }
+        // "Days collected" counts from the earliest pair any Mac has for the location.
+        for v in verified {
+            let k = v.r.loc
+            if meta[k]?.firstIssued.map({ v.r.issued < $0 }) ?? true { meta[k, default: Meta()].firstIssued = v.r.issued }
+        }
+        if changed { saveMeta() }
+        return changed
+    }
+
+    private func saveResetAt() {
+        guard let resetAt, let d = try? Self.encoder.encode(["resetAt": resetAt]) else { return }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? d.write(to: directory.appendingPathComponent("sync-reset.json"), options: .atomic)
     }
 
     public func weights(_ key: String) -> BlendWeights {
@@ -249,6 +302,8 @@ public actor ForecastVerifier {
         if verified.count != all.count { writeAll(verified, to: "verified.jsonl") } // prune
         if let data = try? Data(contentsOf: directory.appendingPathComponent("meta.json")),
            let m = try? Self.decoder.decode([String: Meta].self, from: data) { meta = m }
+        if let data = try? Data(contentsOf: directory.appendingPathComponent("sync-reset.json")),
+           let r = try? Self.decoder.decode([String: Date].self, from: data) { resetAt = r["resetAt"] }
     }
 
     private static let encoder: JSONEncoder = {
