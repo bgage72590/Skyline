@@ -372,13 +372,18 @@ struct ModuleDetailView: View {
             guard value != nil, w > 0 else { return "–" }
             return total > 0 ? String(format: "%.1f× · %.0f%%", w, 100 * w / total) : String(format: "%.1f×", w)
         }
+        func cell(_ value: String, _ weight: String) -> some View {
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(value)
+                Text(weight).font(.caption.monospacedDigit()).opacity(0.65)
+            }
+            .frame(width: 92, alignment: .trailing)
+        }
         return VStack(spacing: 0) {
             HStack {
                 Text("Source").frame(maxWidth: .infinity, alignment: .leading)
-                Text("High").frame(width: 50, alignment: .trailing)
-                Text("Low").frame(width: 50, alignment: .trailing)
-                Text("High weight").frame(width: 96, alignment: .trailing)
-                Text("Low weight").frame(width: 96, alignment: .trailing)
+                Text("High · weight").frame(width: 92, alignment: .trailing)
+                Text("Low · weight").frame(width: 92, alignment: .trailing)
             }
             .font(.caption.weight(.semibold)).opacity(0.7).padding(.vertical, 6)
             ForEach(d.sources) { s in
@@ -395,10 +400,8 @@ struct ModuleDetailView: View {
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    Text(units.temperatureString(s.high)).frame(width: 50, alignment: .trailing)
-                    Text(units.temperatureString(s.low)).frame(width: 50, alignment: .trailing)
-                    Text(share(s.weight, s.high, highTotal)).frame(width: 96, alignment: .trailing).opacity(0.7)
-                    Text(share(s.weight, s.low, lowTotal)).frame(width: 96, alignment: .trailing).opacity(0.7)
+                    cell(units.temperatureString(s.high), share(s.weight, s.high, highTotal))
+                    cell(units.temperatureString(s.low), share(s.weight, s.low, lowTotal))
                 }
                 .font(.callout.monospacedDigit())
                 .padding(.vertical, 7)
@@ -406,9 +409,8 @@ struct ModuleDetailView: View {
             Divider().overlay(Color.white.opacity(0.2))
             HStack {
                 Text("Skyline blend").font(.callout.weight(.semibold)).frame(maxWidth: .infinity, alignment: .leading)
-                Text(units.temperatureString(d.high)).frame(width: 50, alignment: .trailing)
-                Text(units.temperatureString(d.low)).frame(width: 50, alignment: .trailing)
-                Text("").frame(width: 196)
+                Text(units.temperatureString(d.high)).frame(width: 92, alignment: .trailing)
+                Text(units.temperatureString(d.low)).frame(width: 92, alignment: .trailing)
             }
             .font(.callout.weight(.semibold).monospacedDigit())
             .padding(.vertical, 7)
