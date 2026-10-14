@@ -76,3 +76,141 @@ public enum AccuracySync {
         return out
     }
 }
+
+// MARK: Build 32: separate compact file + generation-counted reset (code review H1, H3)
+
+/// "Reset Accuracy Data" as a generation counter (H3). The highest generation wins, so a later reset
+/// always replaces an earlier one, even one stamped by a Mac whose clock was far ahead. `at` drops the
+/// pairs issued before the reset; readers clamp a future `at` to their own clock.
+public struct AccuracyReset: Codable, Equatable, Sendable {
+    public var generation: Int
+    public var at: Date
+
+    public init(generation: Int, at: Date) { self.generation = generation; self.at = at }
+
+    /// Clock tolerance between Macs before a reset stamp counts as future-dated.
+    public static let futureTolerance: TimeInterval = 10 * 60
+
+    /// `at` no later than `now` + tolerance (a Mac whose clock runs ahead can't block learning).
+    public func clamped(now: Date) -> AccuracyReset {
+        var r = self
+        if r.at > now.addingTimeInterval(Self.futureTolerance) { r.at = now }
+        r.at = Date(timeIntervalSince1970: r.at.timeIntervalSince1970.rounded(.down))
+        return r
+    }
+
+    /// The reset that wins: higher generation; same generation, the earlier stamp (keeps more data,
+    /// same answer on every Mac).
+    public static func winner(_ a: AccuracyReset?, _ b: AccuracyReset?) -> AccuracyReset? {
+        guard let a else { return b }
+        guard let b else { return a }
+        if a.generation != b.generation { return a.generation > b.generation ? a : b }
+        return a.at <= b.at ? a : b
+    }
+}
+
+/// `iCloud Drive/Skyline/accuracy.json`: the shared verified pairs, kept out of sync.json so city and
+/// settings syncs stay ~1 KB and the pairs are only rewritten when new ones exist (H1). Compact
+/// encoding: no pretty-printing, epoch-second integers, short keys, one array per model.
+public struct AccuracyFile: Equatable, Sendable {
+    public static let currentFormat = 1
+    public var format = AccuracyFile.currentFormat
+    public var reset: AccuracyReset?
+    public var pairs: [VerifiedRecord] = []
+
+    public init(reset: AccuracyReset? = nil, pairs: [VerifiedRecord] = []) {
+        self.reset = reset; self.pairs = pairs
+    }
+
+    public func encoded() throws -> Data {
+        let e = JSONEncoder()
+        e.outputFormatting = [.sortedKeys]
+        return try e.encode(Wire(self))
+    }
+
+    /// Nil for a file that isn't a readable accuracy file (or a newer format).
+    public static func decode(_ data: Data) -> AccuracyFile? {
+        guard let w = try? JSONDecoder().decode(Wire.self, from: data), w.v <= currentFormat else { return nil }
+        return w.file
+    }
+
+    /// Merge this Mac's pairs with the file's (and any iCloud conflict versions).
+    /// - Returns: the merged file, and whether it holds anything the file lacked (only then is it worth
+    ///   writing; pairs dropped only because the 30-day window moved don't count).
+    public static func merge(local: AccuracyFile, remote: AccuracyFile?, now: Date) -> (file: AccuracyFile, hasNew: Bool) {
+        let reset = AccuracyReset.winner(local.reset?.clamped(now: now), remote?.reset?.clamped(now: now))
+        let pairs = AccuracySync.merge(local.pairs, remote?.pairs ?? [], resetAt: reset?.at, now: now)
+        let out = AccuracyFile(reset: reset, pairs: pairs)
+        guard let remote else { return (out, !pairs.isEmpty || reset != nil) }
+        // Compare with the file pruned by the same rules (same `now`), so window drops aren't "new".
+        let remotePruned = AccuracySync.merge(remote.pairs, [], resetAt: reset?.at, now: now)
+        let hasNew = reset != remote.reset?.clamped(now: now) || pairs != remotePruned
+        return (out, hasNew)
+    }
+
+    // MARK: Wire format
+
+    /// {"v":1,"reset":{"g":gen,"at":epoch},"locs":[...],"models":[...],
+    ///  "g":[{"l":locIndex,"i":issuedEpoch,"r":[[validMinusIssued, obsT, obsW, obsWet, obsP,
+    ///                                           modelIndex, t, pop, p, w, modelIndex, ...], ...]}]}
+    /// Rows are grouped by issuance (one location/issue time shared by ~21 rows); location and model
+    /// names are stored once. Values are kept at full precision (scores are unchanged); null = missing.
+    private struct Wire: Codable {
+        var v: Int
+        var reset: ResetWire?
+        var locs: [String]
+        var models: [String]
+        var g: [Group]
+
+        struct ResetWire: Codable { var g: Int; var at: Int64 }
+        struct Group: Codable { var l: Int; var i: Int64; var r: [[Double?]] }
+
+        init(_ f: AccuracyFile) {
+            v = f.format
+            reset = f.reset.map { ResetWire(g: $0.generation, at: Int64($0.at.timeIntervalSince1970.rounded(.down))) }
+            locs = Array(Set(f.pairs.map(\.r.loc))).sorted()
+            models = Array(Set(f.pairs.flatMap(\.r.f.keys))).sorted()
+            let locIndex = Dictionary(uniqueKeysWithValues: locs.enumerated().map { ($1, $0) })
+            let modelIndex = Dictionary(uniqueKeysWithValues: models.enumerated().map { ($1, $0) })
+            struct Key: Hashable { var l: Int; var i: Int64 }
+            var groups: [Key: [[Double?]]] = [:]
+            var order: [Key] = []
+            for p in f.pairs {
+                let issued = Int64(p.r.issued.timeIntervalSince1970.rounded(.down))
+                let valid = Int64(p.r.valid.timeIntervalSince1970.rounded(.down))
+                let key = Key(l: locIndex[p.r.loc]!, i: issued)
+                var row: [Double?] = [Double(valid - issued), p.o.t, p.o.w, p.o.wet.map { $0 ? 1 : 0 }, p.o.p]
+                for name in p.r.f.keys.sorted() {
+                    let s = p.r.f[name]!
+                    row += [Double(modelIndex[name]!), s.t, s.pop, s.p, s.w]
+                }
+                if groups[key] == nil { order.append(key) }
+                groups[key, default: []].append(row)
+            }
+            g = order.map { Group(l: $0.l, i: $0.i, r: groups[$0]!) }
+        }
+
+        var file: AccuracyFile? {
+            var pairs: [VerifiedRecord] = []
+            for group in g {
+                guard locs.indices.contains(group.l) else { return nil }
+                let issued = Date(timeIntervalSince1970: TimeInterval(group.i))
+                for row in group.r {
+                    guard row.count >= 5, (row.count - 5) % 5 == 0, let d = row[0] else { return nil }
+                    var f: [String: SourceValues] = [:]
+                    var k = 5
+                    while k < row.count {
+                        guard let m = row[k], m >= 0, Int(m) < models.count else { return nil }
+                        f[models[Int(m)]] = SourceValues(t: row[k + 1], pop: row[k + 2], p: row[k + 3], w: row[k + 4])
+                        k += 5
+                    }
+                    pairs.append(VerifiedRecord(
+                        ForecastRecord(loc: locs[group.l], issued: issued, valid: issued.addingTimeInterval(d), f: f),
+                        ObservedHour(t: row[1], w: row[2], wet: row[3].map { $0 != 0 }, p: row[4])))
+                }
+            }
+            return AccuracyFile(reset: reset.map { AccuracyReset(generation: $0.g, at: Date(timeIntervalSince1970: TimeInterval($0.at))) },
+                                pairs: AccuracySync.merge(pairs, []))
+        }
+    }
+}

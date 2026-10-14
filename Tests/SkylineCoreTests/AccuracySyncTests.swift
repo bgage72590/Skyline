@@ -54,25 +54,20 @@ final class AccuracySyncTests: XCTestCase {
         XCTAssertEqual(AccuracySync.merge([old], [new], now: t0.addingTimeInterval(41 * 86400)).count, 1, "30-day window")
     }
 
-    func testSyncDocumentMergeAndOldFileCompatibility() throws {
+    func testSyncDocumentDropsBuild31AccuracyAndOldFilesStillDecode() throws {
+        // Build 32 (H1): pairs moved to accuracy.json; a build-31 sync.json still reads, and merging drops them.
         var local = SyncDocument(); local.accuracy = [pair(issued: 0, valid: 3600, [.blend: SourceValues(t: 1)])]
-        var remote = SyncDocument(); remote.accuracy = [pair(issued: 600, valid: 3600, [.ecmwf: SourceValues(t: 2)]),
-                                                          pair(issued: 0, valid: 7200, [.blend: SourceValues(t: 3)])]
+        var remote = SyncDocument(); remote.accuracy = [pair(issued: 600, valid: 3600, [.ecmwf: SourceValues(t: 2)])]
+        remote.accuracyResetAt = t0
+        let back = try XCTUnwrap(SyncDocument.decode(try remote.encoded()))
+        XCTAssertEqual(back.accuracy?.count, 1)
         let m = SyncDocument.merge(local: local, remote: remote, now: t0.addingTimeInterval(86400))
-        XCTAssertEqual(m.accuracy?.count, 2)
-        XCTAssertEqual(SyncDocument.merge(local: remote, remote: local, now: t0.addingTimeInterval(86400)).accuracy, m.accuracy)
-        // Round trip through the file encoding is stable.
-        let back = try XCTUnwrap(SyncDocument.decode(try m.encoded()))
-        XCTAssertEqual(back.accuracy, m.accuracy)
-        // A file from a build without the field still decodes; the field is optional.
+        XCTAssertNil(m.accuracy); XCTAssertNil(m.accuracyResetAt)
+        XCTAssertFalse(m.sameContent(as: remote), "so the next write shrinks a build-31 file")
+        XCTAssertFalse(String(decoding: try m.encoded(), as: UTF8.self).contains("accuracy"))
         let old = #"{"format":1,"locations":[],"locationStamps":{},"removed":{},"settings":{},"settingStamps":{},"writtenBy":"","writtenAt":"2026-10-14T00:00:00Z"}"#
-        let decoded = try XCTUnwrap(SyncDocument.decode(Data(old.utf8)))
-        XCTAssertNil(decoded.accuracy)
-        // An older build reading a new file: same struct minus the new keys must still decode it.
-        struct OldDoc: Decodable { var format: Int; var locations: [WeatherLocation]; var settings: [String: String] }
-        let d = JSONDecoder(); d.dateDecodingStrategy = .iso8601
-        XCTAssertNoThrow(try d.decode(OldDoc.self, from: try m.encoded()))
-        XCTAssertEqual(SyncDocument.currentFormat, 1, "no format bump, so older builds keep syncing")
+        XCTAssertNotNil(SyncDocument.decode(Data(old.utf8)))
+        XCTAssertEqual(SyncDocument.currentFormat, 1)
     }
 
     func testVerifierAbsorbsOtherMacAndPublishesPayload() async throws {
@@ -80,22 +75,23 @@ final class AccuracySyncTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         let clock = TestClock(t0.addingTimeInterval(86400))
         let v = ForecastVerifier(directory: dir, client: MockHTTPClient(), now: { clock.now })
-        let remote = [pair(issued: 0, valid: 3600, [.blend: SourceValues(t: 14)]),
-                      pair(issued: 3 * 3600, valid: 4 * 3600, [.blend: SourceValues(t: 15)])]
-        let changed1 = await v.absorb(remote, resetAt: nil)
-        let changed2 = await v.absorb(remote, resetAt: nil)
+        let remote = AccuracyFile(pairs: [pair(issued: 0, valid: 3600, [.blend: SourceValues(t: 14)]),
+                                          pair(issued: 3 * 3600, valid: 4 * 3600, [.blend: SourceValues(t: 15)])])
+        let changed1 = await v.absorb(remote)
+        let changed2 = await v.absorb(remote)
         XCTAssertTrue(changed1); XCTAssertFalse(changed2, "absorbing the same pairs again changes nothing")
-        let payload = await v.syncPayload()
-        XCTAssertEqual(payload.records.count, 2)
-        // Persisted: a fresh verifier on the same folder sees them.
+        let unsynced = await v.hasUnsyncedAccuracy
+        XCTAssertFalse(unsynced, "pairs from another Mac are not 'new here'")
+        let payload = await v.syncFile()
+        XCTAssertEqual(payload.pairs.count, 2)
         let v2 = ForecastVerifier(directory: dir, client: MockHTTPClient(), now: { clock.now })
-        let count = await v2.syncPayload().records.count
+        let count = await v2.syncFile().pairs.count
         XCTAssertEqual(count, 2)
-        // A reset on another Mac clears them here.
-        let changed3 = await v2.absorb([], resetAt: t0.addingTimeInterval(80000))
+        // A reset on another Mac (generation 1) clears them here.
+        let changed3 = await v2.absorb(AccuracyFile(reset: AccuracyReset(generation: 1, at: t0.addingTimeInterval(80000))))
         XCTAssertTrue(changed3)
-        let after = await v2.syncPayload()
-        XCTAssertEqual(after.records.count, 0)
-        XCTAssertEqual(after.resetAt, t0.addingTimeInterval(80000))
+        let after = await v2.syncFile()
+        XCTAssertEqual(after.pairs.count, 0)
+        XCTAssertEqual(after.reset, AccuracyReset(generation: 1, at: t0.addingTimeInterval(80000)))
     }
 }

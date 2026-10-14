@@ -22,10 +22,10 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     public var settingStamps: [String: Date] = [:]
     /// When the city order was last changed on purpose (optional so format-1 files still decode).
     public var orderStamp: Date?
-    /// Verified forecast/observation pairs shared between Macs (build 31, see `AccuracySync`). Optional and
-    /// unknown to older builds, which ignore it when reading (the sync format number is unchanged).
+    /// Build 31 only: verified pairs were shared here. Build 32 moved them to accuracy.json
+    /// (`AccuracyFile`); still decoded so a build-31 file reads, and dropped by `merge`.
     public var accuracy: [VerifiedRecord]?
-    /// Newest "Reset Accuracy Data" on any Mac: pairs issued before it are dropped everywhere.
+    /// Build 31 only (see `accuracy`).
     public var accuracyResetAt: Date?
     public var writtenBy: String = ""
     public var writtenAt: Date = .distantPast
@@ -124,11 +124,10 @@ public struct SyncDocument: Codable, Equatable, Sendable {
             out.settingStamps[key] = max(l, r)
             out.settings[key] = useRemote ? remote.settings[key] : local.settings[key]
         }
-        // Accuracy pairs: union without double counting; newest reset wins (max stamp).
-        out.accuracyResetAt = [local.accuracyResetAt, remote.accuracyResetAt].compactMap { $0 }.max()
-        if local.accuracy != nil || remote.accuracy != nil {
-            out.accuracy = AccuracySync.merge(local.accuracy ?? [], remote.accuracy ?? [], resetAt: out.accuracyResetAt, now: now)
-        }
+        // Build 32 (H1): accuracy pairs live in accuracy.json now. The build-31 fields are dropped here, so
+        // the next write shrinks sync.json back to cities and settings.
+        out.accuracy = nil
+        out.accuracyResetAt = nil
         return out
     }
 

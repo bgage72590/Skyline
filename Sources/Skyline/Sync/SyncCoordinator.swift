@@ -31,6 +31,8 @@ final class SyncCoordinator {
     private var observers: [NSObjectProtocol] = []
     private(set) var lastSynced: Date?
     private(set) var lastError: String?
+    /// accuracy.json next to sync.json (nil without iCloud Drive or a verifier).
+    @ObservationIgnored private var accuracySync: AccuracyFileSync?
 
     static func iCloudFolder() -> URL? {
         let docs = FileManager.default.homeDirectoryForCurrentUser
@@ -56,6 +58,11 @@ final class SyncCoordinator {
         self.fileURL = fileURL
         self.stateURL = stateURL
         if let data = try? Data(contentsOf: stateURL) { last = SyncDocument.decode(data) }
+        if let fileURL, let verifier = store.service.verifier {
+            let name = fileURL.lastPathComponent == "sync.json" ? "accuracy.json"
+                : fileURL.deletingPathExtension().lastPathComponent + "-accuracy.json"
+            accuracySync = AccuracyFileSync(url: fileURL.deletingLastPathComponent().appendingPathComponent(name), verifier: verifier)
+        }
     }
 
     private func begin() {
@@ -64,6 +71,7 @@ final class SyncCoordinator {
             // First run with sync (migration): everything this Mac has is kept and merged in.
             last = SyncDocument.migrating(locations: store.savedLocations, settings: currentSettings(), now: Date())
             pushNow()
+            syncAccuracy(force: true)
         } else {
             pullIfChanged(force: true)
         }
@@ -111,16 +119,7 @@ final class SyncCoordinator {
         pushing = true
         inFlight = local
         let io = SyncFileIO(url: fileURL, device: device)
-        let verifier = store.service.verifier
-        Task.detached(priority: .utility) { [weak self, local] in
-            var local = local
-            // Build 31: this Mac's recent accuracy pairs ride along (merged without double counting).
-            if let verifier {
-                let mine = await verifier.syncPayload()
-                local.accuracyResetAt = [local.accuracyResetAt, mine.resetAt].compactMap { $0 }.max()
-                local.accuracy = AccuracySync.merge(local.accuracy ?? [], mine.records,
-                                                    resetAt: local.accuracyResetAt, now: Date())
-            }
+        Task.detached(priority: .utility) { [weak self] in
             let outcome = io.mergeAndWrite(local)
             guard let self else { return }
             await self.finishPush(outcome)
@@ -152,7 +151,6 @@ final class SyncCoordinator {
                 pushAgain = true
             }
             lastError = note
-            absorbAccuracy(from: doc)
         case .waiting(let message), .failed(let message):
             lastError = message
         }
@@ -165,33 +163,25 @@ final class SyncCoordinator {
         guard let fileURL else { return }
         let date = (try? FileManager.default.attributesOfItem(atPath: fileURL.path))?[.modificationDate] as? Date
         if date == nil { try? FileManager.default.startDownloadingUbiquitousItem(at: fileURL) }
-        guard force || date != lastFileDate else { pushIfNewAccuracy(); return }
+        syncAccuracy(force: force)
+        guard force || date != lastFileDate else { return }
         pushNow()
     }
 
-    // MARK: Accuracy learning (build 31)
+    // MARK: Accuracy learning (build 32: accuracy.json, see AccuracyFileSync)
 
-    /// Merged pairs from the file go into this Mac's verifier, so its scorecard and weights include
-    /// what the other Macs verified.
-    private func absorbAccuracy(from doc: SyncDocument) {
-        guard let verifier = store.service.verifier, doc.accuracy != nil || doc.accuracyResetAt != nil else { return }
-        let records = doc.accuracy ?? [], reset = doc.accuracyResetAt
-        Task { [weak self] in
-            guard await verifier.absorb(records, resetAt: reset), let self else { return }
-            for location in self.store.allLocations { await self.store.refreshAccuracy(for: location) }
+    /// Reads accuracy.json when another Mac changed it and writes it when this Mac has new pairs, all off
+    /// the main thread (H1/H2). Then refreshes the scorecards if the local history changed.
+    private func syncAccuracy(force: Bool = false) {
+        guard let accuracySync else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            guard await accuracySync.run(force: force) else { return }
+            await self?.refreshAllAccuracy()
         }
     }
 
-    /// New pairs verified here (or a reset) since the last sync: send them even if nothing else changed.
-    private func pushIfNewAccuracy() {
-        guard let verifier = store.service.verifier, let last, !pushing else { return }
-        Task { [weak self] in
-            let mine = await verifier.syncPayload()
-            let reset = [last.accuracyResetAt, mine.resetAt].compactMap { $0 }.max()
-            let merged = AccuracySync.merge(last.accuracy ?? [], mine.records, resetAt: reset, now: Date())
-            guard merged != (last.accuracy ?? []) || reset != last.accuracyResetAt else { return }
-            self?.pushNow()
-        }
+    private func refreshAllAccuracy() async {
+        for location in store.allLocations { await store.refreshAccuracy(for: location) }
     }
 
     /// Persist the merged document as "last written" (state file + stamps) without touching the store.
@@ -201,11 +191,16 @@ final class SyncCoordinator {
         if let url = fileURL {
             lastFileDate = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
         }
-        if let data = try? doc.encoded() {
-            try? FileManager.default.createDirectory(at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? data.write(to: stateURL, options: .atomic)
+        // Encode and write off the main thread (H2); one serial queue keeps the writes in order.
+        let url = stateURL
+        Self.stateQueue.async {
+            guard let data = try? doc.encoded() else { return }
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: url, options: .atomic)
         }
     }
+
+    private static let stateQueue = DispatchQueue(label: "com.briangage.Skyline.sync-state", qos: .utility)
 
     private func apply(_ doc: SyncDocument) {
         remember(doc)

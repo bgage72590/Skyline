@@ -154,6 +154,7 @@ public actor ForecastVerifier {
         if !newPairs.isEmpty {
             verified.append(contentsOf: newPairs)
             append(newPairs, to: "verified.jsonl")
+            unsyncedPairs += newPairs.count
             cachedScores[key] = nil
             cachedWeights[key] = nil
         }
@@ -176,40 +177,62 @@ public actor ForecastVerifier {
         for name in ["pending.jsonl", "verified.jsonl", "meta.json"] {
             try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
         }
-        // Build 31: the reset travels to the other Macs through sync.json (AccuracySync).
-        resetAt = now()
+        // The reset travels to the other Macs through accuracy.json as the next generation (H3).
+        accuracyReset = AccuracyReset(generation: (accuracyReset?.generation ?? 0) + 1, at: now())
+        resetNeedsPush = true
+        unsyncedPairs = 0
         saveResetAt()
     }
 
-    // MARK: Sharing between Macs (build 31)
+    // MARK: Sharing between Macs (builds 31-32)
 
-    /// When "Reset Accuracy Data" last ran here or on another Mac (pairs issued earlier are dropped).
-    private var resetAt: Date?
+    /// The winning "Reset Accuracy Data" (this Mac's or another's); pairs issued earlier are dropped.
+    private var accuracyReset: AccuracyReset?
+    /// Pairs verified here since they were last written to accuracy.json (H1: push only when > 0).
+    private var unsyncedPairs = 0
+    /// A reset made here that accuracy.json doesn't have yet.
+    private var resetNeedsPush = false
 
-    /// The recent verified pairs and reset stamp to put in sync.json.
-    public func syncPayload() -> (records: [VerifiedRecord], resetAt: Date?) {
+    /// Whether this Mac has something accuracy.json lacks.
+    public var hasUnsyncedAccuracy: Bool { unsyncedPairs > 0 || resetNeedsPush }
+
+    /// This Mac's recent pairs and reset, ready to merge with accuracy.json (runs on this actor, off main).
+    public func syncFile() -> AccuracyFile {
         load()
-        return (AccuracySync.merge(verified, [], resetAt: resetAt, now: now()), resetAt)
+        return AccuracyFile(reset: accuracyReset, pairs: AccuracySync.merge(verified, [], resetAt: accuracyReset?.at, now: now()))
     }
 
-    /// Folds in pairs from the other Macs (de-duplicated, see `AccuracySync`) and a newer reset.
+    /// Pairs verified here that accuracy.json doesn't have yet.
+    public var unsyncedPairCount: Int { unsyncedPairs }
+    /// A reset made here that accuracy.json doesn't have yet.
+    public var hasUnsyncedReset: Bool { resetNeedsPush }
+
+    /// accuracy.json now holds what this Mac had when `syncFile()` was taken (`pairs` = the
+    /// `unsyncedPairCount` read then, so pairs verified meanwhile still count as unsynced).
+    public func markSynced(pairs: Int, reset: AccuracyReset?) {
+        unsyncedPairs = max(0, unsyncedPairs - pairs)
+        if reset == accuracyReset { resetNeedsPush = false }
+    }
+
+    /// Folds in pairs from the other Macs (de-duplicated, see `AccuracySync`) and a winning reset.
     /// Returns true when the local history changed.
     @discardableResult
-    public func absorb(_ records: [VerifiedRecord], resetAt remoteReset: Date?) -> Bool {
+    public func absorb(_ file: AccuracyFile) -> Bool {
         load()
         var changed = false
-        if let remoteReset, remoteReset > (resetAt ?? .distantPast) {
-            resetAt = remoteReset
+        let t = now()
+        if let incoming = file.reset?.clamped(now: t), AccuracyReset.winner(accuracyReset, incoming) != accuracyReset {
+            accuracyReset = incoming
             saveResetAt()
-            pending.removeAll { $0.issued < remoteReset }
+            pending.removeAll { $0.issued < incoming.at }
             writeAll(pending, to: "pending.jsonl")
             for key in meta.keys {
-                if let f = meta[key]?.firstIssued, f < remoteReset { meta[key]?.firstIssued = nil }
+                if let f = meta[key]?.firstIssued, f < incoming.at { meta[key]?.firstIssued = nil }
             }
             changed = true
         }
-        let cutoff = now().addingTimeInterval(-Self.retentionDays * 86400)
-        let merged = AccuracySync.merge(verified, records.filter { $0.r.valid >= cutoff }, resetAt: resetAt)
+        let cutoff = t.addingTimeInterval(-Self.retentionDays * 86400)
+        let merged = AccuracySync.merge(verified, file.pairs.filter { $0.r.valid >= cutoff }, resetAt: accuracyReset?.at)
         if changed || Set(merged) != Set(verified.map(AccuracySync.normalized)) {
             verified = merged
             writeAll(verified, to: "verified.jsonl")
@@ -226,7 +249,7 @@ public actor ForecastVerifier {
     }
 
     private func saveResetAt() {
-        guard let resetAt, let d = try? Self.encoder.encode(["resetAt": resetAt]) else { return }
+        guard let accuracyReset, let d = try? Self.encoder.encode(accuracyReset) else { return }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try? d.write(to: directory.appendingPathComponent("sync-reset.json"), options: .atomic)
     }
@@ -302,8 +325,13 @@ public actor ForecastVerifier {
         if verified.count != all.count { writeAll(verified, to: "verified.jsonl") } // prune
         if let data = try? Data(contentsOf: directory.appendingPathComponent("meta.json")),
            let m = try? Self.decoder.decode([String: Meta].self, from: data) { meta = m }
-        if let data = try? Data(contentsOf: directory.appendingPathComponent("sync-reset.json")),
-           let r = try? Self.decoder.decode([String: Date].self, from: data) { resetAt = r["resetAt"] }
+        if let data = try? Data(contentsOf: directory.appendingPathComponent("sync-reset.json")) {
+            if let r = try? Self.decoder.decode(AccuracyReset.self, from: data) {
+                accuracyReset = r
+            } else if let r = try? Self.decoder.decode([String: Date].self, from: data), let at = r["resetAt"] {
+                accuracyReset = AccuracyReset(generation: 1, at: at) // build-31 file
+            }
+        }
     }
 
     private static let encoder: JSONEncoder = {
