@@ -24,6 +24,9 @@ struct SkylineApp: App {
         .defaultSize(width: 1360, height: 860)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            CommandGroup(after: .appInfo) {
+                Button("Update Skyline…") { Updater.checkForUpdates() }
+            }
             // ⌘Q closes the window and leaves Skyline in the menu bar (batch 6); ⌥⌘Q really quits.
             CommandGroup(replacing: .appTermination) {
                 Button("Close Skyline Window") { AppExit.perform(.commandQ) }
@@ -158,6 +161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             GlobalHotkey.apply()
             AppExit.runQuitKeyTestIfRequested()
             GlobalHotkey.runTestIfRequested()
+            GlobalHotkey.showDropdownIfRequested()
         }
     }
 

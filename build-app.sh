@@ -50,6 +50,10 @@ cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 GIT_REV="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 1)"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GIT_REV" "$APP/Contents/Info.plist" >/dev/null
 printf 'APPL????' > "$APP/Contents/PkgInfo"
+# The verified installer ships inside the signed app, so "Update Skyline…" runs a copy whose integrity
+# the app's own signature covers (polish 2).
+cp "$ROOT/scripts/install-verified.sh" "$APP/Contents/Resources/install-verified.sh"
+chmod +x "$APP/Contents/Resources/install-verified.sh"
 
 # Widget extension (T22): Contents/PlugIns/SkylineWidget.appex, a sandboxed WidgetKit extension that
 # only reads the forecast snapshot the app writes (no network).
@@ -183,7 +187,11 @@ if [[ $ZIP -eq 1 ]]; then
     ditto -c -k --sequesterRsrc --keepParent "$APP" "$ICLOUD_DIR/$APP_NAME.zip"
     # No installer script goes into iCloud any more: anything in that folder can be changed by whoever
     # can edit it. Install with a local copy of scripts/install-verified.sh (see README).
-    echo "    $ICLOUD_DIR/$APP_NAME.zip"
+    # Build number next to the zip so each Mac's "Update Skyline…" can tell there's something newer
+    # without unzipping. It only decides whether to offer; the installer still checks the signature
+    # and refuses anything that isn't newer than what's installed.
+    echo "$GIT_REV" > "$ICLOUD_DIR/$APP_NAME.version"
+    echo "    $ICLOUD_DIR/$APP_NAME.zip (build $GIT_REV)"
     if [[ -e "$ICLOUD_DIR/install.sh" ]]; then
       echo "    note: an old iCloud Drive/$APP_NAME/install.sh is still there (unverified installer); delete it by hand." >&2
     fi

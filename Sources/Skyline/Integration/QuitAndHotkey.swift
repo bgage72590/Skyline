@@ -159,6 +159,22 @@ enum GlobalHotkey {
         return nil
     }
 
+    /// Hidden QA hook: `-SkylineShowDropdown <seconds>` opens the dropdown panel once the forecast has
+    /// loaded and prints its window number (`[dropdown] window=N height=H`) for `screencapture -l N`.
+    static func showDropdownIfRequested() {
+        let delay = UserDefaults.standard.double(forKey: "SkylineShowDropdown")
+        guard delay > 0 else { return }
+        Task {
+            try? await Task.sleep(for: .seconds(delay))
+            fire()
+            try? await Task.sleep(for: .seconds(1))
+            if let panel {
+                print("[dropdown] window=\(panel.windowNumber) height=\(Int(panel.frame.height)) width=\(Int(panel.frame.width))")
+                fflush(stdout)
+            }
+        }
+    }
+
     /// Hidden QA hook: `-SkylineHotkeyTest YES` turns the hotkey on for this run, calls its handler
     /// in-process, checks the dropdown opened, logs PASS/FAIL and quits. No keystrokes are sent.
     static func runTestIfRequested() {
@@ -204,16 +220,20 @@ final class HotkeyPanel: NSPanel {
         isOpaque = false
         isReleasedWhenClosed = false
         hidesOnDeactivate = false
+        // Stays open while a screenshot is taken (QA hook only).
+        if UserDefaults.standard.double(forKey: "SkylineShowDropdown") > 0 { keepOpenForScreenshot = true }
         let host = NSHostingController(rootView: MenuBarContentView().environment(store))
         host.sizingOptions = [.preferredContentSize]
         contentViewController = host
         contentView?.wantsLayer = true
-        contentView?.layer?.cornerRadius = 10
+        contentView?.layer?.cornerRadius = 22
         contentView?.layer?.masksToBounds = true
         NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: self, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.close() }
+            MainActor.assumeIsolated { if self?.keepOpenForScreenshot != true { self?.close() } }
         }
     }
+
+    var keepOpenForScreenshot = false
 
     override var canBecomeKey: Bool { true }
 

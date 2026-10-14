@@ -101,6 +101,7 @@ struct MenuBarContentView: View {
                                        delta: { Int(store.units.temperatureDelta($0).rounded()) }))
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 if let change = InsightFormat.changes(report, units: store.units).first {
                     // "Tomorrow's high is down 5° since this morning" (T11).
                     Label(change, systemImage: change.contains(" up ") ? "arrow.up.right" : "arrow.down.right")
@@ -109,11 +110,13 @@ struct MenuBarContentView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 // Everything below the headline scrolls if the dropdown would be taller than the screen (T21).
-                ViewThatFits(in: .vertical) {
+                // ViewThatFits could pick the scrolling copy when the dropdown window first sizes itself
+                // and then show only a sliver of the details ("sparse" dropdown). FitOrScroll measures the
+                // content's natural height and scrolls only when it's really taller than the screen allows.
+                FitOrScroll(maxHeight: Self.maxDetailsHeight) {
                     details(report)
                     ScrollView { details(report) }.scrollIndicators(.automatic)
                 }
-                .frame(maxHeight: Self.maxDetailsHeight)
                 updatedLine(report)
             } else if let location = store.menuBarLocation {
                 if let error = store.errors[location.id], !store.isLoading(location) {
@@ -186,7 +189,7 @@ struct MenuBarContentView: View {
             .buttonStyle(.borderless)
         }
         .padding(14)
-        .frame(width: 320)
+        .frame(width: 344)
         .id(store.clockStyle)
         .foregroundStyle(.white)
         .background {
@@ -214,14 +217,30 @@ struct MenuBarContentView: View {
     @ViewBuilder
     private func details(_ report: WeatherReport) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            if Briefing.rainDueSoon(report, now: Date()) {
-                MiniNowcast(report: report).frame(height: 46)
-            }
+            rainCard(report)
             hourly(report)
-            chips(report)
-            daily(report)
+            conditionsGrid(report)
+            daily(report).menuGlass()
             otherLocations(report)
         }
+    }
+
+    /// When rain is next expected, with the 2-hour curve when it's close.
+    private func rainCard(_ report: WeatherReport) -> some View {
+        let now = Date()
+        let soon = Briefing.rainDueSoon(report, now: now)
+        let text = MenuSummary.rainTiming(report, now: now, hourLabel: { Fmt.hour($0, report.timeZone) })
+        return VStack(alignment: .leading, spacing: 6) {
+            if let text {
+                Label(text, systemImage: soon || report.current.condition.isPrecipitation ? "cloud.rain.fill" : "umbrella")
+                    .font(.callout.weight(.medium))
+                    .symbolRenderingMode(.multicolor)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if soon { MiniNowcast(report: report).frame(height: 46) }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .menuGlass()
     }
 
     /// "Updated 5 min ago" (ticks while the dropdown is open), or "Offline · Updated 2 h ago".
@@ -241,70 +260,96 @@ struct MenuBarContentView: View {
 
     private func header(_ report: WeatherReport) -> some View {
         HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 4) {
                     if report.location.isCurrentLocation { Image(systemName: "location.fill").font(.caption) }
-                    Text(report.location.name).font(.headline)
+                    Text(report.location.isCurrentLocation ? "My Location" : report.location.name).font(.headline)
+                        .lineLimit(1)
                 }
-                Text(report.current.condition.description).font(.callout).opacity(0.9)
+                if report.location.isCurrentLocation && report.location.name != "My Location" {
+                    Text(report.location.name).font(.caption).opacity(0.85).lineLimit(1)
+                }
+                Text(report.current.condition.description).font(.callout.weight(.medium))
+                Text("Feels like \(store.units.temperatureString(report.current.apparentTemperature))")
+                    .font(.callout).opacity(0.9)
                 if let today = report.today {
                     Text("H:\(store.units.temperatureString(today.high))  L:\(store.units.temperatureString(today.low))")
-                        .font(.callout)
+                        .font(.callout.weight(.medium)).monospacedDigit()
                 }
             }
-            Spacer()
-            HStack(spacing: 6) {
-                WeatherSymbol(condition: report.current.condition, isDay: report.current.isDay, size: 30)
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 0) {
+                WeatherSymbol(condition: report.current.condition, isDay: report.current.isDay, size: 34)
                 Text(store.units.temperatureString(report.current.temperature))
-                    .font(.system(size: 40, weight: .light))
+                    .font(.system(size: 50, weight: .thin))
+                    .monospacedDigit()
             }
         }
+        .padding(.horizontal, 2)
     }
 
     private func hourly(_ report: WeatherReport) -> some View {
-        let hours = Array(report.upcomingHours(count: 7).dropFirst())
+        let hours = Array(report.upcomingHours(count: 8).dropFirst().prefix(6))
         return HStack(spacing: 0) {
             ForEach(hours) { hour in
                 VStack(spacing: 4) {
-                    Text(Fmt.hour(hour.time, report.timeZone)).font(.caption2.weight(.semibold))
-                    WeatherSymbol(condition: hour.condition, isDay: hour.isDay, size: 16)
-                    Text(store.units.temperatureString(hour.temperature)).font(.callout.weight(.medium)).monospacedDigit()
+                    Text(Fmt.hour(hour.time, report.timeZone)).font(.caption2.weight(.semibold)).opacity(0.9)
+                    WeatherSymbol(condition: hour.condition, isDay: hour.isDay, size: 18)
+                        .frame(height: 20)
+                    Text(store.units.temperatureString(hour.temperature)).font(.callout.weight(.semibold)).monospacedDigit()
+                    let p = Int((hour.precipitationProbability ?? 0).rounded())
+                    Text(p >= 20 ? "\(p)%" : " ").font(.caption2.weight(.semibold))
+                        .foregroundStyle(Color(red: 0.55, green: 0.80, blue: 1.0))
                 }
                 .frame(maxWidth: .infinity)
             }
         }
-        .padding(.vertical, 8)
-        .background(.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(.vertical, 2)
+        .menuGlass()
     }
 
-    /// UV, air quality and peak gust at a glance.
-    private func chips(_ report: WeatherReport) -> some View {
+    /// Wind, humidity, UV, air quality, sunrise/sunset and pressure in a 3 × 2 grid of small tiles.
+    private func conditionsGrid(_ report: WeatherReport) -> some View {
+        let c = report.current
         let tz = report.timeZone
-        let gust = Briefing.peak(report.hourly.compactMap { h in h.windGust.map { (h.time, $0) } }, from: report.current.time, hours: 24)
-        return HStack(spacing: 6) {
-            if let uv = report.current.uvIndex {
-                chip("sun.max.fill", "UV \(Int(uv.rounded()))", UVScale.category(uv))
-            }
-            if let aq = report.airQuality {
-                chip("aqi.medium", "AQI \(aq.usAQI)", aq.category)
-            }
-            if let gust, gust.value > 0 {
-                // Unit in the value, the word in the caption, so the number is never what gets cut (UI/UX #10).
-                chip("wind", store.units.speedString(gust.value), "Gust · " + Fmt.hour(gust.time, tz))
+        let now = Date()
+        let gust = Briefing.peak(report.hourly.compactMap { h in h.windGust.map { (h.time, $0) } }, from: c.time, hours: 24)
+        var tiles: [(String, String, String, String)] = []  // symbol, title, value, caption
+        tiles.append(("wind", "Wind", store.units.speedString(c.windSpeed),
+                      c.windDirection.map { "from \(Compass.abbreviation($0))" + (gust.map { " · gusts \(store.units.speedString($0.value))" } ?? "") }
+                        ?? (gust.map { "gusts \(store.units.speedString($0.value))" } ?? "")))
+        tiles.append(("humidity.fill", "Humidity", "\(Int(c.humidity.rounded()))%",
+                      MenuSummary.comfort(dewPointC: c.dewPoint).map { "\($0) · dew \(store.units.temperatureString(c.dewPoint))" } ?? ""))
+        if let uv = c.uvIndex {
+            let peak = report.today?.uvIndexMax.map { " · max \(Int($0.rounded()))" } ?? ""
+            tiles.append(("sun.max.fill", "UV", "\(Int(uv.rounded()))", UVScale.category(uv) + peak))
+        }
+        if let aq = report.airQuality {
+            tiles.append(("aqi.medium", "Air quality", "\(aq.usAQI)", aq.category))
+        }
+        if let sun = MenuSummary.nextSunEvent(report, now: now) {
+            tiles.append((sun.isSunrise ? "sunrise.fill" : "sunset.fill", sun.isSunrise ? "Sunrise" : "Sunset",
+                          Fmt.time(sun.time, tz), Calendar.current.isDate(sun.time, inSameDayAs: now) ? "today" : "tomorrow"))
+        }
+        if tiles.count < 6, let p = c.pressure {
+            tiles.append(("gauge.with.dots.needle.50percent", "Pressure", store.units.pressureString(p), ""))
+        }
+        if tiles.count < 6, let rainToday = report.today?.precipitationProbability {
+            tiles.append(("drop.fill", "Rain today", "\(Int(rainToday.rounded()))%", ""))
+        }
+        let columns = [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)]
+        return LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
+            ForEach(Array(tiles.prefix(6).enumerated()), id: \.offset) { _, t in
+                VStack(alignment: .leading, spacing: 2) {
+                    Label(t.1, systemImage: t.0).font(.caption2.weight(.semibold)).opacity(0.85).lineLimit(1)
+                    Text(t.2).font(.callout.weight(.semibold)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.8)
+                    Text(t.3.isEmpty ? " " : t.3).font(.caption2).opacity(0.85).lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, minHeight: 58, alignment: .topLeading)
+                .menuGlass(cornerRadius: 14, padding: 8)
             }
         }
-    }
-
-    private func chip(_ symbol: String, _ value: String, _ caption: String) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Label(value, systemImage: symbol).font(.caption.weight(.semibold)).lineLimit(1)
-                .minimumScaleFactor(0.85)
-            Text(caption).font(.caption2).opacity(0.9).lineLimit(1)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     /// The other saved locations: one tap opens them in the main window.
@@ -335,8 +380,7 @@ struct MenuBarContentView: View {
                     .buttonStyle(.plain)
                 }
             }
-            .padding(.vertical, 4)
-            .background(.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .menuGlass(padding: 4)
         }
     }
 
@@ -396,5 +440,50 @@ struct MiniNowcast: View {
             .font(.caption2.weight(.medium)).opacity(0.9)
         }
         .accessibilityLabel(report.nowcastSummary(at: Date()) ?? "Rain in the next two hours")
+    }
+}
+
+extension View {
+    /// Dropdown card: Liquid Glass on macOS 26 and later, a frosted material on older systems (polish 3).
+    /// Static (no animation), so it costs nothing while the dropdown just sits open.
+    @ViewBuilder
+    func menuGlass(cornerRadius: CGFloat = 18, padding: CGFloat = 10) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        if #available(macOS 26.0, *) {
+            self.padding(padding)
+                .glassEffect(.regular.tint(.black.opacity(0.22)), in: shape)
+        } else {
+            self.padding(padding)
+                .background {
+                    ZStack {
+                        shape.fill(.ultraThinMaterial)
+                        shape.fill(Color.black.opacity(0.22))
+                    }
+                }
+                .overlay(shape.strokeBorder(.white.opacity(0.12), lineWidth: 0.5))
+        }
+    }
+}
+
+/// Shows the first subview at its natural height when that fits under `maxHeight`, else the second
+/// (a scrolling copy) at `maxHeight`. Pure layout: no state is written while measuring.
+struct FitOrScroll: Layout {
+    var maxHeight: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        let natural = content.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil))
+        return CGSize(width: proposal.width ?? natural.width, height: min(natural.height, maxHeight))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard subviews.count == 2 else { subviews.first?.place(at: bounds.origin, proposal: ProposedViewSize(bounds.size)); return }
+        let natural = subviews[0].sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
+        let fits = natural.height <= maxHeight + 0.5
+        let shown = fits ? subviews[0] : subviews[1]
+        let hidden = fits ? subviews[1] : subviews[0]
+        shown.place(at: bounds.origin, proposal: ProposedViewSize(width: bounds.width, height: bounds.height))
+        // The unused copy is laid out at zero size far outside the window, so it never draws over anything.
+        hidden.place(at: CGPoint(x: -100_000, y: -100_000), proposal: .zero)
     }
 }

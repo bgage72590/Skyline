@@ -207,6 +207,8 @@ final class WeatherStore {
         trackMenuBarImage()
         setUpNotifications()
         IntentStore.shared = self
+        // Saved cities and settings shared across Macs through iCloud Drive (polish 1).
+        if defaults === UserDefaults.standard { SyncCoordinator.start(store: self, defaults: defaults) }
         // Download-cache clean-up (entries older than 14 days), off the launch path.
         let service = self.service
         Task.detached(priority: .utility) {
@@ -434,6 +436,7 @@ final class WeatherStore {
 
     /// Called by the periodic loop and after wake.
     func refreshDue() async {
+        SyncCoordinator.shared?.pullIfChanged() // one stat; merges only when another Mac wrote
         var targets: [WeatherLocation] = []
         if let m = menuBarLocation { targets.append(m) }
         // Cities with warning/rain notifications stay current even with the window closed.
@@ -751,6 +754,45 @@ final class WeatherStore {
 
     private func persistLastFix(_ location: WeatherLocation) {
         if let data = try? JSONEncoder().encode(location) { defaults.set(data, forKey: Keys.lastFix) }
+    }
+
+    // MARK: Sync (polish 1)
+
+    /// The city list from another Mac (merged; nothing local is dropped unless it was removed there later).
+    func applySyncedLocations(_ locations: [WeatherLocation]) {
+        guard locations != savedLocations else { return }
+        savedLocations = locations
+        if let id = selectedID, id != WeatherLocation.currentLocationID, !allLocations.contains(where: { $0.id == id }) {
+            selectedID = allLocations.first?.id
+        }
+        Task { await refreshDue() }
+    }
+
+    /// Re-read the synced settings after another Mac changed them (only assigns what differs).
+    func reloadSyncedSettings() {
+        let preset = UnitPreference(rawValue: defaults.string(forKey: Keys.units) ?? "") ?? .system
+        if preset != unitPreset { unitPreset = preset }
+        let t = defaults.string(forKey: Keys.temperatureUnit).flatMap(TemperatureUnit.init(rawValue:))
+        if t != temperatureUnit { temperatureUnit = t }
+        let sp = defaults.string(forKey: Keys.speedUnit).flatMap(SpeedUnit.init(rawValue:))
+        if sp != speedUnit { speedUnit = sp }
+        let pr = defaults.string(forKey: Keys.precipitationUnit).flatMap(PrecipitationUnit.init(rawValue:))
+        if pr != precipitationUnit { precipitationUnit = pr }
+        let ps = defaults.string(forKey: Keys.pressureUnit).flatMap(PressureUnit.init(rawValue:))
+        if ps != pressureUnit { pressureUnit = ps }
+        let d = defaults.string(forKey: Keys.distanceUnit).flatMap(DistanceUnit.init(rawValue:))
+        if d != distanceUnit { distanceUnit = d }
+        let c = ClockStyle(rawValue: defaults.string(forKey: Keys.clock) ?? "") ?? .system
+        if c != clockStyle { clockStyle = c }
+        let m = defaults.integer(forKey: Keys.refresh)
+        if m >= 5, m != refreshMinutes { refreshMinutes = m }
+        let pin = defaults.string(forKey: Keys.menuBarPin)
+        if pin != menuBarPinID { menuBarPinID = pin }
+        let prefs = defaults.data(forKey: Keys.notifyPrefs).flatMap { try? JSONDecoder().decode(NotificationPrefs.self, from: $0) }
+            ?? NotificationPrefs()
+        if prefs != notificationPrefs { notificationPrefs = prefs }
+        let ids = (defaults.array(forKey: Keys.notifyIDs) as? [String]).map(Set.init)
+        if ids != notifyLocationIDs { notifyLocationIDs = ids }
     }
 
     private func persistLocations() {

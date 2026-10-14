@@ -20,7 +20,25 @@ The app is signed with a self-signed certificate kept in the build Mac's login k
 Signing", created once by `build-app.sh`; no Developer ID). Every build has the same designated
 requirement, so Location permission survives updates.
 
-### Installing on other Macs (verified)
+### Installing and updating on other Macs (the easy way)
+
+`./build-app.sh` on the build Mac (the MacBook Pro) puts `Skyline.zip` and `Skyline.version` in
+iCloud Drive/Skyline. Every other Mac then needs one command, once:
+
+```bash
+T=$(mktemp -d) && ditto -x -k ~/Library/Mobile\ Documents/com~apple~CloudDocs/Skyline/Skyline.zip "$T" && codesign --verify --strict --deep -R='identifier "com.briangage.Skyline" and certificate leaf = H"7e4d9f1dc62e5fc81f7d9c2b3f882a9eb15a28d6"' "$T/Skyline.app" && bash "$T/Skyline.app/Contents/Resources/install-verified.sh" "$T/Skyline.app"
+```
+
+It unzips to a temp folder, checks the app is signed by the build Mac's certificate (the hash is pinned
+in the command, so a swapped zip is refused), then runs the verified installer that ships inside the app.
+
+After that, updates are a menu item: **Skyline › Update Skyline…** (also in Settings › Sync & updates).
+It reads `Skyline.version`, and when iCloud has a newer build it asks, then runs the installer bundled
+in the installed (signed) app: signature check, refuses anything not newer, replaces
+`/Applications/Skyline.app` and relaunches. Nothing checks in the background. Location permission
+carries over because every build has the same signature identity.
+
+### Installing on other Macs (verified script, manual)
 
 The iCloud zip is only a transport: anyone who can edit that folder could swap it. So other Macs install
 with `scripts/install-verified.sh`, which unzips to a temp folder, checks the app is signed by the build
@@ -147,6 +165,15 @@ A new set of scans (every ~5 min) is built hidden and swapped in only once loade
 * **Model comparison.** "Model Comparison" (below Forecast Confidence) charts each model's next 48 h of
   temperature, NWS dashed, the Skyline blend in white. A Best Match that copies GFS/HRRR is one line.
 
+## Menu-bar dropdown
+
+Current conditions with feels-like and high/low, any alert (click for the full text), the day's headline,
+when rain is next expected (with the 2-hour curve when it's close), the next 6 hours with rain chances,
+a 3 × 2 grid (wind and gusts, humidity and dew point, UV, air quality, next sunrise/sunset, pressure),
+5 days, and your other cities. Cards use Liquid Glass (`glassEffect`) on macOS 26+ and a frosted
+material on older systems. It's drawn only while open: nothing animates and nothing runs while hidden.
+The details scroll only when they're taller than the screen (`FitOrScroll`, a pure layout).
+
 ## Widgets, Shortcuts and quitting (batch 6)
 
 - **Widgets** (small / medium / large): current conditions, next-2-hours rain line, 6-hour strip and
@@ -174,6 +201,24 @@ notification through Focus **only if** you allow it: System Settings › Notific
 time-sensitive notifications", and in each Focus, Skyline (or time-sensitive notifications) must be
 allowed. With the self-signed build this may not be offered at all; nothing can break through "Do Not
 Disturb" silently. Treat Skyline as a convenience, not your only warning source.
+
+## Synced cities and settings
+
+Saved cities and the settings worth keeping (units, clock, refresh interval, menu-bar city, notification
+choices) sync through **iCloud Drive/Skyline/sync.json** to every Mac on the same Apple Account. iCloud
+key-value storage would need an entitlement that only a paid developer account can sign, so a plain
+file in iCloud Drive is the transport (the app isn't sandboxed, so it can read and write there).
+
+- **Merging, not overwriting** (`SyncDocument`, tested in `PolishTests`): a city stays unless it was removed
+  later than it was last added or changed; removals carry a date so they reach the other Macs (kept 180
+  days); settings are last-writer-wins per key. The first launch of this build on each Mac counts all its
+  cities as added "now", so existing cities from every Mac are merged and none are lost.
+- **Never clobbers:** if the file exists but iCloud hasn't downloaded it yet, Skyline waits rather than
+  writing only its own cities.
+- **Cost:** no timers or file watchers. It writes ~2 s after a change and checks the file's date when the
+  app becomes active, after wake and on each forecast refresh.
+- Per-Mac on purpose: My Location, the selected city, window state, notification history and caches.
+- Settings › Sync & updates shows when it last synced (or why it can't) and has Sync Now.
 
 ## Privacy, security and hardening (batch 7)
 
@@ -205,6 +250,8 @@ directly); none is settable from the UI.
 | `-SkylinePlayRadar YES` | Start radar playback at launch |
 | `-SkylineStressTest <s>` / `-SkylineStressSeed <n>` / `-SkylineStressQuit YES` | In-process radar stress test; quit when done |
 | `-SkylineQuitKeyTest YES` | Sends ⌘Q through Skyline's own menu, checks the window closed and the app stayed in the menu bar, reopens, logs `[quit-test] PASS/FAIL`, quits |
+| `-SkylineShowDropdown <s>` | Opens the dropdown panel after N s and keeps it open; logs `[dropdown] window=N` for `screencapture -l N` |
+| `-SkylineSyncFile <path>` | Sync through this file instead of iCloud Drive (two-Mac tests on one Mac) |
 | `-SkylineHotkeyTest YES` | Calls the global-hotkey handler in-process, checks the dropdown opened, logs `[hotkey-test] PASS/FAIL`, quits |
 | `SkylineWidget --selftest` (in the appex) | Prints the snapshot path, city, age and whether it runs sandboxed |
 | `-SkylineScrollTest YES` | Scroll-position preservation check (`[scrolltest]`) |

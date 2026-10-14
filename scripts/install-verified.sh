@@ -10,6 +10,8 @@
 #   ~/bin/skyline-install                 # installs from iCloud Drive/Skyline/Skyline.zip
 #   ~/bin/skyline-install path/to/Skyline.zip | path/to/Skyline.app
 #   ~/bin/skyline-install --verify-only path/to/Skyline.app   # check only, install nothing
+#   ~/bin/skyline-install --newer-than 123 [zip]   # used by Skyline's "Update Skyline…": refuse to downgrade
+# Skyline.app also carries a copy (Contents/Resources/install-verified.sh), covered by its signature.
 set -euo pipefail
 
 APP_NAME="Skyline"
@@ -23,7 +25,9 @@ DEST="/Applications/$APP_NAME.app"
 DEFAULT_ZIP="$HOME/Library/Mobile Documents/com~apple~CloudDocs/$APP_NAME/$APP_NAME.zip"
 
 VERIFY_ONLY=0
+NEWER_THAN=""
 if [[ "${1:-}" == "--verify-only" ]]; then VERIFY_ONLY=1; shift; fi
+if [[ "${1:-}" == "--newer-than" ]]; then NEWER_THAN="$2"; shift 2; fi
 SRC="${1:-$DEFAULT_ZIP}"
 [[ -e "$SRC" ]] || { echo "Not found: $SRC (is iCloud Drive synced?)" >&2; exit 1; }
 
@@ -51,6 +55,13 @@ if ! codesign --verify --strict --deep -R="$REQUIREMENT" "$NEW" 2>"$TMP/verify.l
 fi
 echo "Signature OK: $REQUIREMENT"
 [[ $VERIFY_ONLY -eq 1 ]] && exit 0
+if [[ -n "$NEWER_THAN" ]]; then
+  NEW_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$NEW/Contents/Info.plist" 2>/dev/null || echo 0)"
+  if ! [[ "$NEW_BUILD" =~ ^[0-9]+$ ]] || (( NEW_BUILD <= NEWER_THAN )); then
+    echo "Not newer: build $NEW_BUILD vs installed $NEWER_THAN; nothing changed." >&2
+    exit 3
+  fi
+fi
 
 if pgrep -x "$APP_NAME" >/dev/null; then
   osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true

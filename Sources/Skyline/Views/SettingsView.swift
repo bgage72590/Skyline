@@ -91,6 +91,8 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            SyncSection()
+
             PrivacyEnergySection()
 
             Section("Data sources") {
@@ -236,6 +238,37 @@ enum LoginItem {
 }
 
 /// Settings › Privacy & energy (L23): what Skyline keeps, a reset, and how much it's doing.
+/// Polish 1 and 2: where cities and settings sync, and updating from the build Mac's iCloud zip.
+struct SyncSection: View {
+    @Environment(WeatherStore.self) private var store
+    @State private var tick = 0
+
+    var body: some View {
+        let sync = SyncCoordinator.shared
+        Section("Sync & updates") {
+            Text("Your cities, units, clock, refresh interval, menu-bar city and notification choices sync through iCloud Drive (Skyline/sync.json) to every Mac signed in to your Apple Account. Nothing is lost when two Macs change things: cities are merged.")
+                .font(.callout).foregroundStyle(.secondary)
+            HStack {
+                let _ = tick
+                if let error = sync?.lastError {
+                    Text(error).font(.caption).foregroundStyle(.orange)
+                } else if let date = sync?.lastSynced {
+                    Text("Synced \(date.formatted(.relative(presentation: .named))) · \(store.savedLocations.count) cities")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Sync Now") { sync?.pushNow(); tick += 1 }
+                    .disabled(sync?.fileURL == nil)
+            }
+            HStack {
+                Text("Build \(Updater.installedBuild)").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Update Skyline…") { Updater.checkForUpdates() }
+            }
+        }
+    }
+}
+
 struct PrivacyEnergySection: View {
     @Environment(WeatherStore.self) private var store
     @State private var confirmReset = false
