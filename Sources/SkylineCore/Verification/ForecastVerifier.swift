@@ -100,8 +100,13 @@ public actor ForecastVerifier {
     }
 
     public func record(_ records: [ForecastRecord], key: String) {
-        guard !records.isEmpty, wantsIssuance(key) else { return }
-        let t = now()
+        guard let issued = records.map(\.issued).min() else { return }
+        load()
+        // QA SF1 (build 32): gate on the forecast's issue time, not on when this call runs. The issue time
+        // is captured before the (detached, possibly delayed) recording task, so gating on `now()` let two
+        // issuances land minutes apart, and the accuracy merge then collapsed them (pairs dropped).
+        if let last = meta[key]?.lastIssued, issued.timeIntervalSince(last) < Self.issueInterval { return }
+        let t = issued
         pending.append(contentsOf: records)
         // Cap: never keep more than ~4 days of issuances waiting per location.
         let mine = pending.filter { $0.loc == key }

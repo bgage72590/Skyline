@@ -154,3 +154,35 @@ final class Build33MixedFleetTests: XCTestCase {
         XCTAssertEqual(n, 1)
     }
 }
+
+/// QA SF1 (build 32): the 3 h issuance gate uses the forecast's issue time.
+final class Build33IssueGateTests: XCTestCase {
+    let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+
+    func rows(issued: Date) -> [ForecastRecord] {
+        (1...21).map { ForecastRecord(loc: "nyc", issued: issued, valid: issued.addingTimeInterval(Double($0) * 3600),
+                                      f: ["blend": SourceValues(t: Double($0))]) }
+    }
+
+    func testDelayedRecordingCannotLandTwoIssuancesMinutesApart() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("skyline-sf1-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let clock = TestClock(t0)
+        let v = ForecastVerifier(directory: dir, client: MockHTTPClient(), now: { clock.now })
+        // Issuance A captured at t0 but recorded 3 h 5 min later (delayed task)...
+        clock.now = t0.addingTimeInterval(3 * 3600 + 300)
+        await v.record(rows(issued: t0), key: "nyc")
+        // ...issuance B captured 11 min after A's capture, recorded right away: same forecast, rejected.
+        await v.record(rows(issued: t0.addingTimeInterval(660)), key: "nyc")
+        // A real next issuance 3 h after A's issue time is accepted.
+        await v.record(rows(issued: t0.addingTimeInterval(3 * 3600)), key: "nyc")
+        let report = await v.report("nyc")
+        XCTAssertEqual(report.pendingForecasts, 42, "two issuances, 3 h apart by issue time")
+        // Every recorded pair survives the accuracy merge (none collapse).
+        clock.now = t0.addingTimeInterval(30 * 3600)
+        let obs = (0...30).map { StationObservation(time: t0.addingTimeInterval(Double($0) * 3600), temperatureC: 15, windKmh: nil, precipLastHourMM: nil, precipitating: false) }
+        await v.ingest(observations: obs, key: "nyc")
+        let verified = await v.syncFile().pairs.count
+        XCTAssertEqual(verified, 42)
+    }
+}
