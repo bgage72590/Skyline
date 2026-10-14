@@ -144,56 +144,47 @@ struct MenuBarContentView: View {
                 Text("Open Skyline to add a location.").frame(maxWidth: .infinity, minHeight: 80)
             }
             Rectangle().fill(.white.opacity(0.25)).frame(height: 0.5)
-            HStack {
-                Button("Open Skyline") {
-                    AppExit.showMainWindow(); GlobalHotkey.closePanel()
-                    NSApp.activate()
-                }
-                Button("Radar") {
-                    if let location = store.menuBarLocation { store.selectedID = location.id }
-                    store.activeModule = nil
-                    store.radarExpanded = true
-                    AppExit.showMainWindow(); GlobalHotkey.closePanel()
-                    NSApp.activate()
-                }
-                Spacer()
-                Button {
-                    store.toggleTemperatureUnit()
-                } label: {
-                    Text(store.units.temperature.label).font(.callout.weight(.semibold)).monospacedDigit()
-                }
-                .help("Switch to \(store.units.temperature == .fahrenheit ? "°C" : "°F")")
-                // SettingsLink is inert in the ⌃⌥W HotkeyPanel (no Settings scene there). Open the
-                // Settings window the AppKit way so the gear works from both the menu-bar dropdown
-                // and the hotkey panel (QA #3).
-                Button {
-                    AppExit.openSettings()
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-                .help("Settings (⌘,)")
-                Button("Update…") { Updater.checkForUpdates() }
-                    .help("Update Skyline from iCloud Drive")
-                if store.loadingIDs.isEmpty {
-                    Button {
-                        Task { await store.refreshAll(force: true) }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
+            // Build 35 footer (UI/UX spec "Footer layout fix"): seven controls no longer fit 316 pt, so the
+            // daily ones stay visible as 28 pt icons and the rare ones move into a "…" menu.
+            HStack(spacing: 0) {
+                Button("Open Skyline") { AppExit.showMainWindow(); GlobalHotkey.closePanel(); NSApp.activate() }
+                    .fixedSize()
+                Spacer(minLength: 16)
+                HStack(spacing: 8) {
+                    FooterIcon("map", help: "Radar") {
+                        if let l = store.menuBarLocation { store.selectedID = l.id }
+                        store.activeModule = nil; store.radarExpanded = true
+                        AppExit.showMainWindow(); GlobalHotkey.closePanel(); NSApp.activate()
                     }
-                    .help("Refresh")
-                } else {
-                    // Visible feedback while refreshing (T21).
-                    ProgressView().controlSize(.small).frame(width: 16, height: 16)
-                        .help("Refreshing…")
+                    Button { store.toggleTemperatureUnit() } label: {
+                        Text(store.units.temperature.label).font(.callout.weight(.semibold)).monospacedDigit()
+                            .frame(minWidth: 28, minHeight: 28).contentShape(Rectangle())
+                    }
+                    .help("Switch to \(store.units.temperature == .fahrenheit ? "°C" : "°F")")
+                    if store.loadingIDs.isEmpty {
+                        FooterIcon("arrow.clockwise", help: "Refresh") { Task { await store.refreshAll(force: true) } }
+                    } else {
+                        ProgressView().controlSize(.small).frame(width: 28, height: 28).help("Refreshing…")
+                    }
+                    Menu {
+                        // SettingsLink is inert in the ⌃⌥W HotkeyPanel, so Settings opens the AppKit way (QA #3).
+                        Button("Settings…") { AppExit.openSettings() }
+                        Button("Check for Updates…") { Updater.checkForUpdates() }
+                        Divider()
+                        Button("Quit Skyline") { AppExit.perform(.menuBarQuit) }
+                            .help("Quit Skyline completely (closing the window or ⌘Q keeps it in the menu bar)")
+                    } label: {
+                        Image(systemName: "ellipsis.circle").frame(minWidth: 28, minHeight: 28).contentShape(Rectangle())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("More: Settings, Updates, Quit")
                 }
-                Button {
-                    AppExit.perform(.menuBarQuit)
-                } label: {
-                    Label("Quit Skyline", systemImage: "power").labelStyle(.titleAndIcon).font(.caption)
-                }
-                .help("Quit Skyline completely (closing the window or ⌘Q keeps it in the menu bar)")
             }
             .buttonStyle(.borderless)
+            .controlSize(.regular)
+            .padding(.top, 8)
         }
         .padding(14)
         .frame(width: 344)
@@ -490,5 +481,17 @@ struct FitOrScroll: Layout {
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
         subviews.first?.place(at: bounds.origin, proposal: ProposedViewSize(width: bounds.width, height: bounds.height))
+    }
+}
+
+/// 28 pt icon button for the dropdown footer (build 35).
+private struct FooterIcon: View {
+    let symbol: String, help: String, action: () -> Void
+    init(_ symbol: String, help: String, action: @escaping () -> Void) { self.symbol = symbol; self.help = help; self.action = action }
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol).frame(minWidth: 28, minHeight: 28).contentShape(Rectangle())
+        }
+        .help(help)
     }
 }
