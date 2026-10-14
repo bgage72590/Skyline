@@ -609,7 +609,12 @@ final class RadarLayerView: NSView {
         guard follows, newIndex != index else { return }
         index = newIndex
         publishShownFrame()
-        request(Array(keep), in: active, frames: [index])
+        if let g = active { request(TileMath.tiles(covering: visibleRectNow(), z: zoom, margin: 1), in: g, frames: Array(ringFrames(g))) }
+    }
+
+    private func visibleRectNow() -> MapRectValue {
+        guard let map else { return MapRectValue(x: 0, y: 0, width: 0, height: 0) }
+        return visibleRect(map.visibleMapRect)
     }
 
     func setOpacity(_ value: Float) {
@@ -675,6 +680,17 @@ final class RadarLayerView: NSView {
         return order
     }
 
+    /// Frames that keep the one-tile edge ring: the shown frame and the next three the loop will show
+    /// (radar-pan-diagnosis fix 1, "shown + 2-3"), which keeps the playing loop under the ~350 MB ceiling.
+    /// Every other held frame keeps its full on-screen set at full zoom; nothing is pruned mid-gesture.
+    static let ringAhead = 3
+    private func ringFrames(_ g: Generation) -> Set<Int> {
+        guard !g.frames.isEmpty else { return [] }
+        let shown = shownIndex(g)
+        guard follows, playback?.holdsLoop == true else { return [shown] }
+        return Set((0...Self.ringAhead).map { (shown + $0) % g.frames.count })
+    }
+
     /// Mid-gesture: MapKit already moves the radar with the map, so nothing is repositioned. Loading the
     /// newly exposed edge is coalesced to at most one pass per 150 ms, and nothing is pruned until the
     /// gesture settles (diagnosis fixes 1 and 5).
@@ -705,9 +721,11 @@ final class RadarLayerView: NSView {
         var shownChanged = false
         for g in [active, pending].compactMap({ $0 }) {
             let needed = neededFrames(g)
-            request(ring, in: g, frames: needed)
+            let ringed = ringFrames(g)
+            request(ring, in: g, frames: needed.filter { ringed.contains($0) })
+            request(desired, in: g, frames: needed.filter { !ringed.contains($0) })
             if doPrune {
-                for i in g.frames.indices where prune(g, i, needed: needed.contains(i)) && g === active && i == shownIndex(g) {
+                for i in g.frames.indices where prune(g, i, needed: needed.contains(i), ring: ringed.contains(i)) && g === active && i == shownIndex(g) {
                     shownChanged = true
                 }
             }
@@ -761,11 +779,12 @@ final class RadarLayerView: NSView {
     /// Drops tiles outside the ring, frames this view no longer needs, and other-zoom placeholders once
     /// the current zoom is complete. Only runs once a gesture settles. Returns whether anything went.
     @discardableResult
-    private func prune(_ g: Generation, _ i: Int, needed: Bool) -> Bool {
+    private func prune(_ g: Generation, _ i: Int, needed: Bool, ring: Bool = true) -> Bool {
         let complete = g.isComplete(i, desired: desired)
+        let onScreen = ring ? keep : Set(desired)
         var removed = 0
         for key in Array(g.tiles[i].keys) {
-            let stale = !needed || (key.z == zoom ? !keep.contains(key) : complete)
+            let stale = !needed || (key.z == zoom ? !onScreen.contains(key) : complete)
             if stale { g.tiles[i][key] = nil; removed += 1 }
         }
         Self.liveTiles -= removed
