@@ -71,7 +71,9 @@ public actor WeatherService {
     // MARK: Public API
 
     public func report(for location: WeatherLocation, forceRefresh: Bool = false) async throws -> WeatherReport {
-        let key = location.id + (forceRefresh ? "!" : "")
+        // The coordinate is part of the key: My Location keeps its id while it moves, and a second fix
+        // during a slow load must not get the old place's report (QA #13).
+        let key = location.id + "@\(location.coordinate.latitude),\(location.coordinate.longitude)" + (forceRefresh ? "!" : "")
         if let existing = inFlight[key] { return try await existing.value }
         let task = Task { try await self.buildReport(for: location, forceRefresh: forceRefresh) }
         inFlight[key] = task

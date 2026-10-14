@@ -68,11 +68,29 @@ public enum USCoverage {
         return nil
     }
 
-    /// True when the saved place's country is known to be the US or an NWS-served territory.
+    /// True when the saved place's country is known to be the US or an NWS-served territory, in English
+    /// or in any language the system knows (QA batch 7 N2: a city saved with "Estados Unidos" and no code).
     public static func isKnownUS(country: String?) -> Bool {
         guard let c = country?.trimmingCharacters(in: .whitespaces).lowercased(), !c.isEmpty else { return false }
-        return usCountries.contains(c)
+        return usCountries.contains(c) || localizedUSNames.contains(c)
     }
+
+    /// The names of the US and its territories in every locale, built once on first use.
+    static let localizedUSNames: Set<String> = {
+        var names: Set<String> = ["estados unidos", "estados unidos de américa", "vereinigte staaten", "états-unis",
+                                  "etats-unis", "stati uniti", "verenigde staten", "stany zjednoczone", "アメリカ合衆国",
+                                  "美国", "美國", "미국", "соединённые штаты", "соединенные штаты америки", "förenta staterna",
+                                  "usa", "ee. uu.", "eeuu", "eua"]
+        var languages = Set(Locale.availableIdentifiers.map { Locale(identifier: $0).language.languageCode?.identifier ?? $0 })
+        languages.insert("en")
+        for lang in languages {
+            let loc = Locale(identifier: lang)
+            for code in usCodes {
+                if let n = loc.localizedString(forRegionCode: code)?.lowercased(), !n.isEmpty { names.insert(n) }
+            }
+        }
+        return names
+    }()
     /// The old coarse boxes: only used when the country is known to be the US, where a border-hugging
     /// outline can only cause false negatives (Calais ME, Port Huron MI, Roma TX lost NWS + warnings).
     static func inCoarseCONUS(_ c: Coordinate) -> Bool {
@@ -88,7 +106,7 @@ public enum USCoverage {
     /// True when the saved place's country is known and isn't the US (nil/empty = unknown).
     public static func isKnownOutsideUS(country: String?) -> Bool {
         guard let c = country?.trimmingCharacters(in: .whitespaces).lowercased(), !c.isEmpty else { return false }
-        return !usCountries.contains(c)
+        return !usCountries.contains(c) && !localizedUSNames.contains(c)
     }
 
     /// Ray casting on longitude/latitude.

@@ -23,7 +23,9 @@ public enum IntentText {
     public static func staleNote(_ report: WeatherReport, now: Date) -> String {
         guard report.isOfflineFallback || now.timeIntervalSince(report.dataAsOf) > 3600 else { return "" }
         let f = DateFormatter(); f.timeZone = report.timeZone; f.locale = Locale(identifier: "en_US_POSIX")
-        let cal = Calendar.current
+        // Same-day check in the city's own zone too, so Tokyo at 11 PM there isn't "today" by the Mac's clock (N1).
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = report.timeZone
+        f.calendar = cal
         f.dateFormat = cal.isDate(report.dataAsOf, inSameDayAs: now) ? "h:mm a" : "EEE h:mm a"
         return " (as of \(f.string(from: report.dataAsOf)))"
     }

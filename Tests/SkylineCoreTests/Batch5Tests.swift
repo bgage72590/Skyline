@@ -353,8 +353,11 @@ final class Batch5Tests: XCTestCase {
         XCTAssertNil(try SPCOutlookParser.outlook(data, day: 1, point: Coordinate(latitude: 47, longitude: -120)))
         let o = try XCTUnwrap(SPCOutlookParser.outlook(data, day: 1, point: Coordinate(latitude: 35, longitude: -90)))
         XCTAssertEqual(o.validUntil, ISO8601DateFormatter().date(from: "2026-10-13T12:00:00Z"))
-        XCTAssertEqual(o.sentence(now: fixtureTime, timeZone: ny), "Slight risk of severe storms today (level 2 of 5)")
-        XCTAssertEqual(o.sentence(now: fixtureTime.addingTimeInterval(9 * 3600), timeZone: ny), "Slight risk of severe storms tonight (level 2 of 5)")
+        // The fixture is valid Oct 12 12Z; fixtureTime is Oct 11, so the wording is checked on the 12th (CR batch 7).
+        let oct12 = fixtureTime.addingTimeInterval(86400)
+        XCTAssertEqual(o.sentence(now: fixtureTime, timeZone: ny), "Slight risk of severe storms tomorrow (level 2 of 5)")
+        XCTAssertEqual(o.sentence(now: oct12, timeZone: ny), "Slight risk of severe storms today (level 2 of 5)")
+        XCTAssertEqual(o.sentence(now: oct12.addingTimeInterval(9 * 3600), timeZone: ny), "Slight risk of severe storms tonight (level 2 of 5)")
         XCTAssertFalse(SevereOutlook(day: 1, risk: .thunder, validFrom: fixtureTime, validUntil: fixtureTime).isSevere)
         // The real SPC file (Oct 12 01Z) decodes.
         XCTAssertNoThrow(try SPCOutlookParser.outlook(try Fixture.data("spc_day1_live"), day: 1, point: nyc.coordinate))

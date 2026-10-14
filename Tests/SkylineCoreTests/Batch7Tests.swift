@@ -132,7 +132,7 @@ final class Batch7Tests: XCTestCase {
         let german = WeatherLocation(name: "Eastport", country: "Vereinigte Staaten", coordinate: c, countryCode: "US")
         XCTAssertTrue(german.isLikelyInNWSCoverage && german.isInCONUS, "a German placemark name still counts as US")
         let nameOnly = WeatherLocation(name: "Eastport", country: "Vereinigte Staaten", coordinate: c)
-        XCTAssertFalse(nameOnly.isLikelyInNWSCoverage, "the old name-only path is what the code fixes")
+        XCTAssertTrue(nameOnly.isLikelyInNWSCoverage, "localized names count too now (QA N2)")
         let windsor = WeatherLocation(name: "Windsor", country: "Kanada", coordinate: Coordinate(latitude: 42.30, longitude: -83.02),
                                       countryCode: "CA")
         XCTAssertFalse(windsor.isLikelyInNWSCoverage || windsor.isInCONUS)
@@ -147,16 +147,19 @@ final class Batch7Tests: XCTestCase {
     }
 
     func testSevereOutlookWordingAfterMidnight() {
+        // Valid times as SPC issues them (Day 1 12Z–12Z; Day 2 from the next 12Z), for Oct 14, 2026.
         let ny = TimeZone(identifier: "America/New_York")!
-        var cal = Calendar(identifier: .gregorian); cal.timeZone = ny
-        func at(_ h: Int) -> Date { cal.date(bySettingHour: h, minute: 30, second: 0, of: t0)! }
-        let d1 = SevereOutlook(day: 1, risk: .slight, validFrom: t0, validUntil: t0.addingTimeInterval(86400))
-        let d2 = SevereOutlook(day: 2, risk: .slight, validFrom: t0, validUntil: t0.addingTimeInterval(86400))
-        XCTAssertTrue(d1.sentence(now: at(10), timeZone: ny).contains("today"))
-        XCTAssertTrue(d1.sentence(now: at(19), timeZone: ny).contains("tonight"))
-        XCTAssertTrue(d1.sentence(now: at(1), timeZone: ny).contains("tonight"), "1:30 AM: last night's Day 1 is still running")
-        XCTAssertTrue(d2.sentence(now: at(14), timeZone: ny).contains("tomorrow"))
-        XCTAssertTrue(d2.sentence(now: at(1), timeZone: ny).contains("today"), "after midnight, Day 2 is the day starting")
+        let iso = ISO8601DateFormatter()
+        func d(_ s: String) -> Date { iso.date(from: s)! }
+        let d1 = SevereOutlook(day: 1, risk: .slight, validFrom: d("2026-10-14T12:00:00Z"), validUntil: d("2026-10-15T12:00:00Z"))
+        let d2 = SevereOutlook(day: 2, risk: .slight, validFrom: d("2026-10-15T12:00:00Z"), validUntil: d("2026-10-16T12:00:00Z"))
+        let lastNight = SevereOutlook(day: 1, risk: .slight, validFrom: d("2026-10-14T01:00:00Z"), validUntil: d("2026-10-14T12:00:00Z"))
+        XCTAssertTrue(d1.sentence(now: d("2026-10-14T14:30:00Z"), timeZone: ny).contains("today"))
+        XCTAssertTrue(d1.sentence(now: d("2026-10-14T23:30:00Z"), timeZone: ny).contains("tonight"))
+        XCTAssertTrue(lastNight.sentence(now: d("2026-10-14T05:30:00Z"), timeZone: ny).contains("tonight"), "1:30 AM: last night's Day 1 is still running")
+        XCTAssertTrue(d1.sentence(now: d("2026-10-14T08:30:00Z"), timeZone: ny).contains("today"), "4:30 AM: the new Day 1 starts at 8")
+        XCTAssertTrue(d2.sentence(now: d("2026-10-14T18:30:00Z"), timeZone: ny).contains("tomorrow"))
+        XCTAssertTrue(d2.sentence(now: d("2026-10-14T08:30:00Z"), timeZone: ny).contains("tomorrow"), "4:30 AM: the 06Z Day 2 is the 15th")
     }
 
     // MARK: L12 no text under 10 pt
