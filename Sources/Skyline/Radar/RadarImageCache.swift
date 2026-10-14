@@ -55,10 +55,10 @@ final class RadarImageCache {
         config.httpShouldSetCookies = false
         config.httpCookieStorage = nil
         session = URLSession(configuration: config)
-        // Decoded RGBA bytes; live tiles are held by their layers anyway, so this only bridges a frame
-        // dropped and re-requested soon after (8 MB ≈ 32 tiles; was 24 MB, RAM work F). `-SkylineDecodedCacheMB N` is a
-        // measurement hook for the playback-memory work.
-        images.totalCostLimit = max(4, UserDefaults.standard.object(forKey: "SkylineDecodedCacheMB") as? Int ?? 8) << 20
+        // Decoded RGBA bytes; live tiles are held by the radar view anyway, so this bridges tiles pruned
+        // after a pan and re-requested on pan-back without a network trip (32 MB ≈ 128 tiles; restored
+        // from 8 MB in build 35, radar-pan-diagnosis fix 3). `-SkylineDecodedCacheMB N` is a measurement hook.
+        images.totalCostLimit = max(4, UserDefaults.standard.object(forKey: "SkylineDecodedCacheMB") as? Int ?? 32) << 20
         pathMonitor.pathUpdateHandler = { [weak self] path in
             let ok = path.status == .satisfied
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.networkChanged(satisfied: ok) } }

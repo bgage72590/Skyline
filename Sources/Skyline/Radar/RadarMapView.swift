@@ -5,7 +5,7 @@ import QuartzCore
 import SwiftUI
 import SkylineCore
 
-/// MapKit base map + a Core Animation radar layer stack on top.
+/// MapKit base map with the radar as a MapKit overlay (build 35), alert outlines and the pin on top.
 ///
 /// Threading/layout rules (the cause of the 70dfb90 crash was breaking them):
 /// * Nothing in `updateNSView`, `layout()` or MKMapView delegate callbacks writes observed SwiftUI state
@@ -148,8 +148,14 @@ struct RadarMapView: NSViewRepresentable {
         }
 
         func mapViewDidChangeVisibleRegion(_ mapView: MKMapView) {
-            // Continuous during gestures: reposition layers only, keep the zoom level (no tile churn).
+            // Continuous during gestures: MapKit moves the radar itself; only the pin/alerts follow, and
+            // edge loading is coalesced (no pruning, no zoom change).
             container?.regionChanged(settled: false)
+        }
+
+        func mapView(_ mapView: MKMapView, rendererFor overlay: any MKOverlay) -> MKOverlayRenderer {
+            if let container, overlay === container.radar.overlay { return container.radar.makeRenderer() }
+            return MKOverlayRenderer(overlay: overlay)
         }
 
         func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
@@ -200,7 +206,7 @@ final class RadarMapContainer: NSView {
             map.additionalSafeAreaInsets = NSEdgeInsets(top: 0, left: 0, bottom: 84, right: 0)
         }
         addSubview(map)
-        addSubview(radar)
+        addSubview(radar) // invisible tile manager; the radar itself is drawn by MapKit
         addSubview(alertOverlay)
         addSubview(pin)
         radar.map = map
@@ -248,7 +254,7 @@ final class RadarMapContainer: NSView {
     }
 
     func regionChanged(settled: Bool) {
-        radar.updateTiles(allowZoomChange: settled)
+        if settled { radar.updateTiles(allowZoomChange: true) } else { radar.gestureMoved() }
         alertOverlay.relayout()
         layoutPin()
     }
@@ -411,54 +417,85 @@ final class PinView: NSView {
     }
 }
 
-/// Transparent, click-through view holding one CALayer per radar frame.
+/// The radar as a MapKit overlay (build 35): one world-sized overlay whose renderer paints the shown
+/// frame's decoded tiles. MapKit draws it in the same render pass as the base map, so the radar can't
+/// lag, slide or pop at the edges while panning or zooming (radar-pan-diagnosis cause 3).
+final class RadarOverlay: NSObject, MKOverlay {
+    let coordinate = CLLocationCoordinate2D(latitude: 0, longitude: 0)
+    let boundingMapRect = MKMapRect.world
+    func canReplaceMapContent() -> Bool { false }
+}
+
+/// What the renderer draws, swapped atomically from the main thread and read on MapKit's draw threads.
+final class RadarDrawState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tiles: [(TileKey, CGImage)] = []
+    func set(_ new: [(TileKey, CGImage)]) { lock.lock(); tiles = new; lock.unlock() }
+    func snapshot() -> [(TileKey, CGImage)] { lock.lock(); defer { lock.unlock() }; return tiles }
+}
+
+final class RadarOverlayRenderer: MKOverlayRenderer {
+    let state: RadarDrawState
+
+    init(overlay: RadarOverlay, state: RadarDrawState) {
+        self.state = state
+        super.init(overlay: overlay)
+    }
+
+    override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in context: CGContext) {
+        let tiles = state.snapshot()
+        guard !tiles.isEmpty else { return }
+        context.interpolationQuality = .medium
+        // Coarser tiles first, so finer ones (current zoom) paint over leftover placeholders.
+        for (key, image) in tiles.sorted(by: { $0.0.z < $1.0.z }) {
+            let r = TileMath.rect(key)
+            let tileRect = MKMapRect(x: r.x, y: r.y, width: r.width, height: r.height)
+            guard tileRect.intersects(mapRect) else { continue }
+            let cg = rect(for: tileRect)
+            context.saveGState()
+            // MapKit's context is y-down; CGImage draws y-up.
+            context.translateBy(x: cg.minX, y: cg.maxY)
+            context.scaleBy(x: 1, y: -1)
+            context.draw(image, in: CGRect(origin: .zero, size: cg.size))
+            context.restoreGState()
+        }
+    }
+}
+
+/// Radar tile manager: loads and holds each frame's decoded tiles and hands the shown frame to the
+/// MapKit overlay renderer. Invisible and click-through; it only borrows the container's size.
 final class RadarLayerView: NSView {
     nonisolated(unsafe) static var liveTiles = 0
     /// Tiles added since launch (measurement log: a steady loop should stop adding).
     nonisolated(unsafe) static var addedTiles = 0
-    weak var map: MKMapView?
+    weak var map: MKMapView? {
+        didSet { attachOverlay() }
+    }
 
-    /// Each map may hold at most this many decoded tiles (≈256 KB each → ~40 MB, plus its GPU copy).
-    /// Measurement hook `-SkylineTileBudget N` (playback-memory experiments); default unchanged.
+    /// Per-frame zoom budget (decoded tiles a single frame may cover). Playing no longer lowers the zoom
+    /// (build 35: quality first), so this only matters for huge windows.
     static let tileBudget = max(40, UserDefaults.standard.object(forKey: "SkylineTileBudget") as? Int ?? 160)
 
-    /// One prefetched set of frames. A new set (fresh scans) is built hidden as `pending` and only
-    /// swapped in once its tiles are loaded, so the radar never blanks.
+    let overlay = RadarOverlay()
+    let drawState = RadarDrawState()
+    private(set) var renderer: RadarOverlayRenderer?
+
+    /// One prefetched set of frames. A new set (fresh scans) is loaded in the background as `pending` and
+    /// only swapped in once its shown frame is loaded, so the radar never blanks.
     private final class Generation {
         let frames: [RadarFrame]
-        let root = CALayer()
-        var frameLayers: [CALayer] = []
-        var tiles: [[TileKey: CALayer]]
+        var tiles: [[TileKey: CGImage]]
         var requested: [Set<TileKey>]
         var missing: [Set<TileKey>]
 
         deinit { RadarLayerView.liveTiles -= tiles.reduce(0) { $0 + $1.count } }
 
-        init(frames: [RadarFrame], bounds: CGRect) {
+        init(frames: [RadarFrame]) {
             self.frames = frames
             tiles = Array(repeating: [:], count: frames.count)
             requested = Array(repeating: [], count: frames.count)
             missing = Array(repeating: [], count: frames.count)
-            root.frame = bounds
-            root.actions = Self.noActions
-            // Tiles in a frame never overlap, so per-tile opacity looks the same as group opacity, and
-            // Core Animation then needs no offscreen buffer per faded frame (memory while playing).
-            root.allowsGroupOpacity = false
-            for _ in frames {
-                let layer = CALayer()
-                layer.frame = bounds
-                layer.opacity = 0
-                layer.allowsGroupOpacity = false
-                layer.actions = ["bounds": NSNull(), "position": NSNull(), "sublayers": NSNull()]
-                root.addSublayer(layer)
-                frameLayers.append(layer)
-            }
         }
-
-        static let noActions: [String: any CAAction] = [
-            "bounds": NSNull(), "position": NSNull(), "contents": NSNull(), "opacity": NSNull(),
-            "sublayers": NSNull(), "onOrderIn": NSNull(), "onOrderOut": NSNull(),
-        ]
 
         func isComplete(_ i: Int, desired: [TileKey]) -> Bool {
             guard tiles.indices.contains(i) else { return true }
@@ -480,15 +517,10 @@ final class RadarLayerView: NSView {
     private var follows = true
     private var reportsProgress = false
     private var progressScheduled = false
+    private var gestureWorkScheduled = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.masksToBounds = true
-        // Normal source-over compositing (R1). The old screen blend washed the radar out (colours
-        // brightened toward white over light map areas) and still hid the map under heavy echoes. A
-        // ~60 % source-over layer over the higher-contrast base map lets roads and town names read
-        // through the rain, like RadarScope/MyRadar.
         // Failed tiles are asked for again after a back-off, on wake and when the network returns (T15).
         retryObserver = NotificationCenter.default.addObserver(forName: RadarImageCache.retryNotification, object: nil,
                                                                queue: .main) { [weak self] _ in
@@ -500,11 +532,28 @@ final class RadarLayerView: NSView {
         if let retryObserver { NotificationCenter.default.removeObserver(retryObserver) }
     }
 
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    private func attachOverlay() {
+        guard let map, !map.overlays.contains(where: { $0 === overlay }) else { return }
+        // Above roads and labels, like the old layer stack (normal source-over at the user's opacity).
+        map.addOverlay(overlay, level: .aboveLabels)
+    }
+
+    /// The map delegate asks for the renderer.
+    func makeRenderer() -> RadarOverlayRenderer {
+        let r = RadarOverlayRenderer(overlay: overlay, state: drawState)
+        r.alpha = CGFloat(opacity)
+        renderer = r
+        return r
+    }
+
     /// Re-requests tiles marked missing whose failure verdict has expired (back-off over, wake, network
     /// back). Event-driven from a notification on the main queue: never inside layout.
     private func retryMissingTiles() {
-        // Paused while the window is covered/minimised or the Mac is offline; becoming visible and the
-        // network returning both post the retry notification again.
         guard playback?.isVisible == true, RadarImageCache.shared.isOnline else { return }
         var changed = false
         for g in [active, pending].compactMap({ $0 }) {
@@ -522,16 +571,10 @@ final class RadarLayerView: NSView {
     }
 
     /// Playback started/stopped needing the whole loop: load it, or release every frame but the one shown.
+    /// The zoom is kept (build 35: playing never drops resolution).
     func loopHoldChanged() {
-        // Re-pick the zoom: holding the whole loop must fit the tile budget (it used to keep the
-        // single-frame zoom, so a playing loop held 16 tiles × 17 frames ≈ 272 tiles, ~140 MB).
-        updateTiles(allowZoomChange: true)
+        updateTiles(allowZoomChange: false)
     }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
-
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     // MARK: Playback connection
 
@@ -548,7 +591,7 @@ final class RadarLayerView: NSView {
         let wanted = follows ? p.index : lastIndex
         if wanted != index {
             index = wanted
-            applyVisibility(animated: false)
+            publishShownFrame()
         }
         if r { scheduleProgressReport() }
     }
@@ -561,18 +604,18 @@ final class RadarLayerView: NSView {
     private var lastIndex: Int { max(0, ((pending ?? active)?.frames.count ?? 1) - 1) }
 
     /// Called by RadarPlayback when its frame index changes (timer or scrubber) — never during layout.
+    /// Every held frame is already decoded, so a frame change is one redraw.
     func playbackIndexChanged(_ newIndex: Int, animated: Bool) {
         guard follows, newIndex != index else { return }
         index = newIndex
-        applyVisibility(animated: animated)
-        // Playing: on-screen tiles only (a ring requested here was pruned again at once: churn, F).
-        if let map { request(TileMath.tiles(covering: visibleRect(map.visibleMapRect), z: zoom, margin: loopHeld ? 0 : 1), in: active, frames: [index]) }
+        publishShownFrame()
+        request(Array(keep), in: active, frames: [index])
     }
 
     func setOpacity(_ value: Float) {
         guard value != opacity else { return }
         opacity = value
-        applyVisibility(animated: false)
+        renderer?.alpha = CGFloat(value)
     }
 
     // MARK: Frames
@@ -581,43 +624,33 @@ final class RadarLayerView: NSView {
         let ids = frames.map(\.id)
         if ids == (pending ?? active)?.frames.map(\.id), maxZ == self.maxZ { return }
         self.maxZ = maxZ
-        let generation = Generation(frames: frames, bounds: bounds)
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
+        let generation = Generation(frames: frames)
         if active == nil || frames.isEmpty || active?.frames.isEmpty == true {
-            active?.root.removeFromSuperlayer()
-            pending?.root.removeFromSuperlayer()
             pending = nil
             active = generation
         } else {
-            pending?.root.removeFromSuperlayer()
-            generation.root.opacity = 0
             pending = generation
         }
-        layer?.addSublayer(generation.root)
-        CATransaction.commit()
         index = follows ? min(playback?.index ?? lastIndex, max(0, frames.count - 1)) : lastIndex
         zoom = 0
-        applyVisibility(animated: false)
+        publishShownFrame()
         updateTiles(allowZoomChange: true)
     }
 
-    private func applyVisibility(animated: Bool) {
-        guard let g = active, !g.frameLayers.isEmpty else { return }
+    /// Hands the shown frame's tiles (current zoom plus coarser/finer placeholders still held) to the
+    /// renderer and redraws.
+    private func publishShownFrame() {
+        guard let g = active, !g.frames.isEmpty else {
+            drawState.set([])
+            renderer?.setNeedsDisplay()
+            return
+        }
         let shown = min(max(index, 0), g.frames.count - 1)
-        CATransaction.begin()
-        if animated {
-            CATransaction.setAnimationDuration(0.35)
-            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
-        } else {
-            CATransaction.setDisableActions(true)
-        }
-        for (i, frameLayer) in g.frameLayers.enumerated() {
-            let target: Float = i == shown ? opacity : 0
-            if frameLayer.opacity != target { frameLayer.opacity = target }
-        }
-        CATransaction.commit()
+        drawState.set(g.tiles[shown].map { ($0.key, $0.value) })
+        renderer?.setNeedsDisplay()
     }
+
+    private func shownIndex(_ g: Generation) -> Int { min(max(index, 0), max(g.frames.count - 1, 0)) }
 
     // MARK: Tiles
 
@@ -632,44 +665,54 @@ final class RadarLayerView: NSView {
     }
 
     /// Frames this view needs loaded: all of them while playback needs the loop (playing, scrubbing, or
-    /// just paused), else only the one shown. An idle radar holds one frame of tiles instead of 11-13,
-    /// and frames not in the current loop are released (E1).
+    /// just paused), else only the one shown.
     private func neededFrames(_ g: Generation) -> [Int] {
         guard !g.frames.isEmpty else { return [] }
-        let shown = min(max(index, 0), g.frames.count - 1)
+        let shown = shownIndex(g)
         guard follows, playback?.holdsLoop == true else { return [shown] }
         var order = [shown]
         for i in g.frames.indices.reversed() where i != shown { order.append(i) } // newest → oldest
         return order
     }
 
-    /// Recomputes the visible tile set, lays out existing tile layers and requests missing ones.
-    /// Touches only CALayers and plain properties; never SwiftUI state.
-    /// Playback holds the whole loop: no prefetch ring for any frame.
-    private var loopHeld: Bool { follows && playback?.holdsLoop == true }
+    /// Mid-gesture: MapKit already moves the radar with the map, so nothing is repositioned. Loading the
+    /// newly exposed edge is coalesced to at most one pass per 150 ms, and nothing is pruned until the
+    /// gesture settles (diagnosis fixes 1 and 5).
+    func gestureMoved() {
+        guard !gestureWorkScheduled else { return }
+        gestureWorkScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self else { return }
+            self.gestureWorkScheduled = false
+            self.updateTiles(allowZoomChange: false, prune: false)
+        }
+    }
 
-    func updateTiles(allowZoomChange: Bool) {
+    func updateTiles(allowZoomChange: Bool, prune doPrune: Bool = true) {
         guard let map, bounds.width > 1, bounds.height > 1 else { return }
         let v = map.visibleMapRect
         guard v.size.width > 0 else { return }
         let visible = visibleRect(v)
-        let frameCount = follows ? max((pending ?? active)?.frames.count ?? 1, 1) : 1
+        // One frame's worth of budget: the zoom is the same paused or playing (build 35, quality first).
         let z = TileMath.zoom(fitting: visible, viewWidth: Double(max(bounds.width - 2 * horizontalInset, 1)), maxZ: maxZ,
-                              frames: frameCount, tileBudget: Self.tileBudget)
+                              frames: 1, tileBudget: Self.tileBudget)
+        let zoomChanged = (allowZoomChange || zoom == 0) && z != zoom
         if allowZoomChange || zoom == 0 { zoom = z }
         desired = TileMath.tiles(covering: visible, z: zoom, margin: 0)
+        // Every held frame keeps a one-tile ring, so a pan never exposes an empty edge on any frame.
         keep = Set(TileMath.tiles(covering: visible, z: zoom, margin: 1))
-        layoutTiles(v)
+        let ring = TileMath.tiles(covering: visible, z: zoom, margin: 1)
+        var shownChanged = false
         for g in [active, pending].compactMap({ $0 }) {
             let needed = neededFrames(g)
-            // Paused: the shown frame gets a one-tile ring of prefetch. Playing: every frame (the shown
-            // one too) holds only what's on screen. The ring used to be requested for whichever frame
-            // was shown, so over one loop every frame filled it: 16 tiles × 16 frames instead of 4 × 16
-            // (≈190 MB of decoded + GPU copies in the expanded map). RAM work (F).
-            if let first = needed.first { request(loopHeld ? desired : Array(keep), in: g, frames: [first]) }
-            request(desired, in: g, frames: Array(needed.dropFirst()))
-            for i in g.frames.indices { prune(g, i, needed: needed.contains(i)) }
+            request(ring, in: g, frames: needed)
+            if doPrune {
+                for i in g.frames.indices where prune(g, i, needed: needed.contains(i)) && g === active && i == shownIndex(g) {
+                    shownChanged = true
+                }
+            }
         }
+        if shownChanged || zoomChanged { publishShownFrame() }
         promotePendingIfReady()
         scheduleProgressReport()
     }
@@ -695,7 +738,6 @@ final class RadarLayerView: NSView {
                         guard let self, let g else { return }
                         g.requested[i].remove(key)
                         if let image { self.addTile(image, key: key, frame: i, in: g) } else { g.missing[i].insert(key) }
-                        self.prune(g, i, needed: self.neededFrames(g).contains(i))
                         self.promotePendingIfReady()
                         self.scheduleProgressReport()
                     }
@@ -705,57 +747,37 @@ final class RadarLayerView: NSView {
     }
 
     private func addTile(_ image: CGImage, key: TileKey, frame i: Int, in g: Generation) {
-        guard g.tiles[i][key] == nil, key.z == zoom, let map else { return }
-        let tile = CALayer()
-        tile.actions = Generation.noActions
-        tile.contents = image
-        tile.contentsGravity = .resize
-        tile.magnificationFilter = .linear
-        tile.minificationFilter = .linear
-        tile.zPosition = CGFloat(key.z)
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        tile.frame = rect(for: key, visible: map.visibleMapRect)
-        g.frameLayers[i].addSublayer(tile)
-        CATransaction.commit()
-        g.tiles[i][key] = tile
+        guard g.tiles[i][key] == nil, key.z == zoom else { return }
+        g.tiles[i][key] = image
         Self.liveTiles += 1
         Self.addedTiles += 1
+        if g === active, i == shownIndex(g) {
+            drawState.set(g.tiles[i].map { ($0.key, $0.value) })
+            let r = TileMath.rect(key)
+            renderer?.setNeedsDisplay(MKMapRect(x: r.x, y: r.y, width: r.width, height: r.height))
+        }
     }
 
-    /// Drops tiles that scrolled away, frames this view no longer needs, and other-zoom placeholders
-    /// once the current zoom is complete.
-    private func prune(_ g: Generation, _ i: Int, needed: Bool) {
+    /// Drops tiles outside the ring, frames this view no longer needs, and other-zoom placeholders once
+    /// the current zoom is complete. Only runs once a gesture settles. Returns whether anything went.
+    @discardableResult
+    private func prune(_ g: Generation, _ i: Int, needed: Bool) -> Bool {
         let complete = g.isComplete(i, desired: desired)
-        let keep = loopHeld ? Set(desired) : self.keep
-        var removed: [TileKey] = []
-        for (key, tile) in g.tiles[i] {
+        var removed = 0
+        for key in Array(g.tiles[i].keys) {
             let stale = !needed || (key.z == zoom ? !keep.contains(key) : complete)
-            if stale {
-                tile.removeFromSuperlayer()
-                removed.append(key)
-            }
+            if stale { g.tiles[i][key] = nil; removed += 1 }
         }
-        if !removed.isEmpty {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            for key in removed { g.tiles[i][key] = nil }
-            Self.liveTiles -= removed.count
-            CATransaction.commit()
-        }
+        Self.liveTiles -= removed
         g.missing[i] = g.missing[i].filter { $0.z == zoom }
+        return removed > 0
     }
 
     private func promotePendingIfReady() {
-        guard let p = pending, p.isComplete(min(index, p.frames.count - 1), desired: desired) else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        active?.root.removeFromSuperlayer()
-        p.root.opacity = 1
+        guard let p = pending, p.isComplete(shownIndex(p), desired: desired) else { return }
         active = p
         pending = nil
-        CATransaction.commit()
-        applyVisibility(animated: false)
+        publishShownFrame()
     }
 
     /// Coalesced and deferred: progress is computed and handed to SwiftUI on the next main-queue turn,
@@ -779,29 +801,6 @@ final class RadarLayerView: NSView {
             resolved += desired.reduce(0) { $0 + ((g.tiles[i][$1] != nil || g.missing[i].contains($1)) ? 1 : 0) }
         }
         return Double(resolved) / Double(needed.count * desired.count)
-    }
-
-    private func layoutTiles(_ v: MKMapRect) {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        for g in [active, pending].compactMap({ $0 }) {
-            if g.root.frame != bounds { g.root.frame = bounds }
-            for (i, frameLayer) in g.frameLayers.enumerated() {
-                if frameLayer.frame != bounds { frameLayer.frame = bounds }
-                for (key, tile) in g.tiles[i] { tile.frame = rect(for: key, visible: v) }
-            }
-        }
-        CATransaction.commit()
-    }
-
-    /// Tile rect in this (non-flipped, bottom-left origin) view.
-    private func rect(for key: TileKey, visible v: MKMapRect) -> CGRect {
-        let r = TileMath.rect(key)
-        let scale = Double(bounds.width) / v.size.width
-        let x = (r.x - v.origin.x) * scale
-        let yTop = (r.y - v.origin.y) * scale
-        let size = r.width * scale
-        return CGRect(x: x, y: Double(bounds.height) - yTop - size, width: size, height: size)
     }
 }
 
