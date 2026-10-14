@@ -14,6 +14,10 @@ enum MeasureHooks {
                 try? await Task.sleep(for: .seconds(2))
                 store.radar.setPlaying(true)
                 print("[measure] radar play requested"); fflush(stdout)
+                for _ in 0..<6 {
+                    try? await Task.sleep(for: .seconds(8))
+                    print("[measure] liveTiles=\(RadarLayerView.liveTiles) added=\(RadarLayerView.addedTiles) requests=\(RequestStats.shared.total) frames=\(store.radar.frames.count) progress=\(store.radar.progress)"); fflush(stdout)
+                }
             }
         }
         if defaults.bool(forKey: "SkylineRadarSiteTest") { radarSiteTest(store: store) }

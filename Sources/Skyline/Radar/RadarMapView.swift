@@ -85,6 +85,12 @@ struct RadarMapView: NSViewRepresentable {
     static func dismantleNSView(_ container: RadarMapContainer, coordinator: Coordinator) {
         container.map.delegate = nil
         container.radar.disconnect()
+        // Menu-bar only after ⌘Q / close: hand MapKit everything back so its engine (vector tiles,
+        // Metal buffers) can go. Without this a closed window's MKMapView stayed alive (F).
+        container.map.removeOverlays(container.map.overlays)
+        container.map.removeAnnotations(container.map.annotations)
+        container.radar.removeFromSuperview()
+        container.map.removeFromSuperview()
     }
 
     @MainActor
@@ -408,6 +414,8 @@ final class PinView: NSView {
 /// Transparent, click-through view holding one CALayer per radar frame.
 final class RadarLayerView: NSView {
     nonisolated(unsafe) static var liveTiles = 0
+    /// Tiles added since launch (measurement log: a steady loop should stop adding).
+    nonisolated(unsafe) static var addedTiles = 0
     weak var map: MKMapView?
 
     /// Each map may hold at most this many decoded tiles (≈256 KB each → ~40 MB, plus its GPU copy).
@@ -515,7 +523,9 @@ final class RadarLayerView: NSView {
 
     /// Playback started/stopped needing the whole loop: load it, or release every frame but the one shown.
     func loopHoldChanged() {
-        updateTiles(allowZoomChange: false)
+        // Re-pick the zoom: holding the whole loop must fit the tile budget (it used to keep the
+        // single-frame zoom, so a playing loop held 16 tiles × 17 frames ≈ 272 tiles, ~140 MB).
+        updateTiles(allowZoomChange: true)
     }
 
     @available(*, unavailable)
@@ -555,7 +565,8 @@ final class RadarLayerView: NSView {
         guard follows, newIndex != index else { return }
         index = newIndex
         applyVisibility(animated: animated)
-        if let map { request(TileMath.tiles(covering: visibleRect(map.visibleMapRect), z: zoom, margin: 1), in: active, frames: [index]) }
+        // Playing: on-screen tiles only (a ring requested here was pruned again at once: churn, F).
+        if let map { request(TileMath.tiles(covering: visibleRect(map.visibleMapRect), z: zoom, margin: loopHeld ? 0 : 1), in: active, frames: [index]) }
     }
 
     func setOpacity(_ value: Float) {
@@ -634,6 +645,9 @@ final class RadarLayerView: NSView {
 
     /// Recomputes the visible tile set, lays out existing tile layers and requests missing ones.
     /// Touches only CALayers and plain properties; never SwiftUI state.
+    /// Playback holds the whole loop: no prefetch ring for any frame.
+    private var loopHeld: Bool { follows && playback?.holdsLoop == true }
+
     func updateTiles(allowZoomChange: Bool) {
         guard let map, bounds.width > 1, bounds.height > 1 else { return }
         let v = map.visibleMapRect
@@ -648,8 +662,11 @@ final class RadarLayerView: NSView {
         layoutTiles(v)
         for g in [active, pending].compactMap({ $0 }) {
             let needed = neededFrames(g)
-            // Visible frame gets a one-tile ring of prefetch; the rest only what's on screen (memory).
-            if let first = needed.first { request(Array(keep), in: g, frames: [first]) }
+            // Paused: the shown frame gets a one-tile ring of prefetch. Playing: every frame (the shown
+            // one too) holds only what's on screen. The ring used to be requested for whichever frame
+            // was shown, so over one loop every frame filled it: 16 tiles × 16 frames instead of 4 × 16
+            // (≈190 MB of decoded + GPU copies in the expanded map). RAM work (F).
+            if let first = needed.first { request(loopHeld ? desired : Array(keep), in: g, frames: [first]) }
             request(desired, in: g, frames: Array(needed.dropFirst()))
             for i in g.frames.indices { prune(g, i, needed: needed.contains(i)) }
         }
@@ -703,12 +720,14 @@ final class RadarLayerView: NSView {
         CATransaction.commit()
         g.tiles[i][key] = tile
         Self.liveTiles += 1
+        Self.addedTiles += 1
     }
 
     /// Drops tiles that scrolled away, frames this view no longer needs, and other-zoom placeholders
     /// once the current zoom is complete.
     private func prune(_ g: Generation, _ i: Int, needed: Bool) {
         let complete = g.isComplete(i, desired: desired)
+        let keep = loopHeld ? Set(desired) : self.keep
         var removed: [TileKey] = []
         for (key, tile) in g.tiles[i] {
             let stale = !needed || (key.z == zoom ? !keep.contains(key) : complete)
