@@ -162,6 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AppExit.runQuitKeyTestIfRequested()
             GlobalHotkey.runTestIfRequested()
             GlobalHotkey.showDropdownIfRequested()
+            SearchTypeTest.runIfRequested()
         }
     }
 

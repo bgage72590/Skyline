@@ -250,6 +250,7 @@ directly); none is settable from the UI.
 | `-SkylinePlayRadar YES` | Start radar playback at launch |
 | `-SkylineStressTest <s>` / `-SkylineStressSeed <n>` / `-SkylineStressQuit YES` | In-process radar stress test; quit when done |
 | `-SkylineQuitKeyTest YES` | Sends ⌘Q through Skyline's own menu, checks the window closed and the app stayed in the menu bar, reopens, logs `[quit-test] PASS/FAIL`, quits |
+| `-SkylineSearchTypeTest YES` | Types "bos" into the city search field (in-process, at launch, after ⌘Q + reopen and after the dropdown), logs `[search-test] PASS/FAIL` to stdout and `~/Library/Logs/skyline-search-test.txt`, quits |
 | `-SkylineShowDropdown <s>` | Opens the dropdown panel after N s and keeps it open; logs `[dropdown] window=N` for `screencapture -l N` |
 | `-SkylineSyncFile <path>` | Sync through this file instead of iCloud Drive (two-Mac tests on one Mac) |
 | `-SkylineHotkeyTest YES` | Calls the global-hotkey handler in-process, checks the dropdown opened, logs `[hotkey-test] PASS/FAIL`, quits |

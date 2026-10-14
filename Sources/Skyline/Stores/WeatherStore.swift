@@ -63,6 +63,10 @@ final class WeatherStore {
     var searchText = ""
     var searchResults: [PlaceSearchResult] = []
     var isSearching = false
+    /// Why the last search failed (offline, rate limit, timeout); nil after a search that answered (QA #2).
+    var searchError: String?
+    /// The query `searchResults` belong to, so Return never adds a result for older text (QA #1).
+    @ObservationIgnored private var resultsQuery = ""
 
     /// Radar map expanded to fill the detail area (in-window, Apple-Weather style).
     var radarExpanded = false
@@ -652,9 +656,11 @@ final class WeatherStore {
 
     func searchTextChanged() {
         searchTask?.cancel()
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let query = SearchSubmit.normalized(searchText)
         guard query.count >= 2 else {
             searchResults = []
+            resultsQuery = ""
+            searchError = nil
             isSearching = false
             return
         }
@@ -662,12 +668,30 @@ final class WeatherStore {
         searchTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(300)) // debounce typing
             guard !Task.isCancelled, let self else { return }
-            let results = (try? await self.service.search(query)) ?? []
-            guard !Task.isCancelled else { return }
-            self.searchResults = results
-            self.isSearching = false
+            await self.runSearch(query, addFirst: false)
         }
     }
+
+    /// One search; errors are shown (not turned into "No matches"), and results remember their query.
+    private func runSearch(_ query: String, addFirst: Bool) async {
+        do {
+            let results = try await service.search(query)
+            guard !Task.isCancelled else { return }
+            isSearching = false
+            searchError = nil
+            if addFirst, let first = results.first { add(first); return }
+            searchResults = results
+            resultsQuery = query
+        } catch {
+            guard !Task.isCancelled else { return }
+            isSearching = false
+            searchResults = []
+            resultsQuery = ""
+            searchError = "Couldn’t search. " + UserFacingError.message(error)
+        }
+    }
+
+    func retrySearch() { searchTextChanged() }
 
     func add(_ result: PlaceSearchResult) {
         let location = result.asLocation
@@ -677,6 +701,7 @@ final class WeatherStore {
         selectedID = location.id
         searchText = ""
         searchResults = []
+        resultsQuery = ""
         Task { await load(location) }
     }
 
@@ -738,18 +763,15 @@ final class WeatherStore {
     /// Return in the search field adds the first result, searching right away if the debounced search
     /// hasn't answered yet (T19).
     func submitSearch() {
-        if let first = searchResults.first { add(first); return }
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let query = SearchSubmit.normalized(searchText)
+        if let first = SearchSubmit.pick(results: searchResults, resultsQuery: resultsQuery, currentText: searchText) {
+            add(first); return
+        }
         guard query.count >= 2 else { return }
+        // Results are for older text (still inside the debounce) or missing: search the current text now.
         searchTask?.cancel()
         isSearching = true
-        searchTask = Task { [weak self] in
-            guard let self else { return }
-            let results = (try? await self.service.search(query)) ?? []
-            guard !Task.isCancelled else { return }
-            self.isSearching = false
-            if let first = results.first { self.add(first) } else { self.searchResults = [] }
-        }
+        searchTask = Task { [weak self] in await self?.runSearch(query, addFirst: true) }
     }
 
     private func persistLastFix(_ location: WeatherLocation) {

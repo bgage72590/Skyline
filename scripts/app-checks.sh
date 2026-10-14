@@ -15,5 +15,13 @@ run() { # name pattern timeout args...
 run quit   '\[quit-test\] PASS'   40 -SkylineQuitKeyTest YES
 run hotkey '\[hotkey-test\] PASS' 40 -SkylineHotkeyTest YES
 run stress 'STRESS OK'     $((SECS + 60)) -SkylineOpenRadar YES -SkylineStressTest "$SECS" -SkylineStressQuit YES
+# City search typing (launched through LaunchServices so the window can become key; the app writes
+# its verdict to ~/Library/Logs/skyline-search-test.txt).
+pkill -x Skyline 2>/dev/null; sleep 1
+L="$HOME/Library/Logs/skyline-search-test.txt"; rm -f "$L"
+open "$APP" --args -SkylineSearchTypeTest YES
+for _ in $(seq 1 45); do [ -s "$L" ] && break; sleep 1; done
+if grep -q "PASS" "$L" 2>/dev/null; then echo "PASS search-typing"; else echo "FAIL search-typing"; cat "$L" 2>/dev/null; fail=1; fi
+sleep 2
 open "$APP"
 exit $fail

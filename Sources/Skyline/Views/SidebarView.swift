@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import SkylineCore
 
@@ -56,17 +57,26 @@ struct SidebarView: View {
         .focusable()
         .focused($focused)
         .focusEffectDisabled()
-        .onKeyPress(.upArrow) { store.selectLocation(offset: -1); return .handled }
-        .onKeyPress(.downArrow) { store.selectLocation(offset: 1); return .handled }
+        // The sidebar search field lives inside this view, so these handlers see its keystrokes first.
+        // While any text field is being edited they must pass keys through, or typing a city name does
+        // nothing (bug in build 24: L17 returned .handled for every letter).
+        .onKeyPress(.upArrow) {
+            guard !Self.isEditingText else { return .ignored }
+            store.selectLocation(offset: -1); return .handled
+        }
+        .onKeyPress(.downArrow) {
+            guard !Self.isEditingText else { return .ignored }
+            store.selectLocation(offset: 1); return .handled
+        }
         // Type a city's first letters to jump to it, like a standard Mac list (L17).
         .onKeyPress(characters: .alphanumerics, phases: .down) { press in
-            guard press.modifiers.intersection([.command, .control, .option]).isEmpty else { return .ignored }
+            guard !Self.isEditingText, press.modifiers.intersection([.command, .control, .option]).isEmpty else { return .ignored }
             let now = Date()
             typed = now.timeIntervalSince(typedAt) < 1.0 ? typed + press.characters : press.characters
             typedAt = now
             let list = store.allLocations
             guard let i = LocationList.typeSelect(typed, in: list.map { $0.isCurrentLocation ? "My Location" : $0.name }) else {
-                return .handled
+                return .ignored // no match: let the key through (system beep), don't eat it (QA #4)
             }
             store.selectedID = list[i].id
             return .handled
@@ -81,6 +91,12 @@ struct SidebarView: View {
             // Fill in sidebar temperatures (cheap: served from cache when fresh).
             await store.refreshDue()
         }
+    }
+
+    /// True while a text field (the city search) has the keyboard: AppKit's field editor is first responder.
+    static var isEditingText: Bool {
+        guard let responder = NSApp.keyWindow?.firstResponder else { return false }
+        return responder is NSText || responder is NSTextField
     }
 
     private func row(_ location: WeatherLocation, index: Int) -> some View {
@@ -115,7 +131,14 @@ struct SidebarView: View {
     @ViewBuilder
     private var searchResults: some View {
         SidebarSectionHeader(title: "Search Results")
-        if store.isSearching && store.searchResults.isEmpty {
+        if let error = store.searchError, !store.isSearching {
+            VStack(alignment: .leading, spacing: 6) {
+                Label(error, systemImage: "wifi.exclamationmark").font(.callout).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Try Again") { store.retrySearch() }
+            }
+            .padding(.horizontal, 6)
+        } else if store.isSearching && store.searchResults.isEmpty {
             Text("Searching…").font(.callout).foregroundStyle(Glass.secondaryText).padding(.horizontal, 6)
         } else if store.searchResults.isEmpty {
             Text("No matches").font(.callout).foregroundStyle(Glass.secondaryText).padding(.horizontal, 6)
