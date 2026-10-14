@@ -35,4 +35,17 @@ public enum LocationList {
         out.insert(location, at: min(max(index, 0), out.count))
         return out
     }
+
+    /// Type-to-jump in the sidebar (L17): the first name, in list order, starting with what was typed
+    /// (case- and accent-insensitive), else the first containing it at a word start. Nil when nothing matches.
+    public static func typeSelect(_ typed: String, in names: [String]) -> Int? {
+        let q = typed.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return nil }
+        let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        if let i = names.firstIndex(where: { $0.range(of: q, options: opts.union(.anchored)) != nil }) { return i }
+        return names.firstIndex { name in
+            name.split(whereSeparator: { $0 == " " || $0 == "-" })
+                .contains { $0.range(of: q, options: opts.union(.anchored)) != nil }
+        }
+    }
 }

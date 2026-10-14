@@ -517,13 +517,13 @@ struct RadarLegend: View {
                         Text("\(v)").frame(width: 42, alignment: .leading)
                     }
                 }
-                .font(.system(size: 9, weight: .medium)).monospacedDigit()
+                .font(.system(size: 10, weight: .medium)).monospacedDigit()
                 HStack(spacing: 0) {
                     Text("Light").frame(width: 70, alignment: .leading)
                     Text("Moderate").frame(width: 56, alignment: .leading)
                     Text("Heavy · hail").frame(width: 70, alignment: .leading)
                 }
-                .font(.system(size: 9)).foregroundStyle(Glass.secondaryText)
+                .font(.system(size: 10)).foregroundStyle(Glass.secondaryText)
             } else {
                 LinearGradient(colors: rainViewerColors, startPoint: .leading, endPoint: .trailing)
                     .frame(width: 196, height: 8)
@@ -531,10 +531,10 @@ struct RadarLegend: View {
                 HStack { Text("Light"); Spacer(); Text("Heavy") }
                     .font(.caption2).frame(width: 196).foregroundStyle(Glass.secondaryText)
             }
-            Text(provider.attribution).font(.system(size: 9)).foregroundStyle(Glass.secondaryText)
+            Text(provider.attribution).font(.system(size: 10)).foregroundStyle(Glass.secondaryText)
             if showsForecastNote {
                 Text(provider == .nexrad ? "After “Now”: NOAA HRRR model forecast via IEM" : "After “Now”: RainViewer nowcast")
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Color(red: 0.78, green: 0.62, blue: 1.0))
             }
         }

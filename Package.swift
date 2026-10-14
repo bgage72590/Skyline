@@ -7,15 +7,19 @@ import PackageDescription
 // all SwiftUI / MapKit / CoreLocation code and is only built on macOS.
 
 var targets: [Target] = [
+    // Strictest data-race checking (L30): threading mistakes in the core are compile errors/warnings,
+    // and the build is held at 0 warnings.
     .target(
         name: "SkylineCore",
-        path: "Sources/SkylineCore"
+        path: "Sources/SkylineCore",
+        swiftSettings: [.enableExperimentalFeature("StrictConcurrency")]
     ),
     .testTarget(
         name: "SkylineCoreTests",
         dependencies: ["SkylineCore"],
         path: "Tests/SkylineCoreTests",
-        resources: [.copy("Fixtures")]
+        resources: [.copy("Fixtures")],
+        swiftSettings: [.enableExperimentalFeature("StrictConcurrency")]
     ),
 ]
 

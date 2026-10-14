@@ -91,6 +91,8 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            PrivacyEnergySection()
+
             Section("Data sources") {
                 Text("Forecasts blend Open-Meteo models (best match, NOAA HRRR, ECMWF IFS, NOAA GFS, DWD ICON) with the official National Weather Service forecast in the US. Alerts from NWS. Radar from NOAA NEXRAD via Iowa Environmental Mesonet (US) and RainViewer (global). All free, no API keys.")
                     .font(.callout)
@@ -230,5 +232,58 @@ enum LoginItem {
         } catch {
             return "Couldn’t change the login item: \(error.localizedDescription)"
         }
+    }
+}
+
+/// Settings › Privacy & energy (L23): what Skyline keeps, a reset, and how much it's doing.
+struct PrivacyEnergySection: View {
+    @Environment(WeatherStore.self) private var store
+    @State private var confirmReset = false
+    @State private var didReset = false
+
+    var body: some View {
+        Section("Privacy & energy") {
+            Text("Skyline keeps up to 90 days of forecast-accuracy history for your cities (city-level, about 1 km) and a 14-day download cache, in your user Library. Time Machine backs them up. Nothing is sent anywhere except the weather services listed below; there is no tracking.")
+                .font(.callout).foregroundStyle(.secondary)
+            HStack {
+                Button(didReset ? "Accuracy data reset" : "Reset Accuracy Data…") { confirmReset = true }
+                    .disabled(didReset)
+                Spacer()
+            }
+            .confirmationDialog("Reset accuracy data?", isPresented: $confirmReset) {
+                Button("Reset", role: .destructive) {
+                    Task { await store.resetAccuracyData(); didReset = true }
+                }
+            } message: {
+                Text("Skyline forgets what it has learned about which forecast is most accurate for each city and starts again. Forecasts use equal weights until about 3 days are collected.")
+            }
+            if let error = store.widgetError {
+                Text("Widgets can’t get new data: \(error)").font(.caption).foregroundStyle(.orange)
+            }
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                Text(EnergyLine.text(now: context.date)).font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            }
+        }
+    }
+}
+
+/// "142 requests since launch (about 18 an hour) · CPU 0.1% on average" from this process's own counters.
+enum EnergyLine {
+    static func text(now: Date) -> String {
+        let stats = RequestStats.shared
+        var line = "\(stats.total) requests since launch"
+        if let h = stats.perHour(now: now) { line += " (about \(Int(h.rounded())) an hour)" }
+        if let cpu = averageCPU() { line += String(format: " · CPU %.1f%% on average", cpu) }
+        return line
+    }
+
+    /// CPU time used / time since launch, in % of one core.
+    static func averageCPU() -> Double? {
+        var usage = rusage()
+        guard getrusage(RUSAGE_SELF, &usage) == 0 else { return nil }
+        let cpu = Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec)
+            + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1_000_000
+        let wall = Date().timeIntervalSince(RequestStats.shared.since)
+        return wall > 60 ? cpu / wall * 100 : nil
     }
 }

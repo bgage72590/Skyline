@@ -57,6 +57,17 @@ public enum USCoverage {
         "american samoa",
     ]
 
+    /// ISO codes for the US and the territories NWS serves.
+    static let usCodes: Set<String> = ["US", "PR", "GU", "VI", "MP", "AS", "UM"]
+
+    /// From the ISO code when there is one (not localized), else the country name. Nil = unknown.
+    public static func isUS(code: String?, country: String?) -> Bool? {
+        if let c = code?.trimmingCharacters(in: .whitespaces).uppercased(), !c.isEmpty { return usCodes.contains(c) }
+        if isKnownUS(country: country) { return true }
+        if isKnownOutsideUS(country: country) { return false }
+        return nil
+    }
+
     /// True when the saved place's country is known to be the US or an NWS-served territory.
     public static func isKnownUS(country: String?) -> Bool {
         guard let c = country?.trimmingCharacters(in: .whitespaces).lowercased(), !c.isEmpty else { return false }
@@ -100,12 +111,18 @@ public enum USCoverage {
 public extension WeatherLocation {
     /// NEXRAD mosaic, HRRR and future radar apply (lower 48 and the place isn't known to be abroad).
     var isInCONUS: Bool {
-        if USCoverage.isKnownUS(country: country) { return USCoverage.inCoarseCONUS(coordinate) }
-        return !USCoverage.isKnownOutsideUS(country: country) && coordinate.isInCONUS
+        switch USCoverage.isUS(code: countryCode, country: country) {
+        case true?: return USCoverage.inCoarseCONUS(coordinate)
+        case false?: return false
+        case nil: return coordinate.isInCONUS
+        }
     }
     /// NWS forecasts, warnings and discussions apply.
     var isLikelyInNWSCoverage: Bool {
-        if USCoverage.isKnownUS(country: country) { return USCoverage.inCoarseNWS(coordinate) }
-        return !USCoverage.isKnownOutsideUS(country: country) && coordinate.isLikelyInNWSCoverage
+        switch USCoverage.isUS(code: countryCode, country: country) {
+        case true?: return USCoverage.inCoarseNWS(coordinate)
+        case false?: return false
+        case nil: return coordinate.isLikelyInNWSCoverage
+        }
     }
 }

@@ -38,12 +38,17 @@ public struct WeatherLocation: Codable, Hashable, Identifiable, Sendable {
     public var name: String
     public var region: String?
     public var country: String?
+    /// ISO 3166 code ("US", "CA"). Preferred over `country`, whose name is localized ("Vereinigte
+    /// Staaten") when it comes from Apple's place lookup. Nil for cities saved by older builds.
+    public var countryCode: String?
     public var coordinate: Coordinate
     public var timeZoneIdentifier: String?
     public var isCurrentLocation: Bool
 
     public init(id: String? = nil, name: String, region: String? = nil, country: String? = nil,
-                coordinate: Coordinate, timeZoneIdentifier: String? = nil, isCurrentLocation: Bool = false) {
+                coordinate: Coordinate, timeZoneIdentifier: String? = nil, isCurrentLocation: Bool = false,
+                countryCode: String? = nil) {
+        self.countryCode = countryCode
         self.id = id ?? String(format: "%.4f,%.4f", coordinate.latitude, coordinate.longitude)
         self.name = name
         self.region = region
@@ -61,5 +66,14 @@ public struct WeatherLocation: Codable, Hashable, Identifiable, Sendable {
 
     public var timeZone: TimeZone {
         timeZoneIdentifier.flatMap(TimeZone.init(identifier:)) ?? .current
+    }
+}
+
+/// My Location results (forecast, place name) apply only while they're for where the Mac is now; a
+/// slower answer for an earlier fix is dropped (L4).
+public enum CurrentLocationGuard {
+    public static func isCurrent(_ requested: Coordinate, current: Coordinate?) -> Bool {
+        guard let current else { return false }
+        return requested == current
     }
 }

@@ -159,6 +159,25 @@ public actor ForecastVerifier {
         }
     }
 
+    /// The learned weights only if the history is already in memory; never reads the files. The first
+    /// forecast after launch doesn't wait for up to 90 days of history to load (L9): it uses neutral
+    /// weights and the history loads in the background for the next refresh.
+    public func weightsIfLoaded(_ key: String) -> BlendWeights? {
+        loaded ? weights(key) : nil
+    }
+
+    public var isLoaded: Bool { loaded }
+
+    /// "Reset accuracy data" in Settings (L23): forgets every saved forecast and verified pair, on disk
+    /// too. Learning starts over (neutral weights until 3 days are collected again).
+    public func reset() {
+        pending = []; verified = []; meta = [:]; cachedScores = [:]; cachedWeights = [:]
+        loaded = true
+        for name in ["pending.jsonl", "verified.jsonl", "meta.json"] {
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+        }
+    }
+
     public func weights(_ key: String) -> BlendWeights {
         load()
         if let w = cachedWeights[key] { return w }

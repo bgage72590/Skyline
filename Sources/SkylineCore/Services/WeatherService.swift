@@ -17,8 +17,8 @@ public actor WeatherService {
         /// A text product never changes once issued.
         public static let product: TimeInterval = 7 * 86400
         /// A point NWS answered 404 for (outside its grids: Canadian border towns, offshore) isn't asked
-        /// again for a week. Before, a failure wasn't cached, so it was re-requested on every refresh.
-        public static let nwsMissing: TimeInterval = 7 * 24 * 3600
+        /// again for a day. Before, a failure wasn't cached, so it was re-requested on every refresh.
+        public static let nwsMissing: TimeInterval = 24 * 3600 // a day: a one-off NWS hiccup heals soon (CR batch 6)
         /// SPC updates its outlooks a handful of times a day; one file serves every US city.
         public static let spcOutlook: TimeInterval = 30 * 60
         public static let hrrrRun: TimeInterval = 10 * 60
@@ -148,7 +148,13 @@ public actor WeatherService {
 
         let tz = TimeZone(identifier: om.timezone) ?? location.timeZone
         let key = VerificationKey.key(for: location)
-        let learned = await verifier?.weights(key) ?? .neutral
+        let learned: BlendWeights
+        if let verifier, let w = await verifier.weightsIfLoaded(key) {
+            learned = w
+        } else {
+            learned = .neutral
+            if let verifier { Task.detached(priority: .utility) { _ = await verifier.weights(key) } } // load for next time
+        }
         let minutely = om.minutelyPrecipitation()
         let hourly = ForecastBlender.blendHourly(openMeteo: om, nwsHourly: nws?.hourly ?? [], now: current.time,
                                                  weights: learned, minutely: minutely)

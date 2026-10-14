@@ -76,6 +76,13 @@ public actor ForecastHistory {
 
     public func count(_ key: String) -> Int { load(); return snapshots[key]?.count ?? 0 }
 
+    /// Forgets the saved outlooks ("why it changed" starts over), on disk too (L23).
+    public func reset() {
+        snapshots = [:]
+        loaded = true
+        if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
+    }
+
     private func load() {
         guard !loaded else { return }
         loaded = true

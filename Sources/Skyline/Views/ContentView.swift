@@ -52,7 +52,8 @@ struct ContentView: View {
                             store.radarExpanded.toggle()
                         }
                     } label: {
-                        Label("Map", systemImage: store.radarExpanded ? "list.bullet" : "map")
+                        // Says what it does now: back to the forecast when the map is expanded (L15).
+                        Label(store.radarExpanded ? "Forecast" : "Map", systemImage: store.radarExpanded ? "list.bullet" : "map")
                     }
                     .help(store.radarExpanded ? "Back to the forecast" : "Give the radar map the whole window")
                 }

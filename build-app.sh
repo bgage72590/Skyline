@@ -161,7 +161,10 @@ fi
 sign_all() {
   codesign --force --sign "$1" --identifier "$BUNDLE_ID.Widget" --options runtime \
       --entitlements "$ROOT/Resources/Widget/SkylineWidget.entitlements" "$APPEX" &&
-  codesign --force --sign "$1" --identifier "$BUNDLE_ID" "$APP"
+  # Hardened runtime (L27): blocks code injection / unsigned libraries. Location is declared in the
+  # entitlements, as the hardened runtime requires.
+  codesign --force --sign "$1" --identifier "$BUNDLE_ID" --options runtime \
+      --entitlements "$ROOT/Resources/Skyline.entitlements" "$APP"
 }
 if ! sign_all "$SIGN_ID" 2>/tmp/skyline-codesign.log; then
   echo "    WARNING: signing with \"$SIGN_NAME\" failed ($(tail -1 /tmp/skyline-codesign.log)); using ad-hoc." >&2

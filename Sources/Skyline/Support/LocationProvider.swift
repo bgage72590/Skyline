@@ -44,8 +44,11 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         if isAuthorized { manager.requestLocation() }
     }
 
+    /// macOS reports `.authorizedAlways` for an allowed app, but newer systems can report
+    /// "when in use" (raw 4, not exposed in the macOS SDK) for the same "Allow"; both count,
+    /// or refreshes would stop (L5).
     nonisolated static func authorized(_ status: CLAuthorizationStatus) -> Bool {
-        status == .authorizedAlways // the only "authorized" state on macOS
+        status == .authorizedAlways || status.rawValue == 4
     }
 
     private func handle(_ newStatus: CLAuthorizationStatus) {

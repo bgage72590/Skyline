@@ -175,7 +175,26 @@ time-sensitive notifications", and in each Focus, Skyline (or time-sensitive not
 allowed. With the self-signed build this may not be offered at all; nothing can break through "Do Not
 Disturb" silently. Treat Skyline as a convenience, not your only warning source.
 
+## Privacy, security and hardening (batch 7)
+
+- **Known hosts only.** Every request (forecast, alerts, radar tiles, SPC) goes through one allowlist of
+  HTTPS hosts (`KnownHosts`): Open-Meteo, api.weather.gov, Iowa Mesonet, SPC and RainViewer. A redirect
+  or a tampered NWS link to anywhere else fails with `disallowedHost` before anything is sent. Cookies are off.
+- **Hardened runtime.** The app is signed with `--options runtime` and `Resources/Skyline.entitlements`
+  (location only). The widget keeps its own sandbox entitlements.
+- **Stored on this Mac only:** saved cities, the forecast cache and the accuracy history in
+  `~/Library/Application Support/Skyline`. Settings › Privacy & Energy shows this, has *Reset Accuracy
+  Data…*, the request count / rate and average CPU since launch, and the last widget error, if any.
+- **Accepted risk (L29):** the widget snapshot in the shared app-group container is readable by other
+  processes running as the same user. It holds only a city name and the current forecast, no
+  coordinates history or account data. Security accepted this; no encryption is planned.
+- **My Location:** results for an old fix are dropped once you move; after 30 s without a fix the
+  sidebar says so instead of spinning forever.
+
 ## QA and measurement hooks (hidden launch arguments)
+
+`scripts/app-checks.sh` runs the quit, hotkey and stress hooks against the installed app and prints one
+PASS/FAIL line each (`scripts/app-checks.sh 60` for a 60 s stress run).
 
 All are inert unless passed on the command line (`open -a Skyline --args -Hook value`, or the binary
 directly); none is settable from the UI.

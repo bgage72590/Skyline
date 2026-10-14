@@ -7,6 +7,9 @@ import WidgetKit
 @MainActor
 final class WidgetPublisher {
     private var lastContent: Data?
+    /// Why the last write failed (nil after a success). Shown in Settings, so a widget stuck on old data
+    /// has a visible reason before it turns "stale" 2 h later (CR batch 6).
+    private(set) var lastError: String?
     private let home: URL
 
     init(home: URL = FileManager.default.homeDirectoryForCurrentUser) { self.home = home }
@@ -26,9 +29,11 @@ final class WidgetPublisher {
             try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try data.write(to: fileURL, options: .atomic)
             lastContent = content
+            lastError = nil
             WidgetCenter.shared.reloadTimelines(ofKind: "SkylineWeather")
         } catch {
             NSLog("Skyline: widget snapshot not written: %@", error.localizedDescription)
+            lastError = error.localizedDescription // retried on the next update (lastContent unchanged)
         }
     }
 }

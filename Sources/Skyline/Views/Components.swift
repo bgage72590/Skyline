@@ -136,7 +136,7 @@ struct CompassView: View {
             Circle().stroke(.white.opacity(0.3), lineWidth: 1.5)
             ForEach(Self.cardinals, id: \.label) { point in
                 Text(point.label)
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.7))
                     .offset(x: point.x, y: point.y)
             }
@@ -154,7 +154,7 @@ struct CompassView: View {
             if let centerText {
                 VStack(spacing: -2) {
                     Text(centerText).font(.system(size: 17, weight: .semibold))
-                    if let centerUnit { Text(centerUnit).font(.system(size: 9, weight: .medium)).opacity(0.8) }
+                    if let centerUnit { Text(centerUnit).font(.system(size: 10, weight: .medium)).opacity(0.8) }
                 }
             }
         }

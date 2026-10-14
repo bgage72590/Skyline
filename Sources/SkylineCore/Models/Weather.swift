@@ -347,6 +347,6 @@ public struct PlaceSearchResult: Codable, Hashable, Identifiable, Sendable {
 
     public var asLocation: WeatherLocation {
         WeatherLocation(name: name, region: admin1, country: country, coordinate: coordinate,
-                        timeZoneIdentifier: timeZoneIdentifier)
+                        timeZoneIdentifier: timeZoneIdentifier, countryCode: countryCode)
     }
 }

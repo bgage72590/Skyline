@@ -51,7 +51,11 @@ public struct SevereOutlook: Codable, Hashable, Sendable {
     public func sentence(now: Date, timeZone: TimeZone) -> String {
         var cal = Calendar(identifier: .gregorian); cal.timeZone = timeZone
         let when: String
-        if day >= 2 { when = "tomorrow" } else { when = cal.component(.hour, from: now) >= 17 ? "tonight" : "today" }
+        let hour = cal.component(.hour, from: now)
+        // SPC's days run 12Z–12Z (early morning in the US). After midnight the Day 1 outlook still in force
+        // is last night's, and Day 2 is the day that's starting (CR batch 6).
+        let smallHours = hour < 6
+        if day >= 2 { when = smallHours ? "today" : "tomorrow" } else { when = hour >= 17 || smallHours ? "tonight" : "today" }
         let level = risk.level.map { " (level \($0) of 5)" } ?? ""
         return "\(risk.name) of severe storms \(when)\(level)"
     }

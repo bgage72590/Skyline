@@ -51,6 +51,9 @@ final class RadarImageCache {
         config.timeoutIntervalForRequest = 15
         // Tile hosts (IEM, RainViewer) get the plain User-Agent; only api.weather.gov gets the contact.
         config.httpAdditionalHeaders = ["User-Agent": URLSessionHTTPClient.genericUserAgent]
+        config.httpCookieAcceptPolicy = .never
+        config.httpShouldSetCookies = false
+        config.httpCookieStorage = nil
         session = URLSession(configuration: config)
         // Decoded RGBA bytes; live tiles are held by their layers anyway. `-SkylineDecodedCacheMB N` is a
         // measurement hook for the playback-memory work.
@@ -205,9 +208,13 @@ final class RadarImageCache {
     }
 
     nonisolated private static func fetchDecoded(session: URLSession, url: URL) async -> Outcome {
+        // Tile hosts come from responses (RainViewer's `host`): known servers only (L28).
+        guard KnownHosts.isAllowed(url) else { return .missing }
+        RequestStats.shared.note() // includes tiles served from the disk cache
         let data: Data, response: URLResponse
         do { (data, response) = try await session.data(from: url) } catch { return .transientFailure }
         guard let http = response as? HTTPURLResponse else { return .transientFailure }
+        guard KnownHosts.isAllowed(http.url ?? url) else { return .missing }
         switch http.statusCode {
         case 200: break
         case 404, 410: return .missing

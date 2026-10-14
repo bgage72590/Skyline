@@ -87,7 +87,8 @@ final class Batch5Tests: XCTestCase {
 
     func testTorontoMakesNoNWSOrHRRRRequests() async throws {
         let client = MockHTTPClient()
-        let service = WeatherService(client: client, cache: ResponseCache(directory: nil), now: { self.fixtureTime })
+        let t = fixtureTime
+        let service = WeatherService(client: client, cache: ResponseCache(directory: nil), now: { t })
         let toronto = WeatherLocation(name: "Toronto", region: "Ontario", country: "Canada",
                                       coordinate: Coordinate(latitude: 43.65, longitude: -79.38))
         _ = try await service.report(for: toronto)
@@ -96,8 +97,8 @@ final class Batch5Tests: XCTestCase {
         XCTAssertFalse(client.requests.contains { $0.host == "www.spc.noaa.gov" })
     }
 
-    /// A point inside the outline that NWS doesn't serve: asked once, then remembered for a week.
-    func testNWS404IsRememberedForAWeek() async throws {
+    /// A point inside the outline that NWS doesn't serve: asked once, then remembered for a day (CR batch 6).
+    func testNWS404IsRememberedForADay() async throws {
         final class Points404: HTTPClient, @unchecked Sendable {
             let inner = MockHTTPClient()
             func get(_ url: URL, headers: [String: String]) async throws -> Data {
@@ -116,9 +117,12 @@ final class Batch5Tests: XCTestCase {
         XCTAssertEqual(points.count, 1, "not re-asked on the next refresh")
         XCTAssertEqual(client.inner.requests.filter { $0.absoluteString.contains("alerts/active") }.count, 2,
                        "warnings are still asked for (L2); only /points is skipped")
-        clock.now = fixtureTime.addingTimeInterval(8 * 86400)
+        clock.now = fixtureTime.addingTimeInterval(23 * 3600)
         _ = try await service.report(for: border, forceRefresh: true)
-        XCTAssertEqual(client.inner.requests.filter { $0.absoluteString.contains("/points/") }.count, 2, "asked again after a week")
+        XCTAssertEqual(client.inner.requests.filter { $0.absoluteString.contains("/points/") }.count, 1, "still remembered at 23 h")
+        clock.now = fixtureTime.addingTimeInterval(25 * 3600)
+        _ = try await service.report(for: border, forceRefresh: true)
+        XCTAssertEqual(client.inner.requests.filter { $0.absoluteString.contains("/points/") }.count, 2, "asked again after a day")
     }
 
     // MARK: Briefing and rain notification agree

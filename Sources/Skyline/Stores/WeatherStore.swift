@@ -20,7 +20,19 @@ final class WeatherStore {
 
     var savedLocations: [WeatherLocation] = [] { didSet { persistLocations() } }
     var currentLocation: WeatherLocation?
-    var selectedID: String? { didSet { defaults.set(selectedID, forKey: Keys.selected) } }
+    var selectedID: String? {
+        didSet {
+            defaults.set(selectedID, forKey: Keys.selected)
+            // A different city starts on its forecast, not the previous city's map/panel/alert. This used
+            // to be an onChange in LocationDetailView, which never fired: the view is re-created per city
+            // (L32). Selection changes come from user actions, never from layout.
+            if selectedID != oldValue {
+                if radarExpanded { radarExpanded = false }
+                if activeModule != nil { activeModule = nil }
+                if focusedAlertID != nil { focusedAlertID = nil }
+            }
+        }
+    }
     var reports: [String: WeatherReport] = [:]
     var errors: [String: String] = [:]
     var loadingIDs: Set<String> = []
@@ -41,7 +53,12 @@ final class WeatherStore {
     var refreshMinutes: Int { didSet { defaults.set(refreshMinutes, forKey: Keys.refresh); startRefreshLoop() } }
     var locationDenied = false
     /// True while "My Location" is waiting for its first fix (the sidebar shows a loading row).
-    var isLocating = false
+    var isLocating = false { didSet { if isLocating { startLocatingTimeout() } } }
+    /// No fix after `locatingTimeout` (an ignored permission prompt, no Wi-Fi): stop the spinner and say
+    /// so; CoreLocation keeps retrying and the row appears when a fix arrives (L5).
+    var locationUnavailable = false
+    @ObservationIgnored private var locatingTimeoutTask: Task<Void, Never>?
+    static let locatingTimeout: Duration = .seconds(30)
 
     var searchText = ""
     var searchResults: [PlaceSearchResult] = []
@@ -259,7 +276,11 @@ final class WeatherStore {
     func publishWidget() {
         guard let location = menuBarLocation, let report = reports[location.id] else { return }
         widgetPublisher.publish(report, name: location.isCurrentLocation ? "My Location" : location.name, units: units)
+        if widgetError != widgetPublisher.lastError { widgetError = widgetPublisher.lastError }
     }
+
+    /// Set when the widget's data file couldn't be written (Settings shows it).
+    var widgetError: String?
 
     func isLoading(_ location: WeatherLocation) -> Bool { loadingIDs.contains(location.id) }
 
@@ -290,6 +311,9 @@ final class WeatherStore {
         defer { loadingIDs.remove(location.id) }
         do {
             var report = try await service.report(for: location, forceRefresh: force)
+            // My Location moved while this was loading: this answer is for the old place (L4).
+            if location.isCurrentLocation,
+               !CurrentLocationGuard.isCurrent(location.coordinate, current: currentLocation?.coordinate) { return }
             report.location = location
             if defaults.bool(forKey: "SkylineDemoAlert"), report.alerts.isEmpty { report.alerts = [Self.demoAlert(near: location)] }
             if defaults.bool(forKey: "SkylineDemoRain") { report.minutely = Self.demoRain(from: report.current.time) }
@@ -498,8 +522,20 @@ final class WeatherStore {
         locationProvider.start()
     }
 
+    private func startLocatingTimeout() {
+        locatingTimeoutTask?.cancel()
+        locatingTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.locatingTimeout)
+            guard !Task.isCancelled, let self, self.isLocating, self.currentLocation == nil else { return }
+            self.isLocating = false
+            self.locationUnavailable = true
+        }
+    }
+
     private func handleLocation(_ c: CLLocationCoordinate2D) {
         if isLocating { isLocating = false }
+        locatingTimeoutTask?.cancel()
+        if locationUnavailable { locationUnavailable = false }
         // ~1 km from here on: this is what goes to the weather services, Apple's place-name lookup, the
         // saved "last fix" and the verification key (T7). Saved cities keep their own coordinates.
         let coordinate = Coordinate(latitude: c.latitude, longitude: c.longitude).coarse
@@ -509,6 +545,8 @@ final class WeatherStore {
             return
         }
         let isFirstFix = currentLocation == nil
+        // Moved: the old place's forecast must not be shown under My Location while the new one loads (L4).
+        if !isFirstFix, reports[WeatherLocation.currentLocationID] != nil { reports[WeatherLocation.currentLocationID] = nil }
         var location = WeatherLocation(id: WeatherLocation.currentLocationID, name: currentLocation?.name ?? "My Location",
                                        coordinate: coordinate, isCurrentLocation: true)
         location.timeZoneIdentifier = currentLocation?.timeZoneIdentifier
@@ -520,15 +558,18 @@ final class WeatherStore {
         Task {
             var location = location
             let coarse = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
-            if let placemark = try? await CLGeocoder().reverseGeocodeLocation(coarse).first {
+            if let placemark = try? await CLGeocoder().reverseGeocodeLocation(coarse).first,
+               CurrentLocationGuard.isCurrent(coordinate, current: currentLocation?.coordinate) { // a newer fix wins (L4)
                 location.name = placemark.locality ?? placemark.name ?? "My Location"
                 location.region = placemark.administrativeArea
                 location.country = placemark.country
+                location.countryCode = placemark.isoCountryCode // not localized (CR batch 6)
                 location.timeZoneIdentifier = placemark.timeZone?.identifier
                 currentLocation = location
                 persistLastFix(location)
             }
-            await load(location, force: true)
+            guard CurrentLocationGuard.isCurrent(coordinate, current: currentLocation?.coordinate) else { return }
+            await load(currentLocation ?? location, force: true)
         }
     }
 
@@ -555,6 +596,14 @@ final class WeatherStore {
         let start = (now.timeIntervalSince1970 / 900).rounded(.down) * 900
         let mm: [Double] = [0, 0, 0.08, 0.3, 0.7, 1.6, 2.4, 1.3, 0.6, 0.35, 0.2, 0.1, 0, 0]
         return mm.enumerated().map { MinutelyPrecipitation(time: Date(timeIntervalSince1970: start + Double($0.offset) * 900), precipitation: $0.element) }
+    }
+
+    /// Settings › Reset Accuracy Data (L23).
+    func resetAccuracyData() async {
+        await service.verifier?.reset()
+        await service.history?.reset()
+        accuracy = [:]
+        for location in allLocations { await refreshAccuracy(for: location) }
     }
 
     /// Pulls the verifier's summary for a location (cheap: cached until new pairs arrive).

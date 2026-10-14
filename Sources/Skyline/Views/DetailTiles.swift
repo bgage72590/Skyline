@@ -123,7 +123,7 @@ struct HourlyMiniBars: View {
                 Spacer()
                 Text(values.last.map { Fmt.hour($0.0, timeZone) } ?? "")
             }
-            .font(.system(size: 9, weight: .medium))
+            .font(.system(size: 10, weight: .medium))
             .foregroundStyle(Glass.secondaryText)
         }
         .accessibilityHidden(true)

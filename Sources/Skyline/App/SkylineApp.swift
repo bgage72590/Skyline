@@ -8,6 +8,11 @@ struct SkylineApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var store = WeatherStore()
 
+    init() {
+        // L23: start the request-rate clock at launch, not at the first request.
+        _ = RequestStats.shared
+    }
+
     var body: some Scene {
         Window("Skyline", id: SceneID.main) {
             ContentView()

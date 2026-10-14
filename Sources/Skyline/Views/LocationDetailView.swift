@@ -80,9 +80,6 @@ struct LocationDetailView: View {
         .environment(\.isWideLayout, isWide)
         .navigationTitle(location.isCurrentLocation ? "My Location" : location.name)
         .task(id: location.id) { await store.load(location) }
-        .onChange(of: location.id) { _, _ in
-            store.radarExpanded = false; store.activeModule = nil; store.focusedAlertID = nil
-        }
         // Keyboard: the detail area can take focus (⌘⇧F). Space (play/pause radar) is handled by an
         // in-app key monitor (AppActions.installSpaceShortcut) so it works without focus but never
         // while typing in the search field.

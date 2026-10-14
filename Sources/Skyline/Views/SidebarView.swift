@@ -9,6 +9,8 @@ struct SidebarView: View {
     @Environment(WeatherStore.self) private var store
     @Environment(\.undoManager) private var undoManager
     @FocusState private var focused: Bool
+    @State private var typed = ""
+    @State private var typedAt = Date.distantPast
 
     var body: some View {
         // A plain List (no selection binding, so no system highlight) keeps the sidebar search field and
@@ -18,6 +20,11 @@ struct SidebarView: View {
                 if !store.searchText.isEmpty { searchResults }
                 if store.currentLocation == nil && store.isLocating && !store.locationDenied {
                     LocatingRow()
+                } else if store.currentLocation == nil && store.locationUnavailable && !store.locationDenied {
+                    Text("Couldn’t find your location yet. Skyline keeps trying; check Location Services in System Settings › Privacy & Security if this stays.")
+                        .font(.caption)
+                        .foregroundStyle(Glass.secondaryText)
+                        .padding(.horizontal, 6)
                 }
                 if let current = store.currentLocation {
                     row(current, index: 0)
@@ -51,6 +58,19 @@ struct SidebarView: View {
         .focusEffectDisabled()
         .onKeyPress(.upArrow) { store.selectLocation(offset: -1); return .handled }
         .onKeyPress(.downArrow) { store.selectLocation(offset: 1); return .handled }
+        // Type a city's first letters to jump to it, like a standard Mac list (L17).
+        .onKeyPress(characters: .alphanumerics, phases: .down) { press in
+            guard press.modifiers.intersection([.command, .control, .option]).isEmpty else { return .ignored }
+            let now = Date()
+            typed = now.timeIntervalSince(typedAt) < 1.0 ? typed + press.characters : press.characters
+            typedAt = now
+            let list = store.allLocations
+            guard let i = LocationList.typeSelect(typed, in: list.map { $0.isCurrentLocation ? "My Location" : $0.name }) else {
+                return .handled
+            }
+            store.selectedID = list[i].id
+            return .handled
+        }
         .onDeleteCommand {
             // Undoable with ⌘Z (T19).
             if let location = store.selectedLocation, !location.isCurrentLocation {
@@ -194,10 +214,15 @@ struct SidebarRow: View {
                             .help("Shown in the menu bar")
                     }
                 }
-                Text(location.isCurrentLocation ? location.name : Fmt.time(Date(), location.timeZone))
-                    .font(.caption)
-                    .foregroundStyle(Glass.secondaryText)
-                    .lineLimit(1)
+                if location.isCurrentLocation {
+                    Text(location.name).font(.caption).foregroundStyle(Glass.secondaryText).lineLimit(1)
+                } else {
+                    // Ticks with the clock instead of waiting for the next data refresh (L14).
+                    TimelineView(.everyMinute) { context in
+                        Text(Fmt.time(context.date, location.timeZone))
+                            .font(.caption).foregroundStyle(Glass.secondaryText).lineLimit(1)
+                    }
+                }
                 Spacer(minLength: 2)
                 if let alert = report?.activeAlerts().first {
                     Label(alert.event, systemImage: "exclamationmark.triangle.fill")
