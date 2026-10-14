@@ -132,8 +132,16 @@ final class SyncCoordinator {
             let snapshot = inFlight ?? doc
             let current = SyncDocument.rebasing(locations: store.savedLocations, settings: currentSettings(),
                                                 snapshot: snapshot, onto: doc, now: Date())
-            if !current.sameContent(as: doc) { pushAgain = true }
-            apply(current)
+            if current.sameContent(as: doc) {
+                apply(doc)
+            } else {
+                // `last` must be what is actually in the file (doc), not the unwritten rebase; otherwise a
+                // failed follow-up push leaves the edits recorded as "synced" and schedulePush never sends
+                // them until relaunch / another Mac writes.
+                remember(doc)
+                applyToStore(current)
+                pushAgain = true
+            }
             lastError = note
         case .waiting(let message), .failed(let message):
             lastError = message
@@ -166,6 +174,11 @@ final class SyncCoordinator {
 
     private func apply(_ doc: SyncDocument) {
         remember(doc)
+        applyToStore(doc)
+    }
+
+    /// Push `doc`'s settings and cities into UserDefaults / the store (does not touch `last`).
+    private func applyToStore(_ doc: SyncDocument) {
         // Settings first (units affect how cities render), then the list. Unchanged values aren't touched.
         var settingsChanged = false
         for key in Self.settingKeys {

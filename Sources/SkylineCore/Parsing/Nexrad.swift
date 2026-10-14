@@ -25,7 +25,7 @@ public struct NexradStation: Hashable, Sendable, Identifiable, Codable {
 
     /// Lower 48 sites (the picker list; RainViewer covers everywhere else).
     public static let conus: [NexradStation] = all
-        .filter { !["AK", "HI", "PR", "GU", ""].contains($0.state) }
+        .filter { s in let st = s.state.trimmingCharacters(in: .whitespaces); return !st.isEmpty && !["AK", "HI", "PR", "GU"].contains(st) }
         .sorted { ($0.state, $0.name) < ($1.state, $1.name) }
 
     /// Great-circle distance in km.
