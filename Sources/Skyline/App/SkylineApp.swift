@@ -163,6 +163,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             GlobalHotkey.runTestIfRequested()
             GlobalHotkey.showDropdownIfRequested()
             SearchTypeTest.runIfRequested()
+            Updater.showUpdateResultIfNeeded()
+            DockMenuTest.runIfRequested()
+            // Keep activation policy in sync when Settings becomes key or any window closes.
+            let center = NotificationCenter.default
+            center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { DockIcon.apply() }
+            }
+            center.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { note in
+                MainActor.assumeIsolated {
+                    // After this window closes, recompute (main window may still be open).
+                    DispatchQueue.main.async { DockIcon.apply() }
+                }
+            }
         }
     }
 

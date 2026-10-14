@@ -51,18 +51,43 @@ enum Updater {
             fail("This copy of Skyline has no installer inside. Install once with the one-line command in the README.")
             return
         }
-        let log = FileManager.default.temporaryDirectory.appendingPathComponent("skyline-update.log")
+        let log = resultLogURL
         // Detached so it outlives this process: the installer quits Skyline, replaces it and reopens it.
+        // On failure the log is left in place and Skyline is reopened; showUpdateResultIfNeeded reads it (U2).
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         let q = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-        p.arguments = ["-c", "sleep 1; /bin/bash \(q(script.path)) --newer-than \(installedBuild) \(q(zip.path)) > \(q(log.path)) 2>&1 || open -a Skyline"]
+        let mark = q(log.path)
+        p.arguments = ["-c", """
+            sleep 1
+            if /bin/bash \(q(script.path)) --newer-than \(installedBuild) \(q(zip.path)) > \(mark) 2>&1; then
+              rm -f \(mark)
+            else
+              open -a Skyline
+            fi
+            """]
         do {
             try p.run()
         } catch {
             fail(error.localizedDescription); return
         }
         AppExit.perform(.quitCompletely)
+    }
+
+    private static var resultLogURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/skyline-update-result.txt")
+    }
+
+    /// After a failed Update Skyline… the installer leaves a log; show it once and remove it (U2).
+    static func showUpdateResultIfNeeded() {
+        let url = resultLogURL
+        guard let body = try? String(contentsOf: url, encoding: .utf8), !body.isEmpty else { return }
+        try? FileManager.default.removeItem(at: url)
+        let a = NSAlert()
+        a.messageText = "Couldn’t update Skyline"
+        a.informativeText = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        a.runModal()
     }
 
     private static func fail(_ message: String) {

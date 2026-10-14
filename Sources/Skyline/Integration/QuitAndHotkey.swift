@@ -31,6 +31,18 @@ enum AppExit {
     }
 
     /// Brings the main window back (dropdown, Dock click, relaunch, hotkey fallback, Shortcuts).
+    /// Opens Settings from any context (main window, menu-bar dropdown, or ⌃⌥W panel). SettingsLink
+    /// only works inside an app Scene; the hotkey panel hosts the dropdown outside one (QA #3).
+    static func openSettings() {
+        DockIcon.apply(openMainWindow: true) // Settings needs the app menu bar too
+        NSApp.activate()
+        // Private but stable selector used by System Settings / SwiftUI SettingsLink on macOS.
+        let sel = Selector(("showSettingsWindow:"))
+        if NSApp.sendAction(sel, to: nil, from: nil) { return }
+        // Older fallback.
+        NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+    }
+
     static func showMainWindow() {
         AppActions.openMainWindow?()
         NSApp.activate()
@@ -248,7 +260,9 @@ final class HotkeyPanel: NSPanel {
         x = min(max(x, visible.minX + 8), visible.maxX - size.width - 8)
         let top = statusFrame?.minY ?? visible.maxY
         setFrame(NSRect(x: x, y: top - size.height - 4, width: size.width, height: size.height), display: true)
-        NSApp.activate()
-        makeKeyAndOrderFront(nil)
+        // Nonactivating panel: show without NSApp.activate(), which would also raise the main window
+        // in front of whatever the user was looking at (QA #9).
+        orderFrontRegardless()
+        makeKey()
     }
 }

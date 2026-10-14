@@ -500,6 +500,8 @@ final class WeatherStore {
     func setMainWindowOpen(_ open: Bool) {
         guard open != isMainWindowOpen else { return }
         isMainWindowOpen = open
+        // Menu bar / Dock policy: regular while the window is open so menus work; accessory when not.
+        DockIcon.apply(openMainWindow: open)
         if !open {
             setMainWindowVisible(false)
             radar.setPlaying(false)
@@ -695,10 +697,13 @@ final class WeatherStore {
 
     func add(_ result: PlaceSearchResult) {
         let location = result.asLocation
-        if !savedLocations.contains(where: { $0.id == location.id }) {
+        // Same place by id, ~1 km, or name+region+country: select the one we already have (QA #5).
+        if let existing = LocationList.existingDuplicate(of: location, in: savedLocations) {
+            selectedID = existing.id
+        } else {
             savedLocations.append(location)
+            selectedID = location.id
         }
-        selectedID = location.id
         searchText = ""
         searchResults = []
         resultsQuery = ""

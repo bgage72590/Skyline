@@ -9,6 +9,7 @@ import SkylineCore
 /// and checks the file's date (one `stat`) at launch, when the app becomes active, after wake and on
 /// each forecast refresh. A different date means another Mac wrote it: read, merge, apply.
 @MainActor
+@Observable
 final class SyncCoordinator {
     static private(set) var shared: SyncCoordinator?
 
@@ -108,6 +109,7 @@ final class SyncCoordinator {
         var local = SyncDocument.noting(locations: store.savedLocations, settings: currentSettings(), previous: previous, now: Date())
         local.writtenBy = device
         pushing = true
+        inFlight = local
         let io = SyncFileIO(url: fileURL, device: device)
         Task.detached(priority: .utility) { [weak self] in
             let outcome = io.mergeAndWrite(local)
@@ -118,16 +120,25 @@ final class SyncCoordinator {
 
     private var pushing = false
     private var pushAgain = false
+    /// The local document handed to the background merge (to rebase edits made while it ran).
+    private var inFlight: SyncDocument?
 
     private func finishPush(_ outcome: SyncFileIO.Outcome) {
         pushing = false
         switch outcome {
         case .synced(let doc, let note):
-            apply(doc)
+            // The user may have changed cities or settings while the merge ran. Applying `doc` as-is
+            // would revert those edits and the follow-up push would see nothing to send (lost edit).
+            let snapshot = inFlight ?? doc
+            let current = SyncDocument.rebasing(locations: store.savedLocations, settings: currentSettings(),
+                                                snapshot: snapshot, onto: doc, now: Date())
+            if !current.sameContent(as: doc) { pushAgain = true }
+            apply(current)
             lastError = note
         case .waiting(let message), .failed(let message):
             lastError = message
         }
+        inFlight = nil
         if pushAgain { pushAgain = false; pushNow() }
     }
 
@@ -140,7 +151,8 @@ final class SyncCoordinator {
         pushNow()
     }
 
-    private func apply(_ doc: SyncDocument) {
+    /// Persist the merged document as "last written" (state file + stamps) without touching the store.
+    private func remember(_ doc: SyncDocument) {
         last = doc
         lastSynced = Date()
         if let url = fileURL {
@@ -150,6 +162,10 @@ final class SyncCoordinator {
             try? FileManager.default.createDirectory(at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try? data.write(to: stateURL, options: .atomic)
         }
+    }
+
+    private func apply(_ doc: SyncDocument) {
+        remember(doc)
         // Settings first (units affect how cities render), then the list. Unchanged values aren't touched.
         var settingsChanged = false
         for key in Self.settingKeys {

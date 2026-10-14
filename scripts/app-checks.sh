@@ -23,5 +23,12 @@ open "$APP" --args -SkylineSearchTypeTest YES
 for _ in $(seq 1 45); do [ -s "$L" ] && break; sleep 1; done
 if grep -q "PASS" "$L" 2>/dev/null; then echo "PASS search-typing"; else echo "FAIL search-typing"; cat "$L" 2>/dev/null; fail=1; fi
 sleep 2
+# Dock icon off: menus while the window is open, accessory again after ⌘Q-to-menu-bar.
+pkill -x Skyline 2>/dev/null; sleep 1
+D="$HOME/Library/Logs/skyline-dock-test.txt"; rm -f "$D"
+open "$APP" --args -SkylineDockMenuTest YES
+for _ in $(seq 1 30); do [ -s "$D" ] && break; sleep 1; done
+if grep -q "PASS" "$D" 2>/dev/null; then echo "PASS dock-menus"; else echo "FAIL dock-menus"; cat "$D" 2>/dev/null; fail=1; fi
+sleep 2
 open "$APP"
 exit $fail

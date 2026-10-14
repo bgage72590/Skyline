@@ -122,6 +122,18 @@ public struct SyncDocument: Codable, Equatable, Sendable {
         return out
     }
 
+    /// Local edits made while a background merge was in flight (between `snapshot`, the local document
+    /// handed to the merge, and now) are re-noted on top of the merge result, so applying that result
+    /// never reverts them. Returns `merged` unchanged when nothing changed locally in the meantime.
+    public static func rebasing(locations: [WeatherLocation], settings: [String: String],
+                                snapshot: SyncDocument, onto merged: SyncDocument, now: Date) -> SyncDocument {
+        let edits = noting(locations: locations, settings: settings, previous: snapshot, now: now)
+        guard !edits.sameContent(as: snapshot) else { return merged }
+        var out = merge(local: edits, remote: merged, now: now)
+        out.writtenBy = merged.writtenBy
+        return out
+    }
+
     /// Same content (ignores who wrote it and when).
     public func sameContent(as other: SyncDocument) -> Bool {
         locations == other.locations && orderStamp == other.orderStamp && settings == other.settings && removed == other.removed

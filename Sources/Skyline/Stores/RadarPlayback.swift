@@ -13,7 +13,9 @@ import SkylineCore
 @MainActor
 @Observable
 final class RadarPlayback {
-    private(set) var provider: RadarProvider = .nexrad
+    /// Last source the user picked (or the default for the first city). Persisted so switching cities
+    /// and relaunching keep RainViewer vs NEXRAD (QA #6). NEXRAD is still forced off outside CONUS.
+    private(set) var provider: RadarProvider = RadarProvider(rawValue: UserDefaults.standard.string(forKey: "radarProvider") ?? "") ?? .nexrad
     private(set) var frames: [RadarFrame] = []
     /// Loop length (NEXRAD). Persisted; RainViewer ignores it (its free tier is fixed at ~2 h).
     private(set) var range: RadarRange = RadarRange(rawValue: UserDefaults.standard.string(forKey: "radarRange") ?? "") ?? .oneHour
@@ -83,14 +85,16 @@ final class RadarPlayback {
     var isWaitingToPlay: Bool { isPlaying && !isReady && frames.count > 1 }
     var isRunning: Bool { clock.isOccupied }
 
-    /// Picks the right provider for a place (NEXRAD only in the lower 48, by border outline and the saved
-    /// country: QA 4) and loads the frame index if stale. `load: false` when the caller awaits
-    /// `loadFrames()` itself (L7: two index loads raced).
+    /// Picks the right provider for a place and loads the frame index if stale. Keeps the user's last
+    /// choice across cities and relaunches (QA #6); falls back to RainViewer outside CONUS where NEXRAD
+    /// has holes. `load: false` when the caller awaits `loadFrames()` itself (L7: two index loads raced).
     func configure(for location: WeatherLocation, load: Bool = true) {
         inCONUS = location.isInCONUS
         if !inCONUS, layer != .reflectivity { layer = .reflectivity; resetFrames() }
-        let preferred = RadarProvider.preferred(for: location)
-        if preferred != provider { switchProvider(preferred) } else if load { Task { await loadFrames() } }
+        // Use the persisted preference; don't write it back when falling back outside CONUS.
+        let saved = RadarProvider(rawValue: UserDefaults.standard.string(forKey: "radarProvider") ?? "") ?? provider
+        let preferred = RadarProvider.resolved(saved: saved, inCONUS: inCONUS)
+        if preferred != provider { switchProvider(preferred, persist: false) } else if load { Task { await loadFrames() } }
     }
 
     private func resetFrames() {
@@ -118,9 +122,10 @@ final class RadarPlayback {
         Task { await loadFrames(force: true) }
     }
 
-    func switchProvider(_ p: RadarProvider) {
+    func switchProvider(_ p: RadarProvider, persist: Bool = true) {
         guard p != provider else { return }
         provider = p
+        if persist { UserDefaults.standard.set(p.rawValue, forKey: "radarProvider") }
         if p != .nexrad { layer = .reflectivity }
         frames = []
         progress = 0

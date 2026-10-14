@@ -36,7 +36,7 @@ struct SettingsView: View {
                 Toggle("Show Skyline in the Dock", isOn: $showInDock)
                     .onChange(of: showInDock) { _, _ in DockIcon.apply() }
                 if !showInDock {
-                    Text("Skyline stays in the menu bar; open the window from there. Closing the window or ⌘Q always leaves it there; use Quit Skyline in the dropdown to exit.")
+                    Text("Skyline stays in the menu bar (no Dock icon). While the main window or Settings is open, Skyline’s menus appear in the system menu bar; Update Skyline… is also in the menu-bar dropdown. Closing the window or ⌘Q hides the Dock icon again; use Quit Skyline in the dropdown to exit.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Toggle("Open the menu-bar forecast with \(GlobalHotkey.label) from any app", isOn: $globalHotkey)
@@ -206,19 +206,41 @@ extension PrecipitationUnit: UnitLabelled {}
 extension PressureUnit: UnitLabelled {}
 extension DistanceUnit: UnitLabelled {}
 
-/// "Show in Dock" (T10): `.accessory` hides the Dock icon and app menu; the menu-bar extra stays, so
-/// Skyline is always reachable. Applied at launch and whenever the setting changes.
+/// "Show in Dock" (T10): `.accessory` hides the Dock icon when Skyline is menu-bar-only. While the
+/// main window or Settings is up we switch to `.regular` so the system menu bar shows Skyline's menus
+/// (Update Skyline…, Weather, …) even with the Dock icon preference off; closing the window goes
+/// back to `.accessory` (Brian, Oct 14).
 @MainActor
 enum DockIcon {
     static let key = "showInDock"
 
-    static func apply() {
-        let show = UserDefaults.standard.object(forKey: key) as? Bool ?? true
-        let policy: NSApplication.ActivationPolicy = show ? .regular : .accessory
+    /// True when Show-in-Dock is on (default).
+    static var prefersDockIcon: Bool {
+        UserDefaults.standard.object(forKey: key) as? Bool ?? true
+    }
+
+    /// Windows that need the app menu bar (main Skyline window or Settings).
+    static func needsMenuBar(openMainWindow: Bool? = nil) -> Bool {
+        if let openMainWindow, openMainWindow { return true }
+        for w in NSApp.windows where w.isVisible {
+            if AppExit.isAppWindow(w) { return true }
+            // SwiftUI Settings window titles vary; the Settings scene uses this bundle's settings.
+            if w.frameAutosaveName.contains("com_apple_SwiftUI_Settings") || w.title == "Settings"
+                || w.title.hasPrefix("Settings") { return true }
+        }
+        return false
+    }
+
+    static func apply(openMainWindow: Bool? = nil) {
+        let wantRegular = prefersDockIcon || needsMenuBar(openMainWindow: openMainWindow)
+        let policy: NSApplication.ActivationPolicy = wantRegular ? .regular : .accessory
         guard NSApp.activationPolicy() != policy else { return }
         NSApp.setActivationPolicy(policy)
-        // Switching policy can drop the window behind other apps; bring Skyline back.
-        DispatchQueue.main.async { NSApp.activate() }
+        // Switching policy can drop the window behind other apps; bring Skyline back when we just
+        // became regular for a window. Going accessory: don't activate (nothing to show).
+        if wantRegular {
+            DispatchQueue.main.async { NSApp.activate() }
+        }
     }
 }
 
@@ -241,24 +263,43 @@ enum LoginItem {
 /// Polish 1 and 2: where cities and settings sync, and updating from the build Mac's iCloud zip.
 struct SyncSection: View {
     @Environment(WeatherStore.self) private var store
-    @State private var tick = 0
 
     var body: some View {
-        let sync = SyncCoordinator.shared
+        // Pass the singleton into a child so @Observable tracks lastSynced / lastError (QA #7).
+        if let sync = SyncCoordinator.shared {
+            SyncSectionBody(store: store, sync: sync)
+        } else {
+            Section("Sync & updates") {
+                Text("iCloud Drive is off on this Mac; cities stay on this Mac.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+struct SyncSectionBody: View {
+    var store: WeatherStore
+    var sync: SyncCoordinator
+
+    var body: some View {
         Section("Sync & updates") {
-            Text("Your cities, units, clock, refresh interval, menu-bar city and notification choices sync through iCloud Drive (Skyline/sync.json) to every Mac signed in to your Apple Account. Nothing is lost when two Macs change things: cities are merged.")
+            Text("Your cities, units, clock, refresh interval, menu-bar city and notification choices sync through iCloud Drive (Skyline/sync.json) to every Mac signed in to your Apple Account. Nothing is lost when two Macs change things: cities are merged. Status updates when another Mac writes (or on Sync Now); relative time refreshes below.")
                 .font(.callout).foregroundStyle(.secondary)
             HStack {
-                let _ = tick
-                if let error = sync?.lastError {
-                    Text(error).font(.caption).foregroundStyle(.orange)
-                } else if let date = sync?.lastSynced {
-                    Text("Synced \(date.formatted(.relative(presentation: .named))) · \(store.savedLocations.count) cities")
-                        .font(.caption).foregroundStyle(.secondary)
+                TimelineView(.periodic(from: .now, by: 15)) { context in
+                    Group {
+                        if let error = sync.lastError {
+                            Text(error).font(.caption).foregroundStyle(.orange)
+                        } else if let date = sync.lastSynced {
+                            Text("Synced \(date.formatted(.relative(presentation: .named))) · \(store.savedLocations.count) cities")
+                                .font(.caption).foregroundStyle(.secondary)
+                                .id(context.date) // refresh the relative phrase
+                        }
+                    }
                 }
                 Spacer()
-                Button("Sync Now") { sync?.pushNow(); tick += 1 }
-                    .disabled(sync?.fileURL == nil)
+                Button("Sync Now") { sync.pushNow() }
+                    .disabled(sync.fileURL == nil)
             }
             HStack {
                 Text("Build \(Updater.installedBuild)").font(.caption).foregroundStyle(.secondary)

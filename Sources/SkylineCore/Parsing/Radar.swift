@@ -31,6 +31,11 @@ public enum RadarProvider: String, CaseIterable, Codable, Sendable, Identifiable
     public static func preferred(for location: WeatherLocation) -> RadarProvider {
         location.isInCONUS ? .nexrad : .rainViewer
     }
+
+    /// The source to show: the user's saved pick in CONUS, RainViewer everywhere else (QA #6).
+    public static func resolved(saved: RadarProvider, inCONUS: Bool) -> RadarProvider {
+        inCONUS ? saved : .rainViewer
+    }
 }
 
 /// One animation frame: a timestamp and an XYZ tile URL template with `{z}`, `{x}`, `{y}`.

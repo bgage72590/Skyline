@@ -48,4 +48,23 @@ public enum LocationList {
                 .contains { $0.range(of: q, options: opts.union(.anchored)) != nil }
         }
     }
+
+    /// True when `candidate` is the same place as `existing`: same id, or the same name+region+country
+    /// (case- and accent-insensitive), or within about 1 km (QA #5). Used when adding a search result
+    /// so "Boston, MA" from two geocoders doesn't appear twice.
+    public static func isDuplicate(_ candidate: WeatherLocation, of existing: WeatherLocation) -> Bool {
+        if candidate.id == existing.id { return true }
+        if candidate.coordinate.coarse == existing.coordinate.coarse { return true }
+        let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        let nameOK = candidate.name.compare(existing.name, options: opts) == .orderedSame
+        let regionOK = (candidate.region ?? "").compare(existing.region ?? "", options: opts) == .orderedSame
+        let countryOK = (candidate.country ?? "").compare(existing.country ?? "", options: opts) == .orderedSame
+            || (candidate.countryCode != nil
+                && candidate.countryCode?.uppercased() == existing.countryCode?.uppercased())
+        return nameOK && regionOK && countryOK && !candidate.name.isEmpty
+    }
+
+    public static func existingDuplicate(of candidate: WeatherLocation, in list: [WeatherLocation]) -> WeatherLocation? {
+        list.first { isDuplicate(candidate, of: $0) }
+    }
 }

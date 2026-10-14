@@ -110,14 +110,9 @@ struct MenuBarContentView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 // Everything below the headline scrolls if the dropdown would be taller than the screen (T21).
-                // ViewThatFits could pick the scrolling copy when the dropdown window first sizes itself
-                // and then show only a sliver of the details ("sparse" dropdown). FitOrScroll measures the
-                // content's natural height and scrolls only when it's really taller than the screen allows.
-                FitOrScroll(maxHeight: Self.maxDetailsHeight) {
+                // One details tree only (QA #8): scroll when taller than the screen, otherwise leave it still.
+                ScrollableWhenTall(maxHeight: Self.maxDetailsHeight) {
                     details(report)
-                    // VoiceOver reads only the first copy (laid out in full even when it's parked off-screen),
-                    // so the cards are never read twice (Code Reviewer should-fix).
-                    ScrollView { details(report) }.scrollIndicators(.automatic).accessibilityHidden(true)
                 }
                 updatedLine(report)
             } else if let location = store.menuBarLocation {
@@ -164,11 +159,17 @@ struct MenuBarContentView: View {
                     Text(store.units.temperature.label).font(.callout.weight(.semibold)).monospacedDigit()
                 }
                 .help("Switch to \(store.units.temperature == .fahrenheit ? "°C" : "°F")")
-                SettingsLink {
+                // SettingsLink is inert in the ⌃⌥W HotkeyPanel (no Settings scene there). Open the
+                // Settings window the AppKit way so the gear works from both the menu-bar dropdown
+                // and the hotkey panel (QA #3).
+                Button {
+                    AppExit.openSettings()
+                } label: {
                     Image(systemName: "gearshape")
                 }
-                .simultaneousGesture(TapGesture().onEnded { NSApp.activate() })
                 .help("Settings (⌘,)")
+                Button("Update…") { Updater.checkForUpdates() }
+                    .help("Update Skyline from iCloud Drive")
                 if store.loadingIDs.isEmpty {
                     Button {
                         Task { await store.refreshAll(force: true) }
@@ -470,25 +471,29 @@ extension View {
     }
 }
 
-/// Shows the first subview at its natural height when that fits under `maxHeight`, else the second
-/// (a scrolling copy) at `maxHeight`. Pure layout: no state is written while measuring.
-struct FitOrScroll: Layout {
+/// One copy of the content: scrolls only when its natural height exceeds `maxHeight` (QA #8).
+struct ScrollableWhenTall<Content: View>: View {
     var maxHeight: CGFloat
+    @ViewBuilder var content: () -> Content
+    @State private var contentHeight: CGFloat = 0
 
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        guard let content = subviews.first else { return .zero }
-        let natural = content.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil))
-        return CGSize(width: proposal.width ?? natural.width, height: min(natural.height, maxHeight))
+    var body: some View {
+        let needsScroll = contentHeight > maxHeight + 0.5
+        ScrollView(.vertical, showsIndicators: needsScroll) {
+            content()
+                .background {
+                    GeometryReader { geo in
+                        Color.clear.preference(key: DetailsHeightKey.self, value: geo.size.height)
+                    }
+                }
+        }
+        .scrollDisabled(!needsScroll)
+        .frame(maxHeight: maxHeight)
+        .onPreferenceChange(DetailsHeightKey.self) { contentHeight = $0 }
     }
+}
 
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        guard subviews.count == 2 else { subviews.first?.place(at: bounds.origin, proposal: ProposedViewSize(bounds.size)); return }
-        let natural = subviews[0].sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
-        let fits = natural.height <= maxHeight + 0.5
-        let shown = fits ? subviews[0] : subviews[1]
-        let hidden = fits ? subviews[1] : subviews[0]
-        shown.place(at: bounds.origin, proposal: ProposedViewSize(width: bounds.width, height: bounds.height))
-        // The unused copy is laid out at zero size far outside the window, so it never draws over anything.
-        hidden.place(at: CGPoint(x: -100_000, y: -100_000), proposal: .zero)
-    }
+private struct DetailsHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }

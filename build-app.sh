@@ -52,6 +52,8 @@ GIT_REV="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 1)"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 # The verified installer ships inside the signed app, so "Update Skyline…" runs a copy whose integrity
 # the app's own signature covers (polish 2).
+# Note (QA N2): install-verified.sh refuses zip symlink entries. This app has none today; a future
+# .framework bundle would need an allowlist under Contents/Frameworks/ in that script.
 cp "$ROOT/scripts/install-verified.sh" "$APP/Contents/Resources/install-verified.sh"
 chmod +x "$APP/Contents/Resources/install-verified.sh"
 

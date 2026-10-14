@@ -34,12 +34,15 @@ SRC="${1:-$DEFAULT_ZIP}"
 TMP="$(mktemp -d)"
 STAGE="$(dirname "$DEST")/.$APP_NAME.app.new"
 BACKUP="$(dirname "$DEST")/.$APP_NAME.app.previous"
-trap 'rm -rf "$TMP" "$STAGE"' EXIT
+# If the script dies between moving the old app aside and moving the new one in, put the old one back.
+trap '[[ ! -e "$DEST" && -e "$BACKUP" ]] && mv "$BACKUP" "$DEST"; rm -rf "$TMP" "$STAGE"' EXIT
 case "$SRC" in
   *.zip)
     brctl download "$SRC" 2>/dev/null || true   # make sure iCloud has the bytes locally
     # Before extracting: no absolute paths, no ".." components, no symlinks (a symlinked directory
     # entry followed by files "inside" it would write outside $TMP before the signature is checked).
+    # Note (QA N2): if a future build ever ships a .framework (those contain symlinks), allowlist
+    # paths under Skyline.app/Contents/Frameworks/*.framework/ only — refuse every other symlink.
     LISTING="$(zipinfo -l "$SRC")" || { echo "Not a readable zip: $SRC" >&2; exit 1; }
     if zipinfo -1 "$SRC" | grep -qE '(^/|(^|/)\.\.(/|$))'; then echo "REFUSING: unsafe path in $SRC" >&2; exit 1; fi
     if grep -qE '^l' <<<"$LISTING"; then echo "REFUSING: symlink entry in $SRC" >&2; exit 1; fi
@@ -85,7 +88,7 @@ if ! codesign --verify --strict --deep -R="$REQUIREMENT" "$STAGE"; then
 fi
 xattr -dr com.apple.quarantine "$STAGE" 2>/dev/null || true
 rm -rf "$BACKUP"
-[[ -e "$DEST" ]] && mv "$DEST" "$BACKUP"
+if [[ -e "$DEST" ]]; then mv "$DEST" "$BACKUP"; fi
 if ! mv "$STAGE" "$DEST"; then
   [[ -e "$BACKUP" ]] && mv "$BACKUP" "$DEST"
   echo "Install failed; previous version restored." >&2; exit 1
