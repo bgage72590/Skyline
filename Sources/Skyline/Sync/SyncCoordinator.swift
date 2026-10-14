@@ -33,6 +33,7 @@ final class SyncCoordinator {
     private(set) var lastError: String?
     /// accuracy.json next to sync.json (nil without iCloud Drive or a verifier).
     @ObservationIgnored private var accuracySync: AccuracyFileSync?
+    @ObservationIgnored private var lastLegacyFingerprint: LegacyAccuracyFingerprint?
 
     static func iCloudFolder() -> URL? {
         let docs = FileManager.default.homeDirectoryForCurrentUser
@@ -195,7 +196,12 @@ final class SyncCoordinator {
     /// counts as generation 1.
     private func absorbLegacyAccuracy(from doc: SyncDocument) {
         guard let verifier = store.service.verifier, doc.accuracy != nil || doc.accuracyResetAt != nil else { return }
-        let file = AccuracyFile(reset: doc.accuracyResetAt.map { AccuracyReset(generation: 1, at: $0) }, pairs: doc.accuracy ?? [])
+        // Only when the build-31 data changed since the last absorb (build-34 review L2).
+        let fingerprint = LegacyAccuracyFingerprint(doc)
+        guard fingerprint != lastLegacyFingerprint else { return }
+        lastLegacyFingerprint = fingerprint
+        // A build-31 reset is generation 0, so it never undoes a reset made on build 32+ (QA build-34 SF-A).
+        let file = AccuracyFile(reset: doc.accuracyResetAt.map { AccuracyReset(generation: 0, at: $0) }, pairs: doc.accuracy ?? [])
         Task.detached(priority: .utility) { [weak self] in
             guard await verifier.absorb(file) else { return }
             await self?.refreshAllAccuracy()

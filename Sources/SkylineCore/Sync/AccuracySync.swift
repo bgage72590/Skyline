@@ -3,14 +3,13 @@ import Foundation
 /// Sharing the forecast-vs-NWS accuracy learning between Macs (build 31). The scorecard and the adaptive
 /// blend weights are both computed from verified pairs, so the pairs are what travels in sync.json.
 ///
-/// Merge rule: a grow-only set with de-duplication. Records for the same location key (the station's
-/// place) and valid hour whose issue times are within `sameIssuance` (90 min) of the earliest one in their
-/// run are one verification (build 33, M1: each Mac issues on its own 3 h cadence, so two Macs' copies of
-/// the same forecast can sit on either side of any fixed slot boundary; one Mac's own issuances are always
-/// >= 3 h apart, so they never merge). Within such a cluster each model is counted once: the earliest
-/// issued record's value wins, later ones only fill models it lacks. Clusters are formed from the sorted
-/// union, so the result is the same whatever order Macs merge in (commutative, idempotent).
-/// A reset ("Reset Accuracy Data") drops records issued before it everywhere.
+/// Merge rule (build 35, build-34 review N-M1): a grow-only set keyed by (location, issue time, valid
+/// hour). Copies of the same record from two Macs are one record (models filled in, deterministic tie-break);
+/// nothing else is combined on disk, so merging is a plain set union: commutative, associative and
+/// idempotent, and the Macs converge whatever order they merge in.
+/// Cross-Mac duplicates (two Macs issuing the same forecast minutes apart) are collapsed only when
+/// scoring, by `collapsedForScoring`, from the full set every time, so the result never depends on merge
+/// order either. A reset ("Reset Accuracy Data") drops records issued before it everywhere.
 public enum AccuracySync {
     /// Only the most recent pairs travel (each Mac keeps its own 90-day history locally).
     public static let windowDays = 30.0
@@ -23,6 +22,12 @@ public enum AccuracySync {
     struct GroupKey: Hashable {
         let loc: String
         let valid: Date
+    }
+
+    struct RecordKey: Hashable {
+        let loc: String
+        let valid: Date
+        let issued: Date
     }
 
     static func normalized(_ v: VerifiedRecord) -> VerifiedRecord {
@@ -43,19 +48,19 @@ public enum AccuracySync {
         return (try? e.encode(v)).map { String(decoding: $0, as: UTF8.self) } ?? ""
     }
 
-    /// Union of `a` and `b`, de-duplicated by (location, valid hour, issuance within 90 min, model).
+    /// Union of `a` and `b` (same location, valid hour and issue time = one record).
     /// - Parameters:
     ///   - resetAt: drop records issued before this.
     ///   - now: when given, keep only `windowDays` (by valid time) and at most `maxRecords`.
     public static func merge(_ a: [VerifiedRecord], _ b: [VerifiedRecord], resetAt: Date? = nil,
                              now: Date? = nil) -> [VerifiedRecord] {
         let cutoff = now.map { $0.addingTimeInterval(-windowDays * 86400) }
-        var groups: [GroupKey: [VerifiedRecord]] = [:]
+        var groups: [RecordKey: [VerifiedRecord]] = [:]
         for raw in a + b {
             let v = normalized(raw)
             if let resetAt, v.r.issued < resetAt { continue }
             if let cutoff, v.r.valid < cutoff { continue }
-            groups[key(v), default: []].append(v)
+            groups[RecordKey(loc: v.r.loc, valid: v.r.valid, issued: v.r.issued), default: []].append(v)
         }
         var out: [VerifiedRecord] = []
         out.reserveCapacity(groups.count)
@@ -64,17 +69,12 @@ public enum AccuracySync {
             let sorted = unique.count == 1 ? unique : unique.sorted {
                 $0.r.issued != $1.r.issued ? $0.r.issued < $1.r.issued : tieKey($0) < tieKey($1)
             }
-            var i = 0
-            while i < sorted.count {
-                var first = sorted[i]
-                let end = first.r.issued.addingTimeInterval(sameIssuance)
-                i += 1
-                while i < sorted.count, sorted[i].r.issued < end {
-                    for (model, values) in sorted[i].r.f where first.r.f[model] == nil { first.r.f[model] = values }
-                    i += 1
-                }
-                out.append(first)
+            // Same (location, valid, issue time): one record, models filled in from the other copies.
+            var first = sorted[0]
+            for other in sorted.dropFirst() {
+                for (model, values) in other.r.f where first.r.f[model] == nil { first.r.f[model] = values }
             }
+            out.append(first)
         }
         out.sort {
             if $0.r.valid != $1.r.valid { return $0.r.valid < $1.r.valid }
@@ -82,6 +82,42 @@ public enum AccuracySync {
             return $0.r.issued < $1.r.issued
         }
         if now != nil, out.count > maxRecords { out = Array(out.suffix(maxRecords)) }
+        return out
+    }
+
+    /// Cross-Mac duplicates collapsed for scoring (build 35): per location and valid hour, issuances are
+    /// split into runs wherever the gap to the previous issuance is at least `sameIssuance` (90 min); each
+    /// run counts once (earliest issue time and its values, later ones only fill missing models). One Mac's
+    /// own issuances are >= 3 h apart, so they never collapse. Computed from the whole set every time, so
+    /// it doesn't depend on merge order.
+    public static func collapsedForScoring(_ records: [VerifiedRecord]) -> [VerifiedRecord] {
+        var groups: [GroupKey: [VerifiedRecord]] = [:]
+        for v in records { groups[GroupKey(loc: v.r.loc, valid: v.r.valid), default: []].append(v) }
+        var out: [VerifiedRecord] = []
+        out.reserveCapacity(groups.count)
+        for (_, members) in groups {
+            if members.count == 1 { out.append(members[0]); continue }
+            let sorted = members.sorted {
+                $0.r.issued != $1.r.issued ? $0.r.issued < $1.r.issued : tieKey($0) < tieKey($1)
+            }
+            var run = sorted[0]
+            var previous = sorted[0].r.issued
+            for v in sorted.dropFirst() {
+                if v.r.issued.timeIntervalSince(previous) >= sameIssuance {
+                    out.append(run)
+                    run = v
+                } else {
+                    for (model, values) in v.r.f where run.r.f[model] == nil { run.r.f[model] = values }
+                }
+                previous = v.r.issued
+            }
+            out.append(run)
+        }
+        out.sort {
+            if $0.r.valid != $1.r.valid { return $0.r.valid < $1.r.valid }
+            if $0.r.loc != $1.r.loc { return $0.r.loc < $1.r.loc }
+            return $0.r.issued < $1.r.issued
+        }
         return out
     }
 }
@@ -101,19 +137,24 @@ public struct AccuracyReset: Codable, Equatable, Sendable {
     public static let futureTolerance: TimeInterval = 10 * 60
 
     /// `at` no later than `now` + tolerance (a Mac whose clock runs ahead can't block learning).
-    public func clamped(now: Date) -> AccuracyReset {
+    /// A future `at` is pulled back to when the file carrying it was written (`writtenBound`: the
+    /// writer's `writtenAt` when plausible, or the file's modification date), not just to this Mac's
+    /// clock, so pairs issued after the real reset but before this Mac read it are kept (build-32
+    /// review M2). Without a bound it falls back to `now`.
+    public func clamped(now: Date, writtenBound: Date? = nil) -> AccuracyReset {
         var r = self
-        if r.at > now.addingTimeInterval(Self.futureTolerance) { r.at = now }
+        if r.at > now.addingTimeInterval(Self.futureTolerance) { r.at = min(now, writtenBound ?? now) }
         r.at = Date(timeIntervalSince1970: r.at.timeIntervalSince1970.rounded(.down))
         return r
     }
 
-    /// The reset that wins: higher generation; same generation, the earlier stamp (keeps more data,
-    /// same answer on every Mac).
+    /// The reset that wins: higher generation; same generation, the earlier stamp, deterministically
+    /// (keeps more data, same answer on every Mac whatever order they merge in).
     public static func winner(_ a: AccuracyReset?, _ b: AccuracyReset?) -> AccuracyReset? {
         guard let a else { return b }
         guard let b else { return a }
         if a.generation != b.generation { return a.generation > b.generation ? a : b }
+        // Same generation: the earlier stamp wins (Brian's decision; keeps more data, deterministic).
         return a.at <= b.at ? a : b
     }
 }
@@ -126,9 +167,11 @@ public struct AccuracyFile: Equatable, Sendable {
     public var format = AccuracyFile.currentFormat
     public var reset: AccuracyReset?
     public var pairs: [VerifiedRecord] = []
+    /// When the writer wrote the file, by its clock (bounds a future-dated reset, see `clamped`).
+    public var writtenAt: Date?
 
-    public init(reset: AccuracyReset? = nil, pairs: [VerifiedRecord] = []) {
-        self.reset = reset; self.pairs = pairs
+    public init(reset: AccuracyReset? = nil, pairs: [VerifiedRecord] = [], writtenAt: Date? = nil) {
+        self.reset = reset; self.pairs = pairs; self.writtenAt = writtenAt
     }
 
     public func encoded() throws -> Data {
@@ -146,14 +189,21 @@ public struct AccuracyFile: Equatable, Sendable {
     /// Merge this Mac's pairs with the file's (and any iCloud conflict versions).
     /// - Returns: the merged file, and whether it holds anything the file lacked (only then is it worth
     ///   writing; pairs dropped only because the 30-day window moved don't count).
-    public static func merge(local: AccuracyFile, remote: AccuracyFile?, now: Date) -> (file: AccuracyFile, hasNew: Bool) {
-        let reset = AccuracyReset.winner(local.reset?.clamped(now: now), remote?.reset?.clamped(now: now))
+    public static func merge(local: AccuracyFile, remote: AccuracyFile?, now: Date,
+                             remoteFileDate: Date? = nil) -> (file: AccuracyFile, hasNew: Bool) {
+        // Best estimate of when the remote file (and any reset in it) was written: the writer's own stamp
+        // when it isn't in the future, else the file's modification date.
+        let tolerance = AccuracyReset.futureTolerance
+        let plausibleWrite = remote?.writtenAt.flatMap { $0 <= now.addingTimeInterval(tolerance) ? $0 : nil }
+        let bound = [plausibleWrite, remoteFileDate].compactMap { $0 }.min()
+        let remoteReset = remote?.reset?.clamped(now: now, writtenBound: bound)
+        let reset = AccuracyReset.winner(local.reset?.clamped(now: now), remoteReset)
         let pairs = AccuracySync.merge(local.pairs, remote?.pairs ?? [], resetAt: reset?.at, now: now)
         let out = AccuracyFile(reset: reset, pairs: pairs)
         guard let remote else { return (out, !pairs.isEmpty || reset != nil) }
         // Compare with the file pruned by the same rules (same `now`), so window drops aren't "new".
         let remotePruned = AccuracySync.merge(remote.pairs, [], resetAt: reset?.at, now: now)
-        let hasNew = reset != remote.reset?.clamped(now: now) || pairs != remotePruned
+        let hasNew = reset != remoteReset || pairs != remotePruned
         return (out, hasNew)
     }
 
@@ -167,6 +217,7 @@ public struct AccuracyFile: Equatable, Sendable {
     private struct Wire: Codable {
         var v: Int
         var reset: ResetWire?
+        var w: Int64?
         var locs: [String]
         var models: [String]
         var g: [Group?]
@@ -188,6 +239,7 @@ public struct AccuracyFile: Equatable, Sendable {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             v = try c.decode(Int.self, forKey: .v)
             reset = try? c.decodeIfPresent(ResetWire.self, forKey: .reset)
+            w = try? c.decodeIfPresent(Int64.self, forKey: .w)
             locs = try c.decode([String].self, forKey: .locs)
             models = try c.decode([String].self, forKey: .models)
             g = (try c.decode([Lenient<Group>].self, forKey: .g)).map(\.value)
@@ -196,6 +248,7 @@ public struct AccuracyFile: Equatable, Sendable {
         init(_ f: AccuracyFile) {
             v = f.format
             reset = f.reset.map { ResetWire(g: $0.generation, at: Int64($0.at.timeIntervalSince1970.rounded(.down))) }
+            w = f.writtenAt.map { Int64($0.timeIntervalSince1970.rounded(.down)) }
             locs = Array(Set(f.pairs.map(\.r.loc))).sorted()
             models = Array(Set(f.pairs.flatMap(\.r.f.keys))).sorted()
             let locIndex = Dictionary(uniqueKeysWithValues: locs.enumerated().map { ($1, $0) })
@@ -239,7 +292,8 @@ public struct AccuracyFile: Equatable, Sendable {
                 }
             }
             return AccuracyFile(reset: reset.map { AccuracyReset(generation: $0.g, at: Date(timeIntervalSince1970: TimeInterval($0.at))) },
-                                pairs: AccuracySync.merge(pairs, []))
+                                pairs: AccuracySync.merge(pairs, []),
+                                writtenAt: w.map { Date(timeIntervalSince1970: TimeInterval($0)) })
         }
     }
 }
@@ -250,4 +304,30 @@ private func finite(_ x: Double?) -> Double? { x.flatMap { $0.isFinite ? $0 : ni
 struct Lenient<T: Decodable>: Decodable {
     let value: T?
     init(from decoder: Decoder) throws { value = try? T(from: decoder) }
+}
+
+/// One-at-a-time runner state for the accuracy sync (build-32 review M1). A request that arrives while a
+/// pass runs is folded into one follow-up pass (its `force` kept), so passes never overlap and a burst of
+/// requests costs at most one extra pass. Pure state so it can be unit-tested; the actor holds one.
+public struct CoalescingGate: Sendable {
+    public private(set) var running = false
+    private var rerun = false
+    private var rerunForce = false
+
+    public init() {}
+
+    /// Ask to run. True: start a pass now. False: one is running; it will do another pass afterwards.
+    public mutating func begin(force: Bool) -> Bool {
+        if running { rerun = true; rerunForce = rerunForce || force; return false }
+        running = true
+        return true
+    }
+
+    /// After a pass: the `force` for one more pass, or nil when done (the gate is then free).
+    public mutating func next() -> Bool? {
+        guard rerun else { running = false; return nil }
+        let f = rerunForce
+        rerun = false; rerunForce = false
+        return f
+    }
 }

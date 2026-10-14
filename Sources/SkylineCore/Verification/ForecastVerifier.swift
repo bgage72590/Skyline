@@ -263,7 +263,7 @@ public actor ForecastVerifier {
         load()
         if let w = cachedWeights[key] { return w }
         // Learn from every member's full record (see `dedupingNOAAFamily(dropDuplicates:)`); display stays de-duplicated.
-        let learning = AccuracyScorer.score(verified.filter { $0.r.loc == key }, now: now(), dedupe: false)
+        let learning = AccuracyScorer.score(AccuracySync.collapsedForScoring(verified.filter { $0.r.loc == key }), now: now(), dedupe: false)
         let w = AdaptiveWeighting.weights(from: learning, config: config)
         cachedWeights[key] = w
         return w
@@ -274,7 +274,7 @@ public actor ForecastVerifier {
         let s = scores(key)
         let t = now()
         let m = meta[key]
-        let recentRecords = verified.filter { $0.r.loc == key && $0.r.valid >= t.addingTimeInterval(-7 * 86400) && $0.r.leadHours < 48 }
+        let recentRecords = AccuracySync.collapsedForScoring(verified.filter { $0.r.loc == key }).filter { $0.r.valid >= t.addingTimeInterval(-7 * 86400) && $0.r.leadHours < 48 }
         let recent = AccuracyScorer.score(recentRecords, now: t, halfLifeDays: 0)
         let candidates = recent.overall.values.filter { $0.source != .blend && $0.tempN >= config.minSamples }
         let winner = candidates.min { ($0.tempMAE ?? .infinity) < ($1.tempMAE ?? .infinity) }
@@ -293,7 +293,7 @@ public actor ForecastVerifier {
 
     private func scores(_ key: String) -> AccuracyScorer.Scores {
         if let s = cachedScores[key] { return s }
-        let s = AccuracyScorer.score(verified.filter { $0.r.loc == key }, now: now())
+        let s = AccuracyScorer.score(AccuracySync.collapsedForScoring(verified.filter { $0.r.loc == key }), now: now())
         cachedScores[key] = s
         return s
     }

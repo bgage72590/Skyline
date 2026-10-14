@@ -21,8 +21,20 @@ actor AccuracyFileSync {
         self.verifier = verifier
     }
 
+    private var gate = CoalescingGate()
+
     /// Returns true when this Mac's accuracy history changed (the scorecards should refresh).
+    /// One sync at a time (build-32 review M1): the actor is re-entrant at each `await`, so a call that
+    /// arrives while one is running is folded into a single follow-up pass instead of overlapping it
+    /// (overlapping passes could both mark the same unsynced pairs as synced).
     func run(force: Bool) async -> Bool {
+        guard gate.begin(force: force) else { return false }
+        var changed = await runOnce(force: force)
+        while let f = gate.next() { changed = await runOnce(force: f) || changed }
+        return changed
+    }
+
+    private func runOnce(force: Bool) async -> Bool {
         let date = modificationDate()
         let remoteChanged = date == nil ? false : date != lastFileDate
         let unsynced = await verifier.unsyncedPairCount
@@ -57,11 +69,12 @@ actor AccuracyFileSync {
         var coordError: NSError?
         NSFileCoordinator().coordinate(writingItemAt: url, options: .forMerging, error: &coordError) { u in
             let now = Date()
+            let fileDate = (try? fm.attributesOfItem(atPath: u.path))?[.modificationDate] as? Date
             var remote: AccuracyFile?
             let conflicts = NSFileVersion.unresolvedConflictVersionsOfItem(at: u) ?? []
             for v in conflicts {
                 if let data = try? Data(contentsOf: v.url), let f = AccuracyFile.decode(data) {
-                    remote = remote.map { AccuracyFile.merge(local: $0, remote: f, now: now).file } ?? f
+                    remote = remote.map { AccuracyFile.merge(local: $0, remote: f, now: now, remoteFileDate: v.modificationDate).file } ?? f
                 }
             }
             if fm.fileExists(atPath: u.path) {
@@ -73,16 +86,16 @@ actor AccuracyFileSync {
                     // only accuracy pairs, which every Mac also keeps locally).
                     if let peek = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                        let v = peek["v"] as? Int, v > AccuracyFile.currentFormat { return }
-                    let merged = AccuracyFile.merge(local: local, remote: remote, now: now)
+                    let merged = AccuracyFile.merge(local: local, remote: remote, now: now, remoteFileDate: fileDate)
                     result = Result(file: merged.file, hasNew: true, wrote: write && Self.write(merged.file, to: u))
                     return
                 }
-                remote = remote.map { AccuracyFile.merge(local: $0, remote: f, now: now).file } ?? f
+                remote = remote.map { AccuracyFile.merge(local: $0, remote: f, now: now, remoteFileDate: fileDate).file } ?? f
             } else {
                 let placeholder = u.deletingLastPathComponent().appendingPathComponent("." + u.lastPathComponent + ".icloud")
                 if fm.fileExists(atPath: placeholder.path) { try? fm.startDownloadingUbiquitousItem(at: u); return }
             }
-            let merged = AccuracyFile.merge(local: local, remote: remote, now: now)
+            let merged = AccuracyFile.merge(local: local, remote: remote, now: now, remoteFileDate: fileDate)
             let needsWrite = merged.hasNew || !conflicts.isEmpty
             let wrote = write && needsWrite && Self.write(merged.file, to: u)
             if wrote, !conflicts.isEmpty {
@@ -96,6 +109,8 @@ actor AccuracyFileSync {
     }
 
     private static func write(_ file: AccuracyFile, to u: URL) -> Bool {
+        var file = file
+        file.writtenAt = Date()
         guard let data = try? file.encoded() else { return false }
         return (try? data.write(to: u, options: .atomic)) != nil
     }

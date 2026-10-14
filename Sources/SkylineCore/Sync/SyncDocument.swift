@@ -150,9 +150,23 @@ public struct SyncDocument: Codable, Equatable, Sendable {
         // Accuracy pairs live in accuracy.json since build 32. The build-31 fields are passed through as the
         // file has them (never merged, never a reason to write; build-32 review N-H1): stripping them made a
         // build-31 and a build-32 Mac rewrite sync.json back and forth on every refresh.
-        out.accuracy = remote.accuracy ?? local.accuracy
-        out.accuracyResetAt = remote.accuracyResetAt ?? local.accuracyResetAt
+        // Build 35 (QA build-34 SF-B): only what the file itself has is passed through (never re-added from
+        // this Mac's copy), and it ages out once its newest pair is older than the 30-day window, so a
+        // leftover build-31 blob disappears from sync.json after the last build-31 Mac stops writing it.
+        let legacy = Self.liveLegacyAccuracy(remote, now: now)
+        out.accuracy = legacy.accuracy
+        out.accuracyResetAt = legacy.resetAt
         return out
+    }
+
+    /// The build-31 accuracy fields of `doc`, or nil once stale (newest pair, or the reset when there are no
+    /// pairs, older than `AccuracySync.windowDays`).
+    static func liveLegacyAccuracy(_ doc: SyncDocument, now: Date) -> (accuracy: [VerifiedRecord]?, resetAt: Date?) {
+        let cutoff = now.addingTimeInterval(-AccuracySync.windowDays * 86400)
+        let newest = [doc.accuracy?.map(\.r.valid).max(), doc.accuracy?.isEmpty == false ? nil : doc.accuracyResetAt]
+            .compactMap { $0 }.max()
+        guard let newest, newest >= cutoff else { return (nil, nil) }
+        return (doc.accuracy, doc.accuracyResetAt)
     }
 
     /// Local edits made while a background merge was in flight (between `snapshot`, the local document
@@ -230,5 +244,21 @@ public enum SyncValue {
         case "a:": return try? JSONDecoder().decode([String].self, from: Data(body.utf8))
         default: return nil
         }
+    }
+}
+
+/// Cheap identity of a sync.json's build-31 accuracy fields, to absorb them only when they change.
+public struct LegacyAccuracyFingerprint: Equatable, Sendable {
+    let count: Int
+    let newestValid: Date?
+    let newestIssued: Date?
+    let resetAt: Date?
+
+    public init(_ doc: SyncDocument) {
+        let a = doc.accuracy ?? []
+        count = a.count
+        newestValid = a.map(\.r.valid).max()
+        newestIssued = a.map(\.r.issued).max()
+        resetAt = doc.accuracyResetAt
     }
 }

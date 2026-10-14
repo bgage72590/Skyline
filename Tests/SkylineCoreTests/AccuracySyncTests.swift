@@ -16,7 +16,9 @@ final class AccuracySyncTests: XCTestCase {
         // Mac A and Mac B issued in the same 3 h slot for the same station hour: one record, each model once.
         let a = pair(issued: 600, valid: 7200, [.blend: SourceValues(t: 14), .ecmwf: SourceValues(t: 13)])
         let b = pair(issued: 1800, valid: 7200, [.blend: SourceValues(t: 16), .icon: SourceValues(t: 12)])
-        let m = AccuracySync.merge([a], [b])
+        // Build 35: merge keeps both copies; the cross-Mac duplicate is collapsed when scoring.
+        XCTAssertEqual(AccuracySync.merge([a], [b]).count, 2)
+        let m = AccuracySync.collapsedForScoring(AccuracySync.merge([a], [b]))
         XCTAssertEqual(m.count, 1)
         XCTAssertEqual(m[0].r.f["blend"]?.t, 14, "earliest issuance wins for a model both have")
         XCTAssertEqual(m[0].r.f["ecmwf_ifs025"]?.t, 13)

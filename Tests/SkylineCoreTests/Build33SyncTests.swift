@@ -17,13 +17,15 @@ final class Build33SyncTests: XCTestCase {
         // Mac A issued at 07:50, Mac B at 08:05 (a 3 h UTC boundary between them): one verification.
         let a = pair(issued: -600, valid: 7200, ["blend": SourceValues(t: 14), "ecmwf_ifs025": SourceValues(t: 13)])
         let b = pair(issued: 300, valid: 7200, ["blend": SourceValues(t: 16), "icon_seamless": SourceValues(t: 12)])
-        let m = AccuracySync.merge([a], [b])
+        // Build 35: both copies stay on disk; scoring counts them once.
+        let merged = AccuracySync.merge([a], [b])
+        let m = AccuracySync.collapsedForScoring(merged)
         XCTAssertEqual(m.count, 1)
         XCTAssertEqual(m[0].r.issued, t0.addingTimeInterval(-600), "earliest issuance kept")
         XCTAssertEqual(m[0].r.f["blend"]?.t, 14)
         XCTAssertEqual(m[0].r.f["icon_seamless"]?.t, 12)
-        XCTAssertEqual(AccuracySync.merge([b], [a]), m)
-        XCTAssertEqual(AccuracySync.merge(m, [a, b]), m, "idempotent")
+        XCTAssertEqual(AccuracySync.merge([b], [a]), merged)
+        XCTAssertEqual(AccuracySync.merge(merged, [a, b]), merged, "idempotent")
     }
 
     func testOneMacsOwnIssuancesNeverMerge() {
@@ -39,10 +41,10 @@ final class Build33SyncTests: XCTestCase {
     func testClusteringIsOrderIndependentWithThreeMacs() {
         let recs = [pair(issued: 0, valid: 36000), pair(issued: 3000, valid: 36000, ["nws": SourceValues(t: 1)]),
                     pair(issued: 6000, valid: 36000, ["gfs_seamless": SourceValues(t: 2)])]
-        let forward = AccuracySync.merge(recs, [])
-        XCTAssertEqual(AccuracySync.merge(recs.reversed(), []), forward)
-        XCTAssertEqual(AccuracySync.merge([recs[2]], [recs[0], recs[1]]), forward)
-        XCTAssertEqual(forward.count, 2, "0 and 50 min merge; 100 min starts a new cluster")
+        let forward = AccuracySync.collapsedForScoring(AccuracySync.merge(recs, []))
+        XCTAssertEqual(AccuracySync.collapsedForScoring(AccuracySync.merge(recs.reversed(), [])), forward)
+        XCTAssertEqual(AccuracySync.collapsedForScoring(AccuracySync.merge([recs[2]], [recs[0], recs[1]])), forward)
+        XCTAssertEqual(forward.count, 1, "build 35: 50-min gaps chain into one run")
     }
 
     // MARK: M2
