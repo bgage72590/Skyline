@@ -102,16 +102,32 @@ public actor WeatherService {
 
     /// - Parameter future: append HRRR future-radar frames after the newest scan (NEXRAD only, T12). If the
     ///   HRRR run time can't be fetched, the observed loop is returned on its own.
+    /// `site` (NEXRAD only): a single WSR-88D site id ("OKX"); nil for the national composite. A site
+    /// with no recent scans returns no frames, and the caller falls back to the composite.
     public func radarFrames(_ provider: RadarProvider, range: RadarRange = .oneHour, future: Bool = false,
-                            forceRefresh: Bool = false) async throws -> [RadarFrame] {
+                            site: String? = nil, forceRefresh: Bool = false) async throws -> [RadarFrame] {
         switch provider {
         case .rainViewer:
             let data = try await fetch(Endpoints.rainViewerMaps, ttl: TTL.radarIndex, force: forceRefresh)
             return try RainViewerParser.decode(data)
         case .nexrad:
-            let data = try await fetch(Endpoints.iemLatest, ttl: TTL.radarIndex, force: forceRefresh)
-            let latest = try IEMNexrad.latestValidTime(data) ?? now()
-            let past = IEMNexrad.frames(latest: latest, range: range)
+            let latest: Date
+            let past: [RadarFrame]
+            if let site {
+                // Window on a 5-minute grid so the cached scan list's URL is stable between scans.
+                let end = Date(timeIntervalSince1970: ((now().timeIntervalSince1970 / 300).rounded(.down) + 1) * 300)
+                let start = end.addingTimeInterval(-Double(range.totalMinutes * 60 + 900))
+                let data = try await fetch(IEMRidge.scanListURL(site: site, start: start, end: end), ttl: TTL.radarIndex, force: forceRefresh)
+                let scans = try IEMRidge.decodeScans(data)
+                // Stale site (down for maintenance): nothing in the last 30 min means no loop.
+                guard let last = scans.last, now().timeIntervalSince(last) < 30 * 60 else { return [] }
+                latest = last
+                past = IEMRidge.frames(site: site, scans: scans, range: range)
+            } else {
+                let data = try await fetch(Endpoints.iemLatest, ttl: TTL.radarIndex, force: forceRefresh)
+                latest = try IEMNexrad.latestValidTime(data) ?? now()
+                past = IEMNexrad.frames(latest: latest, range: range)
+            }
             guard future,
                   let run = await optionalFetch(Endpoints.iemHRRRLatest, ttl: TTL.hrrrRun, force: false, maxStale: 6 * 3600),
                   let initTime = try? IEMHRRR.initTime(run) else { return past }

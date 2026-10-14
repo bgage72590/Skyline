@@ -24,6 +24,13 @@ final class RadarPlayback {
     /// Reflectivity loop, or a rainfall-total overlay (L21, NEXRAD/US only). Not persisted: each launch
     /// starts on the radar.
     private(set) var layer: RadarLayer = .reflectivity
+    /// NEXRAD view: nearest site (default), the national composite, or a site the user picked. Persisted.
+    private(set) var siteChoice = RadarSiteChoice(stored: UserDefaults.standard.string(forKey: "radarSite"))
+    /// The single site being shown (nil: national composite or not NEXRAD).
+    private(set) var station: NexradStation?
+    /// Why the composite is showing instead of the chosen site (no recent scans).
+    private(set) var siteNote: String?
+    @ObservationIgnored private var coordinate: Coordinate?
     /// Whether the place is in the lower 48 (NEXRAD, future radar and rainfall totals available).
     private(set) var inCONUS = true
     /// Observed only by the small time label / scrubber. Map layers are driven directly (see `sinks`),
@@ -90,6 +97,17 @@ final class RadarPlayback {
     /// has holes. `load: false` when the caller awaits `loadFrames()` itself (L7: two index loads raced).
     func configure(for location: WeatherLocation, load: Bool = true) {
         inCONUS = location.isInCONUS
+        coordinate = location.coordinate
+        let newStation = siteChoice.resolvedStation(for: location.coordinate, inCONUS: inCONUS)
+        if newStation != station {
+            station = newStation
+            siteNote = nil
+            if provider == .nexrad, layer == .reflectivity, !frames.isEmpty {
+                setPlaying(false); resetFrames()
+                if load { Task { await loadFrames(force: true) } }
+                return
+            }
+        }
         if !inCONUS, layer != .reflectivity { layer = .reflectivity; resetFrames() }
         // Use the persisted preference; don't write it back when falling back outside CONUS.
         let saved = RadarProvider(rawValue: UserDefaults.standard.string(forKey: "radarProvider") ?? "") ?? provider
@@ -134,6 +152,26 @@ final class RadarPlayback {
         Task { await loadFrames(force: true) }
     }
 
+    func setSiteChoice(_ choice: RadarSiteChoice) {
+        guard choice != siteChoice else { return }
+        siteChoice = choice
+        UserDefaults.standard.set(choice.stored, forKey: "radarSite")
+        let newStation = coordinate.flatMap { choice.resolvedStation(for: $0, inCONUS: inCONUS) }
+        siteNote = nil
+        guard newStation != station else { return }
+        station = newStation
+        guard provider == .nexrad, layer == .reflectivity else { return }
+        setPlaying(false)
+        resetFrames()
+        Task { await loadFrames(force: true) }
+    }
+
+    /// The nearest site for the current place (shown next to "Nearest" in the picker).
+    var nearestStation: NexradStation? {
+        guard inCONUS, let coordinate else { return nil }
+        return NexradStation.nearest(to: coordinate)
+    }
+
     func setRange(_ r: RadarRange) {
         guard r != range else { return }
         range = r
@@ -153,16 +191,27 @@ final class RadarPlayback {
         let token = generation.next()
         isLoadingIndex = true
         defer { if generation.isCurrent(token) { isLoadingIndex = false } }
-        let requested = provider, requestedRange = range, requestedLayer = layer
+        let requested = provider, requestedRange = range, requestedLayer = layer, requestedStation = station
+        let site = requested == .nexrad && requestedLayer == .reflectivity ? requestedStation?.id : nil
         let future = showsFuture && requested == .nexrad
         do {
             let new: [RadarFrame]
             if requestedLayer.isRainfallTotal {
                 new = IEMMRMS.frame(requestedLayer, now: Date()).map { [$0] } ?? []
             } else {
-                new = try await service.radarFrames(requested, range: requestedRange, future: future, forceRefresh: force)
+                var loaded = site == nil ? [] : ((try? await service.radarFrames(requested, range: requestedRange, future: future, site: site, forceRefresh: force)) ?? [])
+                if loaded.isEmpty {
+                    loaded = try await service.radarFrames(requested, range: requestedRange, future: future, forceRefresh: force)
+                }
+                new = loaded
+                if let s = requestedStation, site != nil, generation.isCurrent(token) {
+                    let note: String? = loaded.first?.urlTemplate.contains("ridge::\(s.id)-") == true ? nil
+                        : "\(s.icao) has no recent scans. Showing the national composite."
+                    if note != siteNote { siteNote = note }
+                }
             }
-            guard generation.isCurrent(token), requested == provider, requestedRange == range, requestedLayer == layer else { return }
+            guard generation.isCurrent(token), requested == provider, requestedRange == range, requestedLayer == layer,
+                  requestedStation == station else { return }
             loadedAt = Date()
             errorMessage = new.isEmpty ? "No radar frames available." : nil
             if new.map(\.id) != frames.map(\.id) {

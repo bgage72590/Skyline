@@ -30,5 +30,12 @@ open "$APP" --args -SkylineDockMenuTest YES
 for _ in $(seq 1 30); do [ -s "$D" ] && break; sleep 1; done
 if grep -q "PASS" "$D" 2>/dev/null; then echo "PASS dock-menus"; else echo "FAIL dock-menus"; cat "$D" 2>/dev/null; fail=1; fi
 sleep 2
+# NEXRAD site picker: nearest site, national composite and a manual site all load frames.
+pkill -x Skyline 2>/dev/null; sleep 1
+R="$HOME/Library/Logs/skyline-radar-site-test.txt"; rm -f "$R"
+open "$APP" --args -SkylineOpenRadar YES -SkylineRadarSiteTest YES
+for _ in $(seq 1 75); do [ -s "$R" ] && break; sleep 1; done
+if grep -q "PASS" "$R" 2>/dev/null; then echo "PASS radar-site"; else echo "FAIL radar-site"; cat "$R" 2>/dev/null; fail=1; fi
+sleep 2
 open "$APP"
 exit $fail

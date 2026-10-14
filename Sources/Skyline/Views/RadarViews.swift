@@ -339,6 +339,9 @@ struct RadarOptions: View {
                 .frame(width: 280)
                 .help("Radar loop, or rainfall totals for the last hour / 24 hours (MRMS)")
             }
+            if radar.provider == .nexrad && radar.inCONUS && radar.layer == .reflectivity {
+                RadarSitePicker(radar: radar)
+            }
             if radar.provider == .nexrad && radar.layer == .reflectivity {
                 Toggle("Future radar (model)", isOn: Binding(get: { radar.showsFuture }, set: { radar.setShowsFuture($0) }))
                     .toggleStyle(.checkbox)
@@ -544,5 +547,30 @@ struct RadarLegend: View {
         [Color(red: 0.55, green: 0.8, blue: 1.0), Color(red: 0.1, green: 0.4, blue: 0.95),
          Color(red: 1.0, green: 0.85, blue: 0.0), Color(red: 1.0, green: 0.3, blue: 0.0),
          Color(red: 0.75, green: 0.0, blue: 0.4)]
+    }
+}
+
+/// NEXRAD station picker: nearest site (default), the national composite, or any lower-48 WSR-88D.
+struct RadarSitePicker: View {
+    let radar: RadarPlayback
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            HStack(spacing: 6) {
+                Text("Site").font(.caption2.weight(.semibold)).foregroundStyle(Glass.secondaryText)
+                Picker("Radar site", selection: Binding(get: { radar.siteChoice }, set: { radar.setSiteChoice($0) })) {
+                    Text(radar.nearestStation.map { "Nearest (\($0.icao))" } ?? "Nearest").tag(RadarSiteChoice.auto)
+                    Text("National composite").tag(RadarSiteChoice.composite)
+                    Divider()
+                    ForEach(NexradStation.conus) { Text($0.label).tag(RadarSiteChoice.site($0.id)) }
+                }
+                .labelsHidden()
+                .frame(width: 230)
+            }
+            .help("Single-site NEXRAD (sharper, updates every 4–6 min) or the national mosaic")
+            if let note = radar.siteNote {
+                Text(note).font(.caption).foregroundStyle(.yellow).frame(width: 280, alignment: .trailing)
+            }
+        }
     }
 }
