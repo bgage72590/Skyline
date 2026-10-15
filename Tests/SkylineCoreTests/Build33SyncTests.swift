@@ -44,7 +44,7 @@ final class Build33SyncTests: XCTestCase {
         let forward = AccuracySync.collapsedForScoring(AccuracySync.merge(recs, []))
         XCTAssertEqual(AccuracySync.collapsedForScoring(AccuracySync.merge(recs.reversed(), [])), forward)
         XCTAssertEqual(AccuracySync.collapsedForScoring(AccuracySync.merge([recs[2]], [recs[0], recs[1]])), forward)
-        XCTAssertEqual(forward.count, 1, "build 35: 50-min gaps chain into one run")
+        XCTAssertEqual(forward.count, 2, "build 42: runs span < 90 min from their first issuance (0+50 | 100)")
     }
 
     // MARK: M2

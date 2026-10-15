@@ -86,7 +86,7 @@ public enum AccuracySync {
     }
 
     /// Cross-Mac duplicates collapsed for scoring (build 35): per location and valid hour, issuances are
-    /// split into runs wherever the gap to the previous issuance is at least `sameIssuance` (90 min); each
+    /// split into runs no wider than `sameIssuance` (90 min) from the run's first issuance; each
     /// run counts once (earliest issue time and its values, later ones only fill missing models). One Mac's
     /// own issuances are >= 3 h apart, so they never collapse. Computed from the whole set every time, so
     /// it doesn't depend on merge order.
@@ -100,16 +100,17 @@ public enum AccuracySync {
             let sorted = members.sorted {
                 $0.r.issued != $1.r.issued ? $0.r.issued < $1.r.issued : tieKey($0) < tieKey($1)
             }
+            // Build 42 (review build-41 M5): a run spans less than 90 min from its *first* issuance, so a
+            // chain of Macs (0 → 70 → 140 → 180 min) can never fold one Mac's own issuances, 3 h apart,
+            // into one. Still a function of the sorted set only, so merge order doesn't matter.
             var run = sorted[0]
-            var previous = sorted[0].r.issued
             for v in sorted.dropFirst() {
-                if v.r.issued.timeIntervalSince(previous) >= sameIssuance {
+                if v.r.issued.timeIntervalSince(run.r.issued) >= sameIssuance {
                     out.append(run)
                     run = v
                 } else {
                     for (model, values) in v.r.f where run.r.f[model] == nil { run.r.f[model] = values }
                 }
-                previous = v.r.issued
             }
             out.append(run)
         }
@@ -141,8 +142,18 @@ public struct AccuracyReset: Codable, Equatable, Sendable {
     /// writer's `writtenAt` when plausible, or the file's modification date), not just to this Mac's
     /// clock, so pairs issued after the real reset but before this Mac read it are kept (build-32
     /// review M2). Without a bound it falls back to `now`.
-    public func clamped(now: Date, writtenBound: Date? = nil) -> AccuracyReset {
+    public func clamped(now: Date, writtenBound: Date? = nil, writerClock: Date? = nil, fileDate: Date? = nil) -> AccuracyReset {
         var r = self
+        // Build 42 (review build-41 L1): when the writer's own `writtenAt` is in the future, its clock is
+        // ahead by about that much; take the skew off its stamp first, so a reset written by a fast Mac
+        // lands near when it really happened instead of at this Mac's "now".
+        // Skew = writer's stamp minus the file's modification date when there is one (both taken at write
+        // time), else minus this Mac's now (an under-estimate if the file sat unread).
+        if let writerClock, writerClock > now.addingTimeInterval(Self.futureTolerance), r.at > now {
+            let reference = fileDate.map { min($0, now) } ?? now
+            r.at = r.at.addingTimeInterval(-writerClock.timeIntervalSince(reference))
+            if let writtenBound { r.at = min(r.at, writtenBound) }
+        }
         if r.at > now.addingTimeInterval(Self.futureTolerance) { r.at = min(now, writtenBound ?? now) }
         r.at = Date(timeIntervalSince1970: r.at.timeIntervalSince1970.rounded(.down))
         return r
@@ -196,7 +207,7 @@ public struct AccuracyFile: Equatable, Sendable {
         let tolerance = AccuracyReset.futureTolerance
         let plausibleWrite = remote?.writtenAt.flatMap { $0 <= now.addingTimeInterval(tolerance) ? $0 : nil }
         let bound = [plausibleWrite, remoteFileDate].compactMap { $0 }.min()
-        let remoteReset = remote?.reset?.clamped(now: now, writtenBound: bound)
+        let remoteReset = remote?.reset?.clamped(now: now, writtenBound: bound, writerClock: remote?.writtenAt, fileDate: remoteFileDate)
         let reset = AccuracyReset.winner(local.reset?.clamped(now: now), remoteReset)
         let pairs = AccuracySync.merge(local.pairs, remote?.pairs ?? [], resetAt: reset?.at, now: now)
         let out = AccuracyFile(reset: reset, pairs: pairs)

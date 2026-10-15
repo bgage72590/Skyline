@@ -115,8 +115,8 @@ final class Build35DedupeAndLegacyTests: XCTestCase {
         func scored(_ m: [Double]) -> Int {
             AccuracySync.collapsedForScoring(AccuracySync.merge(m.enumerated().map { pair($1, model: "m\($0)") }, [])).count
         }
-        XCTAssertEqual(scored([0, 60, 120]), 1)
-        XCTAssertEqual(scored([0, 80, 160]), 1)
+        XCTAssertEqual(scored([0, 60, 120]), 2, "build 42: no chaining past 90 min from a run's first issuance")
+        XCTAssertEqual(scored([0, 80, 160]), 2)
         XCTAssertEqual(scored([0, 89, 200]), 2)
         XCTAssertEqual(scored([0, 91]), 2)
         XCTAssertEqual(scored([0, 180, 360]), 3, "one Mac's own 3 h cadence never collapses")
