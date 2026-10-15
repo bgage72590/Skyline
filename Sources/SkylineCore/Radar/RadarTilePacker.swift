@@ -55,10 +55,16 @@ public final class RadarTile: @unchecked Sendable {
             return CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
         }
         // Straight into the image's backing store: one allocation, no bounds checks (review M3).
+        // Build 48 (review M2): expanded as BGRA (premultiplied first, little-endian), Core Animation's
+        // native format, so the crossfade copies share these pixels instead of each converting its own
+        // copy. Pixel-identical: only the byte order of the same palette colours changes.
+        let bgra = palette.map { v -> UInt32 in
+            (v & 0xFF00_FF00) | ((v & 0x0000_00FF) << 16) | ((v >> 16) & 0x0000_00FF)
+        }
         var data = Data(count: width * height * 4)
         data.withUnsafeMutableBytes { raw in
             let out = raw.bindMemory(to: UInt32.self)
-            palette.withUnsafeBufferPointer { pal in
+            bgra.withUnsafeBufferPointer { pal in
                 indices.withUnsafeBufferPointer { idx in
                     for i in 0..<idx.count { out[i] = pal[Int(idx[i])] }
                 }
@@ -66,7 +72,8 @@ public final class RadarTile: @unchecked Sendable {
         }
         guard let provider = CGDataProvider(data: data as CFData) else { return nil }
         return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
-                       space: space, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       space: space,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
                        provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
     }
 }
