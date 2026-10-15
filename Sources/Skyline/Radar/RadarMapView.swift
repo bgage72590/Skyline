@@ -457,13 +457,23 @@ final class RadarDrawState: @unchecked Sendable {
 
     /// Main thread. `token` identifies the frame (generation + index); expansions are reused within it.
     /// `prebuilt`: images already expanded in the background for this frame.
-    func set(_ new: [TileKey: RadarTile], zoom: Int, token: AnyHashable, prebuilt: [TileKey: CGImage]? = nil) {
+    /// `expandMissing: false` leaves tiles without a prebuilt image out (returned) for the caller to
+    /// expand in the background: the off-screen ring around a frame prepared ahead (build 48, M2).
+    @discardableResult
+    func set(_ new: [TileKey: RadarTile], zoom: Int, token: AnyHashable, prebuilt: [TileKey: CGImage]? = nil,
+             expandMissing: Bool = true) -> [TileKey: RadarTile] {
         if token != frameToken { expanded = prebuilt ?? [:]; frameToken = token }
+        else if let prebuilt { expanded.merge(prebuilt) { old, _ in old } }
         expanded = expanded.filter { new[$0.key] != nil }
-        for (key, tile) in new where expanded[key] == nil { expanded[key] = tile.image() }
+        var missing: [TileKey: RadarTile] = [:]
+        for (key, tile) in new where expanded[key] == nil {
+            if expandMissing { expanded[key] = tile.image() } else { missing[key] = tile }
+        }
         let ordered = RadarPolicy.drawOrder(Array(expanded.keys), currentZoom: zoom).map { ($0, expanded[$0]!) }
         lock.lock(); tiles = ordered; lock.unlock()
+        return missing
     }
+    var token: AnyHashable? { frameToken }
     func clear() { expanded = [:]; frameToken = nil; lock.lock(); tiles = []; lock.unlock() }
     /// What the renderer draws: always the frame on screen (never hidden since build 48).
     func snapshot() -> [(TileKey, CGImage)] { lock.lock(); defer { lock.unlock() }; return tiles }
@@ -843,8 +853,23 @@ final class RadarLayerView: NSView {
     /// Hands a frame to MapKit's renderer.
     private func commit(_ g: Generation, _ i: Int, token: AnyHashable, images: [TileKey: CGImage]) {
         if incoming?.token == token { incoming = nil }
-        states[0].set(g.tiles[i], zoom: zoom, token: token, prebuilt: images)
+        let ring = states[0].set(g.tiles[i], zoom: zoom, token: token, prebuilt: images, expandMissing: false)
         renderers[0]?.setNeedsDisplay()
+        guard !ring.isEmpty else { return }
+        // Frames are prepared ahead for the visible area only; the off-screen ring (for panning) is
+        // expanded in the background now and joins MapKit's frame without a visible change.
+        Self.expandQueue.async { [weak self, weak g] in
+            var images: [TileKey: CGImage] = [:]
+            autoreleasepool { for (key, tile) in ring { images[key] = tile.image() } }
+            DispatchQueue.main.async {
+                guard let self, let g, self.states[0].token == token, g.tiles.indices.contains(i) else { return }
+                self.states[0].set(g.tiles[i], zoom: self.zoom, token: token, prebuilt: images, expandMissing: false)
+                for key in images.keys {
+                    let r = TileMath.rect(key)
+                    self.renderers[0]?.setNeedsDisplay(MKMapRect(x: r.x, y: r.y, width: r.width, height: r.height))
+                }
+            }
+        }
     }
 
     /// Calls `done` once MapKit has drawn after `since` and gone quiet for two display frames (its
@@ -915,7 +940,13 @@ final class RadarLayerView: NSView {
         if ahead[token] != nil { done.map { DispatchQueue.main.async(execute: $0) }; return }
         if aheadInFlight[token] != nil { if let done { aheadInFlight[token]!.append(done) }; return }
         aheadInFlight[token] = done.map { [$0] } ?? []
-        let tiles = g.tiles[i]
+        // Only the tiles on screen (about half of a frame with its pan ring; review M2).
+        let visible = map?.visibleMapRect
+        let tiles = g.tiles[i].filter { key, _ in
+            guard let v = visible else { return true }
+            let r = TileMath.rect(key)
+            return MKMapRect(x: r.x, y: r.y, width: r.width, height: r.height).intersects(v)
+        }
         Self.expandQueue.async { [weak self] in
             var images: [TileKey: CGImage] = [:]
             autoreleasepool { for (key, tile) in tiles { images[key] = tile.image() } }
@@ -959,7 +990,12 @@ final class RadarLayerView: NSView {
             }
             return
         }
-        states[0].set(g.tiles[f], zoom: zoom, token: token)
+        if let key, let image = g.tiles[f][key]?.image() {
+            // Only the arriving tile is expanded here; a ring still expanding in the background joins later.
+            states[0].set(g.tiles[f], zoom: zoom, token: token, prebuilt: [key: image], expandMissing: false)
+        } else {
+            states[0].set(g.tiles[f], zoom: zoom, token: token)
+        }
         if let key {
             let r = TileMath.rect(key)
             renderers[0]?.setNeedsDisplay(MKMapRect(x: r.x, y: r.y, width: r.width, height: r.height))
