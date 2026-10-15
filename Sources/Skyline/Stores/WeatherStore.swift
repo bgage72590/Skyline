@@ -517,6 +517,7 @@ final class WeatherStore {
     // MARK: Current location
 
     private func setUpLocation() {
+        locationProvider.seed(currentLocation?.coordinate)
         locationProvider.onUpdate = { [weak self] coordinate in self?.handleLocation(coordinate) }
         locationProvider.onAuthorizationChange = { [weak self] authorized in
             guard let self else { return }
@@ -556,9 +557,11 @@ final class WeatherStore {
         let isFirstFix = currentLocation == nil
         // Moved: the old place's forecast must not be shown under My Location while the new one loads (L4).
         if !isFirstFix, reports[WeatherLocation.currentLocationID] != nil { reports[WeatherLocation.currentLocationID] = nil }
-        var location = WeatherLocation(id: WeatherLocation.currentLocationID, name: currentLocation?.name ?? "My Location",
+        // Moved more than 2 km: the old place's name (and region, country, time zone) no longer applies.
+        // It shows "My Location" until the place lookup names the new spot; a failed lookup never
+        // leaves the old name on the new coordinates (QA build-41 G1).
+        let location = WeatherLocation(id: WeatherLocation.currentLocationID, name: "My Location",
                                        coordinate: coordinate, isCurrentLocation: true)
-        location.timeZoneIdentifier = currentLocation?.timeZoneIdentifier
         currentLocation = location
         persistLastFix(location)
         if isFirstFix && (selectedID == nil || selectedID == savedLocations.first?.id) {

@@ -65,6 +65,10 @@ final class RadarPlayback {
     @ObservationIgnored private let sinks = NSHashTable<AnyObject>.weakObjects()
     /// QA hook: the expanded map registers a zoom handler so the stress test can zoom programmatically.
     @ObservationIgnored var debugZoomHandler: ((Double) -> Void)?
+    /// Measurement hooks (build 42 pan test): pan the expanded map by a fraction of its width/height,
+    /// and read (visible holes in the shown frame, missing ring tiles, held tiles).
+    @ObservationIgnored var debugPanHandler: ((Double, Double) -> Void)?
+    @ObservationIgnored var debugRadarStats: (() -> (holes: Int, ringMissing: Int, held: Int))?
 
     @ObservationIgnored private let service: WeatherService
     /// The play clock. A TaskSlot so a clock task that resumes after being replaced can't orphan its successor.

@@ -14,11 +14,11 @@ final class RadarImageCache {
 
     private let session: URLSession
     private let urlCache: URLCache
-    private let images = NSCache<NSString, CGImage>()
+    private let images = NSCache<NSString, RadarTile>()
     private struct Waiter {
         /// Still needed? (false once the requesting map/zoom/frame set is gone) — checked before starting.
         let wanted: () -> Bool
-        let completion: (CGImage?) -> Void
+        let completion: (RadarTile?) -> Void
         let cancelled: () -> Void
     }
     private var waiters: [String: [Waiter]] = [:]
@@ -37,7 +37,7 @@ final class RadarImageCache {
     private var wakeObserver: NSObjectProtocol?
 
     /// What a download produced.
-    enum Outcome: Sendable { case image(CGImage), missing, transientFailure }
+    enum Outcome: Sendable { case image(RadarTile), missing, transientFailure }
 
     private init() {
         let config = URLSessionConfiguration.default
@@ -58,12 +58,13 @@ final class RadarImageCache {
         // Decoded RGBA bytes; live tiles are held by the radar view anyway, so this bridges tiles pruned
         // after a pan and re-requested on pan-back without a network trip (24 MB ≈ 96 tiles; restored
         // from 8 MB in build 35, radar-pan-diagnosis fix 3). `-SkylineDecodedCacheMB N` is a measurement hook.
-        images.totalCostLimit = max(4, UserDefaults.standard.object(forKey: "SkylineDecodedCacheMB") as? Int ?? 24) << 20
+        images.totalCostLimit = Self.normalCacheBytes
         pathMonitor.pathUpdateHandler = { [weak self] path in
             let ok = path.status == .satisfied
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.networkChanged(satisfied: ok) } }
         }
         pathMonitor.start(queue: DispatchQueue(label: "Skyline.radar.path", qos: .utility))
+        startPressureMonitor()
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             // Give Wi-Fi a moment, then re-request anything that failed while asleep.
@@ -126,7 +127,39 @@ final class RadarImageCache {
         }
     }
 
-    func image(for url: URL) -> CGImage? {
+    // MARK: Memory pressure (build 42): shrink the cache first, never frames, zoom or resolution.
+
+    private var pressureSource: DispatchSourceMemoryPressure?
+    private var restoreTask: Task<Void, Never>?
+    static let normalCacheBytes = max(4, UserDefaults.standard.object(forKey: "SkylineDecodedCacheMB") as? Int ?? 24) << 20
+
+    func startPressureMonitor() {
+        guard pressureSource == nil else { return }
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
+        source.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.memoryPressure(critical: source.data.contains(.critical)) }
+        }
+        source.resume()
+        pressureSource = source
+    }
+
+    func memoryPressure(critical: Bool) {
+        // Tiles the radar is drawing are held by the radar view, not by this cache, so nothing on
+        // screen changes; only re-attach-without-network after a pan-back gets slower.
+        images.totalCostLimit = critical ? 1 << 20 : Self.normalCacheBytes / 4
+        if critical { images.removeAllObjects() }
+        urlCache.memoryCapacity = 0
+        urlCache.memoryCapacity = 1 << 20
+        restoreTask?.cancel()
+        restoreTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(120))
+            guard !Task.isCancelled, let self else { return }
+            self.images.totalCostLimit = Self.normalCacheBytes
+            self.urlCache.memoryCapacity = 4 << 20
+        }
+    }
+
+    func image(for url: URL) -> RadarTile? {
         images.object(forKey: url.absoluteString as NSString)
     }
 
@@ -141,7 +174,7 @@ final class RadarImageCache {
     }
 
     func load(_ url: URL, wanted: @escaping () -> Bool = { true },
-              cancelled: @escaping () -> Void = {}, completion: @escaping (CGImage?) -> Void) {
+              cancelled: @escaping () -> Void = {}, completion: @escaping (RadarTile?) -> Void) {
         let key = url.absoluteString
         if let hit = images.object(forKey: key as NSString) { return completion(hit) }
         let waiter = Waiter(wanted: wanted, completion: completion, cancelled: cancelled)
@@ -187,11 +220,11 @@ final class RadarImageCache {
             let outcome = await Self.fetchDecoded(session: session, url: url)
             inFlight -= 1
             defer { pump() }
-            var image: CGImage?
+            var image: RadarTile?
             switch outcome {
             case .image(let decoded):
                 image = decoded
-                images.setObject(decoded, forKey: key as NSString, cost: decoded.bytesPerRow * decoded.height)
+                images.setObject(decoded, forKey: key as NSString, cost: decoded.heldBytes)
                 failures[key] = nil
                 transient[key] = nil
             case .missing:
@@ -223,10 +256,14 @@ final class RadarImageCache {
         }
         // Decode inside an autorelease pool so ImageIO's temporaries are freed per tile, not per burst
         // (less heap growth/fragmentation while a loop of ~100 tiles decodes).
-        let image: CGImage? = autoreleasepool {
+        let image: RadarTile? = autoreleasepool {
             guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
             let options = [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
-            return CGImageSourceCreateImageAtIndex(source, 0, options)
+            guard let decoded = CGImageSourceCreateImageAtIndex(source, 0, options) else { return nil }
+            // Build 42: 8-bit palette indices, pixel-identical, ~4× smaller (RadarTilePacker).
+            let tile = RadarTilePacker.pack(decoded)
+            RequestStats.shared.notePacked(tile.isPacked)
+            return tile
         }
         return image.map(Outcome.image) ?? .missing
     }

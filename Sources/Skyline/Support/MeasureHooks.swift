@@ -16,11 +16,43 @@ enum MeasureHooks {
                 print("[measure] radar play requested"); fflush(stdout)
                 for _ in 0..<6 {
                     try? await Task.sleep(for: .seconds(8))
-                    print("[measure] liveTiles=\(RadarLayerView.liveTiles) added=\(RadarLayerView.addedTiles) requests=\(RequestStats.shared.total) frames=\(store.radar.frames.count) progress=\(store.radar.progress)"); fflush(stdout)
+                    print("[measure] packed=\(RequestStats.shared.packCounts) liveTiles=\(RadarLayerView.liveTiles) added=\(RadarLayerView.addedTiles) requests=\(RequestStats.shared.total) frames=\(store.radar.frames.count) progress=\(store.radar.progress)"); fflush(stdout)
                 }
             }
         }
         if defaults.bool(forKey: "SkylineRadarSiteTest") { radarSiteTest(store: store) }
+        if defaults.bool(forKey: "SkylinePanTest") { panTest(store: store) }
+        if defaults.bool(forKey: "SkylineFullScreen") {
+            Task {
+                try? await Task.sleep(for: .seconds(3))
+                if let w = NSApp.windows.first(where: { $0.isVisible && $0.styleMask.contains(.titled) && $0.frame.width > 600 }) {
+                    w.toggleFullScreen(nil)
+                    print("[measure] full screen \(w.screen?.frame.size ?? .zero)"); fflush(stdout)
+                }
+            }
+        }
+        let swapAfter = defaults.double(forKey: "SkylineScanSwapAfter")
+        if swapAfter > 0 {
+            // A new frame set mid-loop (range change = new frame IDs, the same path as fresh scans), then back.
+            Task { @MainActor in
+                let radar = store.radar
+                let original = radar.range
+                try? await Task.sleep(for: .seconds(swapAfter))
+                // A range change pauses on purpose (user action); a fresh scan doesn't, so resume to
+                // measure the swap with the loop playing, then log that the clock keeps stepping.
+                @MainActor func swap(to r: RadarRange, _ label: String) async {
+                    radar.setRange(r)
+                    radar.setPlaying(true)
+                    print("[measure] \(label) (range \(r.rawValue)) playing=\(radar.isPlaying)"); fflush(stdout)
+                    for t in stride(from: 5, through: 25, by: 5) {
+                        try? await Task.sleep(for: .seconds(5))
+                        print("[measure] +\(t)s playing=\(radar.isPlaying) index=\(radar.index)/\(radar.frames.count) progress=\(radar.progress)"); fflush(stdout)
+                    }
+                }
+                await swap(to: original == .oneHour ? .twoHours : .oneHour, "scan swap")
+                await swap(to: original, "scan swap back")
+            }
+        }
         let closeAfter = defaults.double(forKey: "SkylineCloseMainWindowAfter")
         if closeAfter > 0 {
             Task {
@@ -30,6 +62,37 @@ enum MeasureHooks {
                 }
                 print("[measure] main window closed"); fflush(stdout)
             }
+        }
+    }
+
+    /// `-SkylinePanTest YES` (with `-SkylineOpenRadar YES -SkylinePlayRadar YES`): review test 8. While the
+    /// loop plays, pans the map in 60 steps at 60 Hz (right, then back), sampling on-screen holes in the
+    /// frame being shown at every step; writes ~/Library/Logs/skyline-pan-test.txt.
+    static func panTest(store: WeatherStore) {
+        Task { @MainActor in
+            let radar = store.radar
+            try? await Task.sleep(for: .seconds(45))
+            guard let pan = radar.debugPanHandler, let stats = radar.debugRadarStats else {
+                print("[measure] pan test: no expanded map"); fflush(stdout); return
+            }
+            var lines = ["before: \(stats())"]
+            var worst = 0, stepsWithHoles = 0
+            for leg in [0.004, -0.004] {
+                for _ in 0..<60 {
+                    pan(leg, leg / 2)
+                    try? await Task.sleep(for: .milliseconds(16))
+                    let s = stats()
+                    worst = max(worst, s.holes)
+                    if s.holes > 0 { stepsWithHoles += 1 }
+                }
+            }
+            try? await Task.sleep(for: .seconds(2))
+            lines.append("during pan: steps with on-screen holes \(stepsWithHoles)/120, worst \(worst) tiles")
+            lines.append("settled: \(stats())")
+            let text = lines.joined(separator: "\n")
+            print("[measure] pan test\n" + text); fflush(stdout)
+            let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/skyline-pan-test.txt")
+            try? text.write(to: url, atomically: true, encoding: .utf8)
         }
     }
 
