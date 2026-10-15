@@ -927,8 +927,8 @@ final class RadarLayerView: NSView {
                 self.ahead[token] = images
                 self.aheadOrder.removeAll { $0 == token }
                 self.aheadOrder.append(token)
-                // Two ahead plus a frame being waited for.
-                while self.aheadOrder.count > 3 { self.ahead[self.aheadOrder.removeFirst()] = nil }
+                // Two prepared frames at most (each ~12-25 MB expanded).
+                while self.aheadOrder.count > 2 { self.ahead[self.aheadOrder.removeFirst()] = nil }
                 callbacks.forEach { $0() }
             }
         }
