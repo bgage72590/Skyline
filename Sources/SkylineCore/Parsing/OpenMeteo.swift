@@ -165,6 +165,7 @@ public struct OpenMeteoGeocodingResponse: Decodable, Sendable {
         public var admin1: String?
         public var timezone: String?
         public var population: Int?
+        public var feature_code: String?
     }
     public var results: [Result]?
 
@@ -174,7 +175,8 @@ public struct OpenMeteoGeocodingResponse: Decodable, Sendable {
             PlaceSearchResult(id: $0.id, name: $0.name, admin1: $0.admin1, country: $0.country,
                               countryCode: $0.country_code,
                               coordinate: Coordinate(latitude: $0.latitude, longitude: $0.longitude),
-                              timeZoneIdentifier: $0.timezone, population: $0.population)
+                              timeZoneIdentifier: $0.timezone, population: $0.population,
+                              featureCode: $0.feature_code)
         }
     }
 }

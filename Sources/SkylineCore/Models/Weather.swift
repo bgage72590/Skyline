@@ -83,9 +83,35 @@ public struct SourceReading: Codable, Hashable, Sendable, Identifiable {
     public var high: Double?
     public var low: Double?
     public var weight: Double
+    /// Share (0…1) of the blended high / low this row carries, from the blend's own per-field dedupe:
+    /// a NOAA-family row equal to another on that field only shares one vote (review L3). nil = not computed.
+    public var highShare: Double?
+    public var lowShare: Double?
     public var id: String { name }
     public init(name: String, high: Double?, low: Double?, weight: Double) {
         self.name = name; self.high = high; self.low = low; self.weight = weight
+    }
+
+    /// Per-field shares like the blend counts them. `family[i]`: row i is a NOAA-family forecast, whose
+    /// equal values on a field are one vote (the largest weight counts, the rest 0).
+    public static func withShares(_ rows: [SourceReading], family: [Bool]) -> [SourceReading] {
+        var out = rows
+        for field in [\SourceReading.high, \SourceReading.low] {
+            var counted = rows.map { $0[keyPath: field] == nil ? 0 : $0.weight }
+            var best: [Double: Int] = [:]
+            for (i, r) in rows.enumerated() where family[i] {
+                guard let v = r[keyPath: field] else { continue }
+                if let j = best[v] {
+                    if counted[i] > counted[j] { counted[j] = 0; best[v] = i } else { counted[i] = 0 }
+                } else { best[v] = i }
+            }
+            let total = counted.reduce(0, +)
+            for i in out.indices where rows[i][keyPath: field] != nil {
+                let share = total > 0 ? counted[i] / total : 0
+                if field == \SourceReading.high { out[i].highShare = share } else { out[i].lowShare = share }
+            }
+        }
+        return out
     }
 }
 
@@ -337,12 +363,27 @@ public struct PlaceSearchResult: Codable, Hashable, Identifiable, Sendable {
     public var coordinate: Coordinate
     public var timeZoneIdentifier: String?
     public var population: Int?
+    /// GeoNames feature code ("PPLA2" city, "AIRP" airport, "PCLI"/"PCLIX" country…), when given.
+    public var featureCode: String?
 
     public init(id: Int, name: String, admin1: String?, country: String?, countryCode: String?,
-                coordinate: Coordinate, timeZoneIdentifier: String?, population: Int?) {
+                coordinate: Coordinate, timeZoneIdentifier: String?, population: Int?, featureCode: String? = nil) {
         self.id = id; self.name = name; self.admin1 = admin1; self.country = country
         self.countryCode = countryCode; self.coordinate = coordinate
         self.timeZoneIdentifier = timeZoneIdentifier; self.population = population
+        self.featureCode = featureCode
+    }
+
+    public var isAirport: Bool { featureCode.map { $0 == "AIRP" || $0 == "AIRF" } ?? false }
+    /// A whole country or dependency (PCL*), or a first-order division of one: never a "city".
+    public var isCountryLevel: Bool { featureCode.map { $0.hasPrefix("PCL") || $0 == "TERR" || $0 == "ADM0" } ?? false }
+
+    /// "Airport · Sint Maarten", "New York, United States", "Country".
+    public var subtitle: String {
+        let place = [admin1, country ?? countryCode.flatMap { Locale(identifier: "en_US").localizedString(forRegionCode: $0) }]
+            .compactMap { $0 }.joined(separator: ", ")
+        let kind = isAirport ? "Airport" : (isCountryLevel ? "Country or territory" : nil)
+        return [kind, place.isEmpty ? nil : place].compactMap { $0 }.joined(separator: " · ")
     }
 
     public var asLocation: WeatherLocation {

@@ -382,7 +382,7 @@ final class WeatherStore {
             guard !Task.isCancelled, let self else { return }
             self.retryTasks[id] = nil
             guard let current = self.allLocations.first(where: { $0.id == id }),
-                  self.isMainWindowVisible || self.menuBarLocation?.id == id
+                  self.isMainWindowVisible || self.menuBarLocation?.id == id || self.reports[id] == nil
                     || ((self.notificationPrefs.alerts || self.notificationPrefs.rain) && self.notifies(current)) else { return }
             await self.load(current)
         }
@@ -446,6 +446,9 @@ final class WeatherStore {
         // Cities with warning/rain notifications stay current even with the window closed.
         if notificationPrefs.alerts || notificationPrefs.rain { targets += allLocations.filter(notifies) }
         if isMainWindowVisible { targets += allLocations }
+        // A city with no data at all is fetched once even while the window is hidden or occluded
+        // (display asleep at launch), so its row never sits on "--" waiting for a visibility change.
+        targets += allLocations.filter { reports[$0.id] == nil }
         await refresh(locations: targets, force: false)
     }
 
@@ -542,6 +545,8 @@ final class WeatherStore {
         }
     }
 
+    private var currentNameVerified = false
+
     private func handleLocation(_ c: CLLocationCoordinate2D) {
         if isLocating { isLocating = false }
         locatingTimeoutTask?.cancel()
@@ -552,8 +557,29 @@ final class WeatherStore {
         if let existing = currentLocation,
            CLLocation(latitude: existing.coordinate.latitude, longitude: existing.coordinate.longitude)
             .distance(from: CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)) < 2_000 {
+            // QA build-44 G1-b: a saved fix at the right spot may carry a wrong name from an earlier
+            // session; look the name up again once per launch (no reload unless it changes).
+            if !currentNameVerified {
+                currentNameVerified = true
+                let here = existing.coordinate
+                Task {
+                    guard let placemark = try? await CLGeocoder().reverseGeocodeLocation(
+                              CLLocation(latitude: here.latitude, longitude: here.longitude)).first,
+                          var location = currentLocation, location.coordinate == here else { return }
+                    let name = placemark.locality ?? placemark.name ?? "My Location"
+                    guard name != location.name || placemark.timeZone?.identifier != location.timeZoneIdentifier else { return }
+                    location.name = name
+                    location.region = placemark.administrativeArea
+                    location.country = placemark.country
+                    location.countryCode = placemark.isoCountryCode
+                    location.timeZoneIdentifier = placemark.timeZone?.identifier
+                    currentLocation = location
+                    persistLastFix(location)
+                }
+            }
             return
         }
+        currentNameVerified = true
         let isFirstFix = currentLocation == nil
         // Moved: the old place's forecast must not be shown under My Location while the new one loads (L4).
         if !isFirstFix, reports[WeatherLocation.currentLocationID] != nil { reports[WeatherLocation.currentLocationID] = nil }
@@ -680,11 +706,11 @@ final class WeatherStore {
     /// One search; errors are shown (not turned into "No matches"), and results remember their query.
     private func runSearch(_ query: String, addFirst: Bool) async {
         do {
-            let results = try await service.search(query)
+            let results = SearchSubmit.ranked(try await service.search(query), query: query)
             guard !Task.isCancelled else { return }
             isSearching = false
             searchError = nil
-            if addFirst, let first = results.first { add(first); return }
+            if addFirst, let first = SearchSubmit.autoAdd(results) { add(first); return }
             searchResults = results
             resultsQuery = query
         } catch {

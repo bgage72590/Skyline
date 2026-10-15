@@ -107,7 +107,10 @@ struct SidebarView: View {
         } label: {
             SidebarRow(location: location, report: store.reports[location.id],
                        units: store.units, isSelected: selected,
-                       inMenuBar: store.menuBarLocation?.id == location.id)
+                       inMenuBar: store.menuBarLocation?.id == location.id,
+                       status: store.reports[location.id] != nil ? nil
+                           : (store.errors[location.id] != nil ? "Couldn’t update · retrying"
+                              : (store.loadingIDs.contains(location.id) ? "Updating…" : nil)))
         }
         .buttonStyle(.plain)
         .help(index < 9 ? "⌘\(index + 1)" : "")
@@ -148,7 +151,7 @@ struct SidebarView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(result.name).font(.headline)
-                        Text([result.admin1, result.country].compactMap { $0 }.joined(separator: ", "))
+                        Text(result.subtitle)
                             .font(.caption).foregroundStyle(Glass.secondaryText)
                     }
                     Spacer()
@@ -217,6 +220,8 @@ struct SidebarRow: View {
     let units: DisplayUnits
     let isSelected: Bool
     var inMenuBar = false
+    /// Shown instead of the condition while there's no data yet ("Updating…", "Couldn’t update").
+    var status: String? = nil
     @State private var hovering = false
 
     static let radius: CGFloat = 14
@@ -253,7 +258,7 @@ struct SidebarRow: View {
                         .foregroundStyle(AlertsCard.color(alert.severity))
                         .lineLimit(1)
                 } else {
-                    Text(report?.current.condition.description ?? " ")
+                    Text(report?.current.condition.description ?? status ?? " ")
                         .font(.caption)
                         .foregroundStyle(Glass.secondaryText)
                         .lineLimit(1)
