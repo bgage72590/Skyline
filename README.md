@@ -22,8 +22,19 @@ requirement, so Location permission survives updates.
 
 ### Installing and updating on other Macs (the easy way)
 
-`./build-app.sh` on the build Mac (the MacBook Pro) puts `Skyline.zip` and `Skyline.version` in
-iCloud Drive/Skyline. Every other Mac then needs one command, once:
+`./build-app.sh` on the build Mac (the MacBook Pro) puts `Skyline.zip`, `Install Skyline.command`,
+`VERSION.txt` and `Skyline.version` in iCloud Drive/Skyline (`scripts/publish-icloud.sh`; a stale
+`Skyline.app` or `install.sh` there is moved to `~/Skyline-iCloud-backup/`).
+
+On any Mac: open iCloud Drive › Skyline in Finder and double-click **Install Skyline.command**. The first
+time on a Mac, if macOS says it can't be opened, right-click it › Open › Open (once). It downloads the
+zip from iCloud if needed, checks the signature (same check as `install-verified.sh`), quits Skyline,
+replaces /Applications/Skyline.app, relaunches it and prints the installed build. Later updates: the
+app's own "Update Skyline…", or the .command again.
+
+Note: the .command itself lives in iCloud, so whoever can edit that folder could change it (the zip's
+signature check can't protect a modified installer). It's Brian's own iCloud; for the strict path use
+a local copy of `install-verified.sh` as below. Without the .command, one command, once:
 
 ```bash
 T=$(mktemp -d) && ditto -x -k ~/Library/Mobile\ Documents/com~apple~CloudDocs/Skyline/Skyline.zip "$T" && codesign --verify --strict --deep -R='identifier "com.briangage.Skyline" and certificate leaf = H"7e4d9f1dc62e5fc81f7d9c2b3f882a9eb15a28d6"' "$T/Skyline.app" && bash "$T/Skyline.app/Contents/Resources/install-verified.sh" "$T/Skyline.app"

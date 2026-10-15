@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build Skyline.app, sign with the local signing identity, install to /Applications, relaunch, and
-# zip to iCloud Drive. Other Macs install the zip with scripts/install-verified.sh (copied to each Mac
-# once, never run from iCloud), which refuses anything not signed by this Mac's certificate.
+# publish to iCloud Drive/Skyline (scripts/publish-icloud.sh: Skyline.zip, Install Skyline.command,
+# VERSION.txt, Skyline.version). Other Macs double-click Install Skyline.command (first time: right-click ›
+# Open), which refuses anything not signed by this Mac's certificate.
 #
 #   ./build-app.sh              # build + install + launch + zip to iCloud
 #   ./build-app.sh --no-launch  # install but don't launch
@@ -183,20 +184,8 @@ codesign -d -r- "$APP" 2>&1 | sed -n 's/^designated => /    designated requireme
 
 if [[ $ZIP -eq 1 ]]; then
   if [[ -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs" ]]; then
-    echo "==> Zipping to iCloud Drive"
-    mkdir -p "$ICLOUD_DIR"
-    rm -f "$ICLOUD_DIR/$APP_NAME.zip"
-    ditto -c -k --sequesterRsrc --keepParent "$APP" "$ICLOUD_DIR/$APP_NAME.zip"
-    # No installer script goes into iCloud any more: anything in that folder can be changed by whoever
-    # can edit it. Install with a local copy of scripts/install-verified.sh (see README).
-    # Build number next to the zip so each Mac's "Update Skyline…" can tell there's something newer
-    # without unzipping. It only decides whether to offer; the installer still checks the signature
-    # and refuses anything that isn't newer than what's installed.
-    echo "$GIT_REV" > "$ICLOUD_DIR/$APP_NAME.version"
-    echo "    $ICLOUD_DIR/$APP_NAME.zip (build $GIT_REV)"
-    if [[ -e "$ICLOUD_DIR/install.sh" ]]; then
-      echo "    note: an old iCloud Drive/$APP_NAME/install.sh is still there (unverified installer); delete it by hand." >&2
-    fi
+    echo "==> Publishing to iCloud Drive"
+    "$ROOT/scripts/publish-icloud.sh" "$APP"
   else
     echo "    iCloud Drive not found; skipping zip"
   fi
