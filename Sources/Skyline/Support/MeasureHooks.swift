@@ -59,7 +59,12 @@ enum MeasureHooks {
             Task {
                 try? await Task.sleep(for: .seconds(3))
                 if let w = NSApp.windows.first(where: { $0.isVisible && $0.styleMask.contains(.titled) && $0.frame.width > 600 }) {
+                    // Lift the size limits, or AppKit clamps the window to this screen.
+                    w.maxSize = NSSize(width: 100_000, height: 100_000)
+                    w.contentMaxSize = w.maxSize
                     w.setFrame(NSRect(x: 0, y: 0, width: size[0], height: size[1]), display: true)
+                    try? await Task.sleep(for: .seconds(1))
+                    if w.frame.width < size[0] { w.setFrame(NSRect(x: 0, y: 0, width: size[0], height: size[1]), display: true) }
                     print("[measure] window \(w.frame.size)"); fflush(stdout)
                 }
             }
