@@ -93,7 +93,11 @@ public enum RadarTilePacker {
     /// (when smaller than RGBA) instead of the decoded pixels.
     public static func pack(_ image: CGImage, encoded: Data?) -> RadarTile {
         let tile = pack(image)
-        guard !tile.isPacked, let encoded, encoded.count < image.width * image.height * 4 else { return tile }
+        // Build 52 (QA R1): the original PNG bytes whenever they're smaller than the packed (or RGBA) form.
+        // Lossless either way; NEXRAD PNGs are typically 3-10× smaller than 8-bit indices, which is what
+        // lets 19 frames fit at 1440p/4K. Frames are expanded ahead in the background, so the decode
+        // never runs on the main thread during playback.
+        guard let encoded, encoded.count < tile.heldBytes else { return tile }
         return RadarTile(encoded: encoded, width: image.width, height: image.height)
     }
 
