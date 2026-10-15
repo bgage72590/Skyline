@@ -151,7 +151,7 @@ struct MenuBarContentView: View {
                     .fixedSize()
                 Spacer(minLength: 16)
                 HStack(spacing: 8) {
-                    FooterIcon("map", help: "Radar") {
+                    FooterIcon("map", help: "Show radar map") {
                         if let l = store.menuBarLocation { store.selectedID = l.id }
                         store.activeModule = nil; store.radarExpanded = true
                         AppExit.showMainWindow(); GlobalHotkey.closePanel(); NSApp.activate()
@@ -161,10 +161,13 @@ struct MenuBarContentView: View {
                             .frame(minWidth: 28, minHeight: 28).contentShape(Rectangle())
                     }
                     .help("Switch to \(store.units.temperature == .fahrenheit ? "°C" : "°F")")
+                    .accessibilityLabel("Temperature unit: \(store.units.temperature == .fahrenheit ? "Fahrenheit" : "Celsius")")
+                    .accessibilityHint("Switches to \(store.units.temperature == .fahrenheit ? "Celsius" : "Fahrenheit")")
                     if store.loadingIDs.isEmpty {
-                        FooterIcon("arrow.clockwise", help: "Refresh") { Task { await store.refreshAll(force: true) } }
+                        FooterIcon("arrow.clockwise", help: "Refresh weather") { Task { await store.refreshAll(force: true) } }
                     } else {
                         ProgressView().controlSize(.small).frame(width: 28, height: 28).help("Refreshing…")
+                            .accessibilityLabel("Refreshing weather")
                     }
                     Menu {
                         // SettingsLink is inert in the ⌃⌥W HotkeyPanel, so Settings opens the AppKit way (QA #3).
@@ -180,6 +183,7 @@ struct MenuBarContentView: View {
                     .menuIndicator(.hidden)
                     .fixedSize()
                     .help("More: Settings, Updates, Quit")
+                    .accessibilityLabel("More options")
                 }
             }
             .buttonStyle(.borderless)
@@ -493,5 +497,6 @@ private struct FooterIcon: View {
             Image(systemName: symbol).frame(minWidth: 28, minHeight: 28).contentShape(Rectangle())
         }
         .help(help)
+        .accessibilityLabel(help)
     }
 }

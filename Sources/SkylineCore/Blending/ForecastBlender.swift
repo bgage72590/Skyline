@@ -415,6 +415,7 @@ public enum ForecastBlender {
             // One row per distinct NOAA-family forecast (identical columns are the same model).
             var readings: [SourceReading] = []
             var noaaRows: Set<Int> = []
+            var family: [Bool] = []
             let bmIsCopy = bmCopy("temperature_2m_max") && bmCopy("temperature_2m_min")
             for m in models {
                 // A best_match that is GFS/HRRR carries no weight of its own (it's listed with the model it is).
@@ -433,11 +434,14 @@ public enum ForecastBlender {
                 }
                 if inFamily { noaaRows.insert(readings.count) }
                 readings.append(SourceReading(name: m.displayName, high: h, low: l, weight: w))
+                family.append(inFamily)
             }
             if highP != nil || lowP != nil {
                 readings.append(SourceReading(name: "National Weather Service", high: highP?.temperatureC,
                                               low: lowP?.temperatureC, weight: nwsW))
+                family.append(false)
             }
+            readings = SourceReading.withShares(readings, family: family)
 
             var forecast = DailyForecast(
                 date: day, weatherCode: code, high: high, low: low,

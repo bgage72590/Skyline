@@ -368,9 +368,13 @@ struct ModuleDetailView: View {
     private func confidenceTable(_ d: DailyForecast) -> some View {
         let highTotal = d.sources.filter { $0.high != nil }.reduce(0) { $0 + $1.weight }
         let lowTotal = d.sources.filter { $0.low != nil }.reduce(0) { $0 + $1.weight }
-        func share(_ w: Double, _ value: Double?, _ total: Double) -> String {
+        func share(_ w: Double, _ value: Double?, _ total: Double, _ fieldShare: Double?) -> String {
             guard value != nil else { return "–" }          // no value from this source
             guard w > 0 else { return "0× · not counted" }    // a value that carries no weight
+            // Review L3: the blend's own per-field dedupe (a NOAA row equal to another on this field only).
+            if let fieldShare {
+                return fieldShare > 0 ? String(format: "%.1f× · %.0f%%", w, 100 * fieldShare) : "same as NOAA vote · 0%"
+            }
             return total > 0 ? String(format: "%.1f× · %.0f%%", w, 100 * w / total) : String(format: "%.1f×", w)
         }
         func cell(_ value: String, _ weight: String) -> some View {
@@ -401,8 +405,8 @@ struct ModuleDetailView: View {
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    cell(units.temperatureString(s.high), share(s.weight, s.high, highTotal))
-                    cell(units.temperatureString(s.low), share(s.weight, s.low, lowTotal))
+                    cell(units.temperatureString(s.high), share(s.weight, s.high, highTotal, s.highShare))
+                    cell(units.temperatureString(s.low), share(s.weight, s.low, lowTotal, s.lowShare))
                 }
                 .font(.callout.monospacedDigit())
                 .padding(.vertical, 7)

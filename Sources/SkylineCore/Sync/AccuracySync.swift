@@ -81,8 +81,24 @@ public enum AccuracySync {
             if $0.r.loc != $1.r.loc { return $0.r.loc < $1.r.loc }
             return $0.r.issued < $1.r.issued
         }
-        if now != nil, out.count > maxRecords { out = Array(out.suffix(maxRecords)) }
+        if now != nil, out.count > maxRecords { out = capped(out) }
         return out
+    }
+
+    /// Hard ceiling on stored pairs (file size) when two Macs each store their copy (QA S1).
+    public static let maxStoredRecords = maxRecords * 2
+
+    /// Newest records kept so the *scored* (cross-Mac collapsed) count is at most `maxRecords`, within
+    /// `maxStoredRecords` stored. Build 45 (QA S1): two Macs' copies of one forecast no longer halve
+    /// how many days are kept. A function of the sorted set only, so merge order still doesn't matter.
+    static func capped(_ sorted: [VerifiedRecord]) -> [VerifiedRecord] {
+        var lo = max(0, sorted.count - maxStoredRecords), hi = sorted.count - maxRecords
+        // Smallest start index whose suffix scores at most maxRecords (scored count shrinks with the suffix).
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if collapsedForScoring(Array(sorted[mid...])).count <= maxRecords { hi = mid } else { lo = mid + 1 }
+        }
+        return Array(sorted[lo...])
     }
 
     /// Cross-Mac duplicates collapsed for scoring (build 35): per location and valid hour, issuances are

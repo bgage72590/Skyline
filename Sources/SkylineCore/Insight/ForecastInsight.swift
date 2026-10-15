@@ -40,7 +40,9 @@ public enum ForecastInsight {
             level = .medium
             reason = "Only one forecast available for this day"
         } else if let spread = trimmedSpread(highs) ?? day.highSpread {
-            let t: Level = spread >= highSpreadLow ? .low : (spread >= highSpreadMedium ? .medium : .high)
+            // C1: classify on the number the sentence shows, so one displayed spread never reads as two levels.
+            let shown = delta(spread)
+            let t: Level = shown >= delta(highSpreadLow) ? .low : (shown >= delta(highSpreadMedium) ? .medium : .high)
             if t > .high { level = t; reason = "Models differ by \(delta(spread))° on the high" }
             else if day.sources.count >= 3 || spread > 0 { reason = "Models agree on the high within \(max(1, delta(spread)))°" }
         }
