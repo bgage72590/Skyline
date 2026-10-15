@@ -478,7 +478,7 @@ final class RadarDrawState: @unchecked Sendable {
     }
     var token: AnyHashable? { frameToken }
     func clear() { expanded = [:]; frameToken = nil; lock.lock(); tiles = []; lock.unlock() }
-    /// What the renderer draws: always the frame on screen (never hidden since build 48).
+    /// What the renderer draws: the frame on screen, or nothing while hidden behind the crossfade copies.
     func snapshot() -> [(TileKey, CGImage)] { lock.lock(); defer { lock.unlock() }; return hidden ? [] : tiles }
     /// The frame's tiles even while hidden (for the copies).
     func drawable() -> [(TileKey, CGImage)] { lock.lock(); defer { lock.unlock() }; return tiles }
@@ -566,7 +566,8 @@ final class RadarLayerView: NSView {
     private var pending: Generation?
     private var maxZ = 7
     private var zoom = 0
-    private var desired: [TileKey] = []
+    private var desired: [TileKey] = [] { didSet { desiredSet = Set(desired) } }
+    private var desiredSet: Set<TileKey> = []
     private var keep: Set<TileKey> = []
     private var index = 0
     private var opacity: Float = Float(RadarOpacity.defaultValue)
@@ -736,7 +737,7 @@ final class RadarLayerView: NSView {
         let onScreen = !states[0].drawable().isEmpty
         // Review M1 (build 47): frames are expanded off the main thread. On a miss the current frame
         // stays on screen and the switch happens once the background expansion lands.
-        guard let images = takeExpanded(token) ?? (onScreen ? nil : expandNow(g.tiles[target])) else {
+        guard let images = takeExpanded(token) ?? (onScreen ? nil : expandNow(g.tiles[target].filter { desiredSet.contains($0.key) })) else {
             expand(g, target) { [weak self] in
                 guard let self, let g2 = self.active, g2 === g, self.shownIndex(g2) == target, self.shownFrame != target else { return }
                 self.showTarget(animated: animated)
@@ -911,6 +912,12 @@ final class RadarLayerView: NSView {
         states[0].setHidden(hidden)
         let ring = states[0].set(g.tiles[i], zoom: zoom, token: token, prebuilt: images, expandMissing: false)
         if redraw { renderers[0]?.setNeedsDisplay() }
+        expandInBackground(ring, g, i, token: token)
+    }
+
+    /// Tiles of the shown frame without an image yet: expanded (PNG decode) on the expand queue, then
+    /// drawn, so the main thread never decodes a batch (review M2, build 56).
+    private func expandInBackground(_ ring: [TileKey: RadarTile], _ g: Generation, _ i: Int, token: AnyHashable) {
         guard !ring.isEmpty else { return }
         // Tiles that arrived after the frame was prepared: expanded in the background, then drawn.
         ringWork?.cancel()
@@ -956,8 +963,16 @@ final class RadarLayerView: NSView {
     }
 
     /// Resize: the copies follow the new size (called after the frame changed).
-    func sizeDidChange() { relayoutCopies() }
-    func sizeWillChange() {}
+    /// Resize, full screen, zoom or overscan change: the copies can't follow a re-tiled frame, so MapKit
+    /// takes the frame back as after a gesture (copies stay until it has drawn; review M1, build 56).
+    func sizeDidChange() {
+        relayoutCopies()
+        revealIfHidden()
+    }
+
+    private func revealIfHidden() {
+        if states[0].isHidden, !revealing { fadeSerial += 1; revealRenderer(serial: fadeSerial) }
+    }
 
     /// Ends a fade now (close, no frames): MapKit draws the shown frame; the copies stay until it has.
     private func cancelFade() {
@@ -979,7 +994,8 @@ final class RadarLayerView: NSView {
         return images
     }
 
-    /// First frame only (nothing on screen to hold): expanded at once.
+    /// First frame only (nothing on screen to hold): the visible tiles are expanded at once; the pan
+    /// ring follows from the background via `commit` (review M2, build 56).
     private func expandNow(_ tiles: [TileKey: RadarTile]) -> [TileKey: CGImage] {
         tiles.compactMapValues { $0.image() }
     }
@@ -1048,7 +1064,11 @@ final class RadarLayerView: NSView {
             // Only the arriving tile is expanded here; a ring still expanding in the background joins later.
             states[0].set(g.tiles[f], zoom: zoom, token: token, prebuilt: [key: image], expandMissing: false)
         } else {
-            states[0].set(g.tiles[f], zoom: zoom, token: token)
+            // Zoom change or prune: the copy holds the old tiles, so MapKit takes the frame back, and
+            // missing tiles decode in the background instead of here.
+            let missing = states[0].set(g.tiles[f], zoom: zoom, token: token, prebuilt: [:], expandMissing: false)
+            revealIfHidden()
+            expandInBackground(missing, g, f, token: token)
         }
         if let key {
             let r = TileMath.rect(key)
@@ -1087,7 +1107,7 @@ final class RadarLayerView: NSView {
         // The copies are plain layers: move them with the map, and hand the frame back to MapKit (the
         // copies stay, following the map, until MapKit has drawn).
         relayoutCopies()
-        if states[0].isHidden, !revealing { fadeSerial += 1; revealRenderer(serial: fadeSerial) }
+        revealIfHidden()
         guard !gestureWorkScheduled else { return }
         gestureWorkScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
