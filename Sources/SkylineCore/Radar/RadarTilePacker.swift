@@ -1,6 +1,7 @@
 #if canImport(CoreGraphics)
 import CoreGraphics
 import Foundation
+import ImageIO
 
 /// A decoded radar tile as held in memory (build 42). Radar tiles use a small palette with fully
 /// transparent or fully opaque pixels, so a 256² RGBA tile (256 KB) is kept as 8-bit palette indices
@@ -13,31 +14,56 @@ public final class RadarTile: @unchecked Sendable {
     /// Premultiplied RGBA per palette index; index 0 is transparent.
     private let palette: [UInt32]
     private let space: CGColorSpace
+    /// Build 45: a tile that can't be palette-packed (partial alpha, > 256 colours: RainViewer's smoothed
+    /// tiles) keeps its original compressed bytes (PNG/WebP, ~10–40 KB) instead of 256 KB of RGBA, and is
+    /// decoded again (losslessly, the same pixels) when its frame is expanded, ahead of time in the background.
+    private let encoded: Data?
 
     init(rgba: CGImage) {
         self.rgba = rgba; width = rgba.width; height = rgba.height
-        indices = []; palette = []; space = rgba.colorSpace ?? CGColorSpaceCreateDeviceRGB()
+        indices = []; palette = []; space = rgba.colorSpace ?? CGColorSpaceCreateDeviceRGB(); encoded = nil
+    }
+
+    init(encoded: Data, width: Int, height: Int) {
+        rgba = nil; self.width = width; self.height = height
+        indices = []; palette = []; space = CGColorSpaceCreateDeviceRGB(); self.encoded = encoded
     }
 
     init(width: Int, height: Int, indices: [UInt8], palette: [UInt32], space: CGColorSpace) {
         rgba = nil; self.width = width; self.height = height
-        self.indices = indices; self.palette = palette; self.space = space
+        self.indices = indices; self.palette = palette; self.space = space; encoded = nil
     }
 
-    public var isPacked: Bool { rgba == nil }
+    /// Palette-packed (8-bit indices).
+    public var isPacked: Bool { rgba == nil && encoded == nil }
+    /// Kept as the original compressed bytes.
+    public var isCompressed: Bool { encoded != nil }
 
     /// Bytes this tile holds.
-    public var heldBytes: Int { rgba.map { $0.bytesPerRow * $0.height } ?? indices.count + palette.count * 4 }
+    public var heldBytes: Int {
+        if let rgba { return rgba.bytesPerRow * rgba.height }
+        if let encoded { return encoded.count }
+        return indices.count + palette.count * 4
+    }
 
     /// A drawable image: the stored one, or a fresh RGBA expansion (released with the caller's copy,
     /// so nothing is cached per tile).
     public func image() -> CGImage? {
         if let rgba { return rgba }
-        var out = [UInt32](repeating: 0, count: width * height)
-        palette.withUnsafeBufferPointer { pal in
-            for i in 0..<indices.count { out[i] = pal[Int(indices[i])] }
+        if let encoded {
+            guard let source = CGImageSourceCreateWithData(encoded as CFData, nil) else { return nil }
+            return CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
         }
-        let data = out.withUnsafeBytes { Data($0) }
+        // Straight into the image's backing store: one allocation, no bounds checks (review M3).
+        var data = Data(count: width * height * 4)
+        data.withUnsafeMutableBytes { raw in
+            let out = raw.bindMemory(to: UInt32.self)
+            palette.withUnsafeBufferPointer { pal in
+                indices.withUnsafeBufferPointer { idx in
+                    for i in 0..<idx.count { out[i] = pal[Int(idx[i])] }
+                }
+            }
+        }
         guard let provider = CGDataProvider(data: data as CFData) else { return nil }
         return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
                        space: space, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
@@ -46,6 +72,14 @@ public final class RadarTile: @unchecked Sendable {
 }
 
 public enum RadarTilePacker {
+    /// `encoded`: the bytes `image` was decoded from. A tile that can't be palette-packed keeps them
+    /// (when smaller than RGBA) instead of the decoded pixels.
+    public static func pack(_ image: CGImage, encoded: Data?) -> RadarTile {
+        let tile = pack(image)
+        guard !tile.isPacked, let encoded, encoded.count < image.width * image.height * 4 else { return tile }
+        return RadarTile(encoded: encoded, width: image.width, height: image.height)
+    }
+
     public static func pack(_ image: CGImage) -> RadarTile {
         let w = image.width, h = image.height
         guard w > 0, h > 0, w * h <= 1024 * 1024 else { return RadarTile(rgba: image) }

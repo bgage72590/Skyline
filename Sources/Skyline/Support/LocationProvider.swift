@@ -89,10 +89,10 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
 
     /// Build 42 (QA build-41 G1): only plausible fixes reach the app. Inaccurate (> 5 km), stale
     /// (> 5 min), invalid fixes are dropped, and a jump of more than 500 km needs a second fix nearby.
-    private var filter = LocationFixFilter()
+    private var filter = LocationFixFilter(timeZoneOffset: TimeZone.current.secondsFromGMT())
 
     /// The last accepted place (from the saved fix at launch), so a first bogus fix can't jump far.
-    func seed(_ c: Coordinate?) { filter = LocationFixFilter(last: c) }
+    func seed(_ c: Coordinate?) { filter = LocationFixFilter(last: c, timeZoneOffset: TimeZone.current.secondsFromGMT()) }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         let fixes = locations.map {
@@ -115,10 +115,10 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
                 self.retryTask?.cancel()
                 self.onUpdate?(accepted)
             } else if held {
-                // Ask again soon: a real trip is confirmed by the next fix.
+                // Ask again soon: a real trip is confirmed by fixes over two minutes (30 s apart).
                 self.retryTask?.cancel()
                 self.retryTask = Task { [weak self] in
-                    try? await Task.sleep(for: .seconds(20))
+                    try? await Task.sleep(for: .seconds(30))
                     guard !Task.isCancelled else { return }
                     self?.manager.requestLocation()
                 }

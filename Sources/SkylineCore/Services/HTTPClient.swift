@@ -90,10 +90,16 @@ public final class RequestStats: @unchecked Sendable {
     public let since = Date()
     public init() {}
     public func note() { lock.lock(); count += 1; lock.unlock() }
-    private var packed = 0, unpacked = 0
-    /// Radar tiles stored packed vs. as decoded (build 42 measurement log).
-    public func notePacked(_ ok: Bool) { lock.lock(); if ok { packed += 1 } else { unpacked += 1 }; lock.unlock() }
-    public var packCounts: (packed: Int, unpacked: Int) { lock.lock(); defer { lock.unlock() }; return (packed, unpacked) }
+    private var packed = 0, compressed = 0, unpacked = 0
+    /// Radar tiles stored palette-packed, as original compressed bytes, or as decoded RGBA (measurement log).
+    public func notePacked(_ ok: Bool, compressed isCompressed: Bool = false) {
+        lock.lock()
+        if ok { packed += 1 } else if isCompressed { compressed += 1 } else { unpacked += 1 }
+        lock.unlock()
+    }
+    public var packCounts: (packed: Int, compressed: Int, unpacked: Int) {
+        lock.lock(); defer { lock.unlock() }; return (packed, compressed, unpacked)
+    }
     public var total: Int { lock.lock(); defer { lock.unlock() }; return count }
     /// Requests per hour since launch (nil in the first 5 minutes, when it means little).
     public func perHour(now: Date = Date()) -> Double? {

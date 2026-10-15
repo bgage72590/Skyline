@@ -2,6 +2,15 @@ import Foundation
 
 /// Build 42 radar policy, kept free of AppKit/MapKit so it runs (and is tested) on Linux.
 public enum RadarPolicy {
+    /// How long a frame with an unresolved tile may hold the previous frame on screen (review L2).
+    public static let incompleteTimeout: Double = 1.5
+
+    /// Show the target frame when it's complete, when nothing is on screen yet, or after waiting
+    /// `incompleteTimeout` for a tile that never resolves.
+    public static func shouldShow(complete: Bool, nothingShown: Bool, waited: Double) -> Bool {
+        complete || nothingShown || waited >= incompleteTimeout
+    }
+
     /// Frames loaded first after the shown one while playing (code review build 41 M2).
     public static let aheadFrames = 3
 
@@ -131,7 +140,15 @@ public struct LocationFixFilter: Sendable {
     public static let maxAccuracy: Double = 5_000        // metres
     public static let maxAge: TimeInterval = 5 * 60
     public static let bigJump: Double = 500_000          // metres
-    public static let confirmRadius: Double = 50_000     // a second fix within this of the jump confirms it
+    public static let confirmRadius: Double = 50_000     // later fixes within this of the jump confirm it
+    /// Build 45 (QA build-44 G1-a): a jump is confirmed only by fixes spanning at least this long, so one
+    /// mislocated Wi-Fi answer repeated 20 s later isn't enough.
+    public static let confirmSpan: TimeInterval = 120
+    /// A fix dated this far in the future is invalid.
+    public static let futureSkew: TimeInterval = 60
+    /// No saved fix yet: a first fix whose solar time is this far from the Mac's time zone is held
+    /// for confirmation like a big jump.
+    public static let maxZoneMismatchHours: Double = 3.5
 
     public struct Fix: Equatable, Sendable {
         public let latitude: Double, longitude: Double, accuracy: Double, timestamp: Date
@@ -143,27 +160,47 @@ public struct LocationFixFilter: Sendable {
     public enum Verdict: Equatable, Sendable { case accept, rejectInaccurate, rejectStale, rejectInvalid, holdForConfirmation }
 
     public private(set) var last: Coordinate?
-    private var candidate: Fix?
+    /// The first fix of an unconfirmed jump.
+    private var anchor: Fix?
+    private let zoneOffsetSeconds: Int?
 
-    public init(last: Coordinate? = nil) { self.last = last }
+    /// - Parameter timeZoneOffset: the Mac's UTC offset in seconds (checks a first fix with no seed).
+    public init(last: Coordinate? = nil, timeZoneOffset: Int? = nil) {
+        self.last = last
+        zoneOffsetSeconds = timeZoneOffset
+    }
+
+    /// True when `longitude`'s solar offset is far from the Mac's time zone.
+    static func zoneMismatch(longitude: Double, offsetSeconds: Int) -> Bool {
+        var diff = abs(longitude / 15 - Double(offsetSeconds) / 3600)
+        if diff > 12 { diff = 24 - diff }
+        return diff > maxZoneMismatchHours
+    }
 
     public mutating func evaluate(_ f: Fix, now: Date) -> Verdict {
         guard f.latitude.isFinite, f.longitude.isFinite, abs(f.latitude) <= 90, abs(f.longitude) <= 180,
               !(f.latitude == 0 && f.longitude == 0) else { return .rejectInvalid }
+        guard f.timestamp.timeIntervalSince(now) <= Self.futureSkew else { return .rejectInvalid }
         guard f.accuracy >= 0, f.accuracy <= Self.maxAccuracy else { return .rejectInaccurate }
         guard now.timeIntervalSince(f.timestamp) <= Self.maxAge else { return .rejectStale }
         let here = Coordinate(latitude: f.latitude, longitude: f.longitude)
-        if let last, Self.distance(last, here) > Self.bigJump {
-            if let c = candidate, c.timestamp != f.timestamp,
-               Self.distance(Coordinate(latitude: c.latitude, longitude: c.longitude), here) <= Self.confirmRadius {
-                candidate = nil
-                self.last = here
-                return .accept
+        let suspicious: Bool
+        if let last { suspicious = Self.distance(last, here) > Self.bigJump }
+        else if let z = zoneOffsetSeconds { suspicious = Self.zoneMismatch(longitude: f.longitude, offsetSeconds: z) }
+        else { suspicious = false }
+        if suspicious {
+            if let a = anchor, Self.distance(Coordinate(latitude: a.latitude, longitude: a.longitude), here) <= Self.confirmRadius {
+                if f.timestamp.timeIntervalSince(a.timestamp) >= Self.confirmSpan {
+                    anchor = nil
+                    self.last = here
+                    return .accept
+                }
+                return .holdForConfirmation
             }
-            candidate = f
+            anchor = f
             return .holdForConfirmation
         }
-        candidate = nil
+        anchor = nil
         self.last = here
         return .accept
     }

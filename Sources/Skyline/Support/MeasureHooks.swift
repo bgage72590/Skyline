@@ -20,6 +20,28 @@ enum MeasureHooks {
                 }
             }
         }
+        if defaults.bool(forKey: "SkylineDumpReports") {
+            // Which cities have data, which have an error, which are still loading.
+            Task {
+                for t in [20, 60, 120] {
+                    try? await Task.sleep(for: .seconds(t == 20 ? 20 : 40))
+                    for l in store.allLocations {
+                        let r = store.reports[l.id]
+                        print("[measure] t=\(t)s \(l.name) [\(l.id)] report=\(r.map { "\($0.current.temperature) fetched \($0.fetchedAt)" } ?? "nil") error=\(store.errors[l.id] ?? "-") loading=\(store.loadingIDs.contains(l.id))")
+                    }
+                    fflush(stdout)
+                }
+            }
+        }
+        if let q = defaults.string(forKey: "SkylineSearchProbe") {
+            // Live search check without adding anything: what would Return add?
+            Task {
+                let raw = (try? await store.service.search(q)) ?? []
+                let ranked = SearchSubmit.ranked(raw, query: q)
+                print("[measure] search \(q): \(ranked.map { "\($0.name) [\($0.featureCode ?? "?")]" }) → Return adds: \(SearchSubmit.autoAdd(ranked)?.name ?? "nothing (list stays open)")")
+                fflush(stdout)
+            }
+        }
         if defaults.bool(forKey: "SkylineRadarSiteTest") { radarSiteTest(store: store) }
         if defaults.bool(forKey: "SkylinePanTest") { panTest(store: store) }
         if defaults.bool(forKey: "SkylineFullScreen") {

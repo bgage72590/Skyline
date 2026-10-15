@@ -261,8 +261,8 @@ final class RadarImageCache {
             let options = [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
             guard let decoded = CGImageSourceCreateImageAtIndex(source, 0, options) else { return nil }
             // Build 42: 8-bit palette indices, pixel-identical, ~4× smaller (RadarTilePacker).
-            let tile = RadarTilePacker.pack(decoded)
-            RequestStats.shared.notePacked(tile.isPacked)
+            let tile = RadarTilePacker.pack(decoded, encoded: data)
+            RequestStats.shared.notePacked(tile.isPacked, compressed: tile.isCompressed)
             return tile
         }
         return image.map(Outcome.image) ?? .missing
