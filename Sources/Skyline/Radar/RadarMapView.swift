@@ -868,9 +868,16 @@ final class RadarLayerView: NSView {
             self.states[0].setHidden(true)
             self.renderers[0]?.setNeedsDisplay()
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + RadarCrossfade.duration) { [weak self] in
-            guard let self, self.fadeSerial == serial else { return }
-            self.revealRenderer(serial: serial)
+        DispatchQueue.main.asyncAfter(deadline: .now() + RadarCrossfade.duration + 0.02) { [weak self, weak out] in
+            guard let self, self.fadeSerial == serial, let out else { return }
+            // The new frame stays on screen as its copy (MapKit still hidden) until the map moves: no
+            // hand-back during playback, so no moment with both or neither drawn.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            out.removeFromSuperlayer()
+            CATransaction.commit()
+            self.fadeLayers.removeAll { $0 === out }
+            self.fade.finish()
         }
     }
 
@@ -878,15 +885,22 @@ final class RadarLayerView: NSView {
     /// has drawn.
     private func revealRenderer(serial: Int) {
         incoming = nil
+        revealing = true
         let before = states[0].drawCount
         states[0].setHidden(false)
         renderers[0]?.setNeedsDisplay()
         awaitDraw(since: before) { [weak self] in
-            guard let self, self.fadeSerial == serial else { return }
-            self.removeCopies()
-            self.fade.finish()
+            // MapKit's draw lands on screen a little after draw() returns.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                guard let self else { return }
+                self.revealing = false
+                guard self.fadeSerial == serial else { return }
+                self.removeCopies()
+                self.fade.finish()
+            }
         }
     }
+    private var revealing = false
 
     /// Hands a frame to MapKit's renderer.
     /// `redraw: false`: the state changes but MapKit isn't asked to redraw yet (start of a fade, where
@@ -924,7 +938,7 @@ final class RadarLayerView: NSView {
     /// redraw is asynchronous and piecewise), or after 0.5 s (nothing visible to draw).
     private func awaitDraw(since: Int, started: CFTimeInterval = CACurrentMediaTime(), _ done: @escaping () -> Void) {
         let now = CACurrentMediaTime()
-        let drew = states[0].drawCount > since && now - states[0].lastDraw > 0.017
+        let drew = states[0].drawCount > since && now - states[0].lastDraw > 0.05
         if drew || now - started > 0.5 { done(); return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 120) { [weak self] in
             self?.awaitDraw(since: since, started: started, done)
@@ -1070,8 +1084,10 @@ final class RadarLayerView: NSView {
     /// Mid-gesture: MapKit already moves the radar with the map. Edge loading is coalesced to at most
     /// one pass per 150 ms, and nothing is pruned until the gesture settles.
     func gestureMoved() {
-        // The fading copies are plain layers: move them with the map (the fade carries on).
+        // The copies are plain layers: move them with the map, and hand the frame back to MapKit (the
+        // copies stay, following the map, until MapKit has drawn).
         relayoutCopies()
+        if states[0].isHidden, !revealing { fadeSerial += 1; revealRenderer(serial: fadeSerial) }
         guard !gestureWorkScheduled else { return }
         gestureWorkScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
