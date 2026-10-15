@@ -49,6 +49,12 @@ enum SkyPalette {
         LinearGradient(colors: colors(category, isDay: isDay), startPoint: .top, endPoint: .bottom)
     }
 
+    /// Tint for the dropdown's Liquid Glass (SkyColors.glassTint, tested for contrast).
+    static func glassTint(for report: WeatherReport?) -> Color {
+        let c = SkyColors.glassTint(report?.current.condition.category ?? .partlyCloudy, isDay: report?.current.isDay ?? true)
+        return Color(red: c.r, green: c.g, blue: c.b).opacity(SkyColors.glassTintOpacity)
+    }
+
     static func gradient(for report: WeatherReport?) -> LinearGradient {
         gradient(report?.current.condition.category ?? .partlyCloudy, isDay: report?.current.isDay ?? true)
     }

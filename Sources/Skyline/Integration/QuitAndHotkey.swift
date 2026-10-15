@@ -238,7 +238,7 @@ final class HotkeyPanel: NSPanel {
         host.sizingOptions = [.preferredContentSize]
         contentViewController = host
         contentView?.wantsLayer = true
-        contentView?.layer?.cornerRadius = 22
+        contentView?.layer?.cornerRadius = DropdownShape.radius
         contentView?.layer?.masksToBounds = true
         NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: self, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { if self?.keepOpenForScreenshot != true { self?.close() } }

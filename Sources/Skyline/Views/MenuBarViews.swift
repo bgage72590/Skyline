@@ -194,14 +194,9 @@ struct MenuBarContentView: View {
         .frame(width: 344)
         .id(store.clockStyle)
         .foregroundStyle(.white)
-        .background {
-            // Black wash keeps white text ≥ 4.5:1 on every sky (T6; tested via SkyColors.dropdownScrim).
-            ZStack {
-                SkyPalette.gradient(for: report)
-                Color.black.opacity(SkyColors.dropdownScrim)
-            }
-        }
+        .dropdownSurface(report: report)
         .environment(\.colorScheme, .dark)
+        .background(DropdownWindowConfigurator(cornerRadius: DropdownShape.radius))
         .task {
             if let location = store.menuBarLocation { await store.load(location) }
         }
@@ -448,15 +443,44 @@ struct MiniNowcast: View {
     }
 }
 
+enum DropdownShape {
+    /// Outer corners of the dropdown (MenuBarExtra panel and hotkey panel), Brian's 22 pt.
+    static let radius: CGFloat = 22
+    static var shape: RoundedRectangle { RoundedRectangle(cornerRadius: radius, style: .continuous) }
+}
+
 extension View {
+    /// The dropdown's surface: one tinted Liquid Glass layer on macOS 26+, the sky gradient with its
+    /// black wash before that. Either way clipped to 22 pt corners; the window itself is transparent
+    /// (DropdownWindowConfigurator), so these are the corners you see.
+    @ViewBuilder
+    func dropdownSurface(report: WeatherReport?) -> some View {
+        if #available(macOS 26.0, *) {
+            self.glassEffect(.regular.tint(SkyPalette.glassTint(for: report)), in: DropdownShape.shape)
+                .clipShape(DropdownShape.shape)
+        } else {
+            self.background {
+                // Black wash keeps white text ≥ 4.5:1 on every sky (T6; tested via SkyColors.dropdownScrim).
+                ZStack {
+                    SkyPalette.gradient(for: report)
+                    Color.black.opacity(SkyColors.dropdownScrim)
+                }
+            }
+            .clipShape(DropdownShape.shape)
+        }
+    }
+
     /// Dropdown card: Liquid Glass on macOS 26 and later, a frosted material on older systems (polish 3).
     /// Static (no animation), so it costs nothing while the dropdown just sits open.
     @ViewBuilder
     func menuGlass(cornerRadius: CGFloat = 18, padding: CGFloat = 10) -> some View {
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         if #available(macOS 26.0, *) {
+            // Build 57: the whole dropdown is one Liquid Glass surface; cards are flat on it (no glass
+            // on glass, per Apple's guidance and the spec).
             self.padding(padding)
-                .glassEffect(.regular.tint(.black.opacity(0.22)), in: shape)
+                .background(shape.fill(.white.opacity(0.08)))
+                .overlay(shape.strokeBorder(.white.opacity(0.12), lineWidth: 0.5))
         } else {
             self.padding(padding)
                 .background {

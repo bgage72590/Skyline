@@ -31,6 +31,20 @@ public enum SkyColors {
     /// Extra black at the bottom edge of a sidebar card (linear from the centre).
     public static let cardBottomScrim = 0.35
 
+    /// Liquid Glass dropdown (macOS 26+, build 57): the glass is tinted with the sky's top colour,
+    /// darkened, at `glassTintOpacity`. Chosen so white text (and 0.75-alpha secondary text) stays at
+    /// least 4.5 : 1 even with a pure white wallpaper behind the glass (tested), Brian's "readability
+    /// wins over see-through".
+    public static let glassTintDarken = 0.55
+    public static let glassTintOpacity = 0.85
+    public static func glassTint(_ category: SkyCategory, isDay: Bool) -> RGB {
+        darkened(stops(category, isDay: isDay)[0], by: glassTintDarken)
+    }
+    /// The tinted glass over a backdrop colour (worst case: white).
+    public static func glassComposite(_ category: SkyCategory, isDay: Bool, over backdrop: RGB = (1, 1, 1)) -> RGB {
+        mix(backdrop, glassTint(category, isDay: isDay), glassTintOpacity)
+    }
+
     /// `colour` with black at `opacity` composited over it (sRGB, as SwiftUI draws it).
     public static func darkened(_ c: RGB, by opacity: Double) -> RGB {
         (c.r * (1 - opacity), c.g * (1 - opacity), c.b * (1 - opacity))
