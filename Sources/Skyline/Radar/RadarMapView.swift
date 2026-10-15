@@ -260,8 +260,9 @@ final class RadarMapContainer: NSView {
     override func layout() {
         super.layout()
         map.frame = bounds
-        if radar.frame.size != bounds.size { radar.sizeWillChange() }
+        let resized = radar.frame.size != bounds.size
         radar.frame = bounds
+        if resized { radar.sizeDidChange() }
         alertOverlay.frame = bounds
         radar.updateTiles(allowZoomChange: true)
         alertOverlay.relayout()
@@ -447,6 +448,8 @@ final class RadarOverlay: NSObject, MKOverlay {
 final class RadarDrawState: @unchecked Sendable {
     private let lock = NSLock()
     private var tiles: [(TileKey, CGImage)] = []
+    /// While a crossfade runs MapKit draws nothing: both frames are copies on top (build 52).
+    private var hidden = false
     /// Draw passes so far and when the last one ran (review H1: a copy is removed only after MapKit drew).
     private var draws = 0
     private var lastDrawTime: CFTimeInterval = 0
@@ -476,8 +479,11 @@ final class RadarDrawState: @unchecked Sendable {
     var token: AnyHashable? { frameToken }
     func clear() { expanded = [:]; frameToken = nil; lock.lock(); tiles = []; lock.unlock() }
     /// What the renderer draws: always the frame on screen (never hidden since build 48).
-    func snapshot() -> [(TileKey, CGImage)] { lock.lock(); defer { lock.unlock() }; return tiles }
-    func drawable() -> [(TileKey, CGImage)] { snapshot() }
+    func snapshot() -> [(TileKey, CGImage)] { lock.lock(); defer { lock.unlock() }; return hidden ? [] : tiles }
+    /// The frame's tiles even while hidden (for the copies).
+    func drawable() -> [(TileKey, CGImage)] { lock.lock(); defer { lock.unlock() }; return tiles }
+    var isHidden: Bool { lock.lock(); defer { lock.unlock() }; return hidden }
+    func setHidden(_ h: Bool) { lock.lock(); hidden = h; lock.unlock() }
     /// MapKit draw threads, after each draw pass.
     func noteDraw() { lock.lock(); draws += 1; lastDrawTime = CACurrentMediaTime(); lock.unlock() }
     var drawCount: Int { lock.lock(); defer { lock.unlock() }; return draws }
@@ -742,24 +748,30 @@ final class RadarLayerView: NSView {
         if animated, onScreen, Self.crossfadeEnabled, let map, bounds.width > 1 {
             startFade(g, target, token: token, images: images, visible: map.visibleMapRect)
         } else {
-            removeCopies()
-            commit(g, target, token: token, images: images)
-            fade.finish()
+            if fadeLayers.isEmpty {
+                commit(g, target, token: token, images: images)
+                fade.finish()
+            } else {
+                // Mid-fade: MapKit takes the new frame; the copies go once it has drawn it.
+                commit(g, target, token: token, images: images, hidden: true)
+                fadeSerial += 1
+                revealRenderer(serial: fadeSerial)
+            }
         }
         expandAhead()
     }
 
-    // MARK: Two-way crossfade over a renderer that always draws (build 48, review H1)
+    // MARK: Simultaneous crossfade (build 52, reviews M1 / QA X1)
 
-    /// MapKit's renderer always draws a real frame: it is never hidden, so removing a copy can never
-    /// show an empty map. A switch runs in two phases, GPU only:
-    /// 1. The new frame, as a Core Animation copy, fades in over the old frame (still drawn by MapKit).
-    /// 2. MapKit redraws the new frame under the copy. Once it has actually drawn, the new-frame copy
-    ///    is swapped (same transaction) for a copy of the old frame, which fades out over the new one.
-    /// Both copies share the CGImages MapKit draws (no extra image memory).
+    /// Old and new frames as Core Animation copies on top of the map: old 1→0 and new 0→1 together over
+    /// 0.35 s (GPU only), so the radar is never two frames at full strength and never snaps back.
+    /// MapKit gets the new frame at the start but is told to draw nothing under the copies while they
+    /// fade; at the end it draws the new frame again and the copies go only once it has actually drawn
+    /// (review H1: the copies always cover until then, so the radar never goes blank). During a pan or
+    /// resize the copies follow the map.
     private var fadeLayers: [CALayer] = []
     private var waitTarget: (token: AnyHashable, since: CFTimeInterval)?
-    /// The frame being faded in, until MapKit has it (`commit`); tiles arriving for it join its copy.
+    /// The frame being faded in; tiles arriving for it join its copy.
     private var incoming: (token: AnyHashable, layer: CALayer, images: [TileKey: CGImage])?
     private var fadeSerial = 0
 
@@ -768,30 +780,45 @@ final class RadarLayerView: NSView {
         group.frame = bounds
         group.actions = Self.noActions
         group.allowsGroupOpacity = false
-        // Review L6: the copy is placed from this view's size, which must match the map's.
-        assert(map.map { abs($0.bounds.width - bounds.width) < 1 && abs($0.bounds.height - bounds.height) < 1 } ?? true)
         for (key, image) in tiles { addTileLayer(key, image, to: group, visible: v) }
         return group
     }
 
-    private static let noActions: [String: any CAAction] = ["opacity": NSNull(), "sublayers": NSNull(), "bounds": NSNull(), "position": NSNull(), "contents": NSNull()]
+    private static let noActions: [String: any CAAction] = ["opacity": NSNull(), "sublayers": NSNull(), "bounds": NSNull(), "position": NSNull(), "contents": NSNull(), "frame": NSNull()]
 
-    private func addTileLayer(_ key: TileKey, _ image: CGImage, to group: CALayer, visible v: MKMapRect) {
+    private func tileFrame(_ key: TileKey, visible v: MKMapRect) -> CGRect {
         let scale = Double(bounds.width) / v.size.width
         let r = TileMath.rect(key)
         let x = (r.x - v.origin.x) * scale, yTop = (r.y - v.origin.y) * scale, size = r.width * scale
-        let frame = CGRect(x: x, y: Double(bounds.height) - yTop - size, width: size, height: size)
-        guard frame.intersects(bounds) else { return }
-        let tile = CALayer()
+        return CGRect(x: x, y: Double(bounds.height) - yTop - size, width: size, height: size)
+    }
+
+    private func addTileLayer(_ key: TileKey, _ image: CGImage, to group: CALayer, visible v: MKMapRect) {
+        let tile = TileLayer()
+        tile.key = key
         tile.actions = Self.noActions
         tile.contents = image
         tile.contentsGravity = .resize
         tile.magnificationFilter = .linear
         tile.minificationFilter = .linear
-        tile.frame = frame
+        tile.frame = tileFrame(key, visible: v)
         tile.opacity = opacity
-        tile.name = "\(key.z)/\(key.x)/\(key.y)"
         group.addSublayer(tile)
+    }
+
+    private final class TileLayer: CALayer { var key: TileKey? }
+
+    /// Re-places the copies for the map's current region and size (pan, zoom, resize mid-fade).
+    private func relayoutCopies() {
+        guard !fadeLayers.isEmpty, let map else { return }
+        let v = map.visibleMapRect
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for group in fadeLayers {
+            group.frame = bounds
+            for case let tile as TileLayer in group.sublayers ?? [] { if let key = tile.key { tile.frame = tileFrame(key, visible: v) } }
+        }
+        CATransaction.commit()
     }
 
     private func ordered(_ images: [TileKey: CGImage]) -> [(TileKey, CGImage)] {
@@ -804,73 +831,82 @@ final class RadarLayerView: NSView {
         anim.toValue = to
         anim.duration = duration
         anim.fillMode = .both
-        anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        anim.timingFunction = CAMediaTimingFunction(name: .linear)
         anim.isRemovedOnCompletion = false
         return anim
     }
 
     private func startFade(_ g: Generation, _ target: Int, token: AnyHashable, images: [TileKey: CGImage], visible v: MKMapRect) {
         guard let host = layer else { return }
-        // A switch mid-fade: drop the copies; MapKit still shows a whole frame underneath.
+        // The old frame as MapKit has it (a switch mid-fade starts from the frame being faded in).
+        let old = states[0].drawable()
         removeCopies()
         fadeSerial += 1
         let serial = fadeSerial
+        let out = copyLayer(old, visible: v)
         let inc = copyLayer(ordered(images), visible: v)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         inc.opacity = 0
+        out.opacity = 0
+        host.addSublayer(out)
         host.addSublayer(inc)
-        inc.add(fadeAnimation(from: 0, to: 1, duration: RadarCrossfade.fadeIn), forKey: "fade")
+        // Equal-sum, simultaneous: old 1→0 while new 0→1.
+        out.add(fadeAnimation(from: 1, to: 0, duration: RadarCrossfade.duration), forKey: "fade")
+        inc.add(fadeAnimation(from: 0, to: 1, duration: RadarCrossfade.duration), forKey: "fade")
         CATransaction.commit()
-        fadeLayers = [inc]
+        fadeLayers = [out, inc]
         incoming = (token, inc, images)
-        DispatchQueue.main.asyncAfter(deadline: .now() + RadarCrossfade.fadeIn) { [weak self] in
-            guard let self, self.fadeSerial == serial, let pending = self.incoming, pending.token == token,
-                  let g2 = self.active, g2 === g, g2.tiles.indices.contains(target) else { return }
-            let old = self.states[0].drawable()
-            let drawsBefore = self.states[0].drawCount
-            self.commit(g2, target, token: token, images: pending.images)
-            self.awaitDraw(since: drawsBefore) { [weak self] in
-                guard let self, self.fadeSerial == serial, let host = self.layer, let map = self.map else { return }
-                // Phase 2, same transaction: the new frame is MapKit's now; the old one fades out on top.
-                let out = self.copyLayer(old, visible: map.visibleMapRect)
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                host.addSublayer(out)
-                out.add(self.fadeAnimation(from: 1, to: 0, duration: RadarCrossfade.fadeOut), forKey: "fade")
-                self.fadeLayers.forEach { $0.removeFromSuperlayer() }
-                CATransaction.commit()
-                self.fadeLayers = [out]
-                DispatchQueue.main.asyncAfter(deadline: .now() + RadarCrossfade.fadeOut + 0.02) { [weak self] in
-                    guard let self, self.fadeSerial == serial else { return }
-                    self.removeCopies()
-                    self.fade.finish()
-                }
-            }
+        // MapKit gets the new frame now, drawing nothing under the copies until the fade ends.
+        commit(g, target, token: token, images: images, hidden: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + RadarCrossfade.duration) { [weak self] in
+            guard let self, self.fadeSerial == serial else { return }
+            self.revealRenderer(serial: serial)
+        }
+    }
+
+    /// MapKit draws the shown frame again; the copies (new at full strength on top) are removed once it
+    /// has drawn.
+    private func revealRenderer(serial: Int) {
+        incoming = nil
+        let before = states[0].drawCount
+        states[0].setHidden(false)
+        renderers[0]?.setNeedsDisplay()
+        awaitDraw(since: before) { [weak self] in
+            guard let self, self.fadeSerial == serial else { return }
+            self.removeCopies()
+            self.fade.finish()
         }
     }
 
     /// Hands a frame to MapKit's renderer.
-    private func commit(_ g: Generation, _ i: Int, token: AnyHashable, images: [TileKey: CGImage]) {
-        if incoming?.token == token { incoming = nil }
+    private func commit(_ g: Generation, _ i: Int, token: AnyHashable, images: [TileKey: CGImage], hidden: Bool = false) {
+        if !hidden, incoming?.token == token { incoming = nil }
+        states[0].setHidden(hidden)
         let ring = states[0].set(g.tiles[i], zoom: zoom, token: token, prebuilt: images, expandMissing: false)
         renderers[0]?.setNeedsDisplay()
         guard !ring.isEmpty else { return }
-        // Frames are prepared ahead for the visible area only; the off-screen ring (for panning) is
-        // expanded in the background now and joins MapKit's frame without a visible change.
-        Self.expandQueue.async { [weak self, weak g] in
+        // Tiles that arrived after the frame was prepared: expanded in the background, then drawn.
+        ringWork?.cancel()
+        let work = DispatchWorkItem { [weak self, weak g] in
             var images: [TileKey: CGImage] = [:]
             autoreleasepool { for (key, tile) in ring { images[key] = tile.image() } }
             DispatchQueue.main.async {
                 guard let self, let g, self.states[0].token == token, g.tiles.indices.contains(i) else { return }
                 self.states[0].set(g.tiles[i], zoom: self.zoom, token: token, prebuilt: images, expandMissing: false)
+                if let pending = self.incoming, pending.token == token, let map = self.map {
+                    for (key, image) in images { self.addTileLayer(key, image, to: pending.layer, visible: map.visibleMapRect) }
+                }
                 for key in images.keys {
                     let r = TileMath.rect(key)
                     self.renderers[0]?.setNeedsDisplay(MKMapRect(x: r.x, y: r.y, width: r.width, height: r.height))
                 }
             }
         }
+        ringWork = work
+        Self.expandQueue.async(execute: work)
     }
+    private var ringWork: DispatchWorkItem?
 
     /// Calls `done` once MapKit has drawn after `since` and gone quiet for two display frames (its
     /// redraw is asynchronous and piecewise), or after 0.5 s (nothing visible to draw).
@@ -893,19 +929,15 @@ final class RadarLayerView: NSView {
         fadeLayers = []
     }
 
-    /// The copies are placed for the old size: drop them (MapKit's frame is underneath).
-    func sizeWillChange() { cancelFade() }
+    /// Resize: the copies follow the new size (called after the frame changed).
+    func sizeDidChange() { relayoutCopies() }
+    func sizeWillChange() {}
 
-    /// Drops the copies at once (pan, resize, close). MapKit is always drawing a whole frame under
-    /// them, so nothing goes blank; a frame still fading in is handed to MapKit straight away.
+    /// Ends a fade now (close, no frames): MapKit draws the shown frame; the copies stay until it has.
     private func cancelFade() {
-        let pending = incoming
-        removeCopies()
-        incoming = nil
-        if let pending, let g = active, let f = shownFrame, Self.token(g, f) == pending.token {
-            commit(g, f, token: pending.token, images: pending.images)
-        }
-        fade.finish()
+        guard !fadeLayers.isEmpty || states[0].isHidden else { fade.finish(); return }
+        fadeSerial += 1
+        revealRenderer(serial: fadeSerial)
     }
 
     // MARK: Expanding frames off the main thread (review M1/M3)
@@ -929,7 +961,7 @@ final class RadarLayerView: NSView {
     /// Expands the next two frames in the background, so a switch only swaps images.
     private func expandAhead() {
         guard let g = active, g.frames.count > 1, let shown = shownFrame else { return }
-        for step in 1...min(2, g.frames.count - 1) {
+        for step in 1...min(aheadLimit, g.frames.count - 1) {
             let i = (shown + step) % g.frames.count
             if g.isComplete(i, desired: desired) { expand(g, i, then: nil) }
         }
@@ -940,13 +972,8 @@ final class RadarLayerView: NSView {
         if ahead[token] != nil { done.map { DispatchQueue.main.async(execute: $0) }; return }
         if aheadInFlight[token] != nil { if let done { aheadInFlight[token]!.append(done) }; return }
         aheadInFlight[token] = done.map { [$0] } ?? []
-        // Only the tiles on screen (about half of a frame with its pan ring; review M2).
-        let visible = map?.visibleMapRect
-        let tiles = g.tiles[i].filter { key, _ in
-            guard let v = visible else { return true }
-            let r = TileMath.rect(key)
-            return MKMapRect(x: r.x, y: r.y, width: r.width, height: r.height).intersects(v)
-        }
+        // The whole frame with its pan ring (review M2: no blank edges after a switch).
+        let tiles = g.tiles[i]
         Self.expandQueue.async { [weak self] in
             var images: [TileKey: CGImage] = [:]
             autoreleasepool { for (key, tile) in tiles { images[key] = tile.image() } }
@@ -959,11 +986,15 @@ final class RadarLayerView: NSView {
                 self.aheadOrder.removeAll { $0 == token }
                 self.aheadOrder.append(token)
                 // Two prepared frames at most (each ~12-25 MB expanded).
-                while self.aheadOrder.count > 2 { self.ahead[self.aheadOrder.removeFirst()] = nil }
+                while self.aheadOrder.count > self.aheadLimit { self.ahead[self.aheadOrder.removeFirst()] = nil }
                 callbacks.forEach { $0() }
             }
         }
     }
+
+    /// Frames prepared ahead: 2, or 1 on large windows (full screen on a 1440p/4K display), where each
+    /// prepared frame with its ring is 40-80 MB. Memory only: the prepared frame is still ready in time.
+    private var aheadLimit: Int { bounds.width * bounds.height > 2_000_000 ? 1 : 2 }
 
     private func dropAhead() { ahead = [:]; aheadOrder = [] }
 
@@ -977,17 +1008,14 @@ final class RadarLayerView: NSView {
     private func refreshShown(_ key: TileKey? = nil) {
         guard let g = active, let f = shownFrame, g.tiles.indices.contains(f) else { return }
         let token = Self.token(g, f)
-        if var pending = incoming, pending.token == token {
-            if let key, let tile = g.tiles[f][key], pending.images[key] == nil, let image = tile.image(), let map {
-                pending.images[key] = image
-                incoming = pending
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                addTileLayer(key, image, to: pending.layer, visible: map.visibleMapRect)
-                CATransaction.commit()
-            } else if key == nil {
-                cancelFade() // pruning or a zoom change: hand the frame to MapKit as it is
-            }
+        if let pending = incoming, pending.token == token, let key, let image = g.tiles[f][key]?.image(), let map {
+            // The frame fading in gained a tile: into its copy and into MapKit's (hidden) frame.
+            incoming?.images[key] = image
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            addTileLayer(key, image, to: pending.layer, visible: map.visibleMapRect)
+            CATransaction.commit()
+            states[0].set(g.tiles[f], zoom: zoom, token: token, prebuilt: [key: image], expandMissing: false)
             return
         }
         if let key, let image = g.tiles[f][key]?.image() {
@@ -1030,8 +1058,8 @@ final class RadarLayerView: NSView {
     /// Mid-gesture: MapKit already moves the radar with the map. Edge loading is coalesced to at most
     /// one pass per 150 ms, and nothing is pruned until the gesture settles.
     func gestureMoved() {
-        // The fading copy is a plain layer that doesn't move with the map: drop it at once.
-        cancelFade()
+        // The fading copies are plain layers: move them with the map (the fade carries on).
+        relayoutCopies()
         guard !gestureWorkScheduled else { return }
         gestureWorkScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in

@@ -52,7 +52,17 @@ public final class RadarTile: @unchecked Sendable {
         if let rgba { return rgba }
         if let encoded {
             guard let source = CGImageSourceCreateWithData(encoded as CFData, nil) else { return nil }
-            return CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
+            guard let decoded = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+            // Build 52 (QA R1): into BGRA like packed tiles, so the crossfade copies share these pixels.
+            let w = decoded.width, h = decoded.height
+            let cs = (decoded.colorSpace?.model == .rgb ? decoded.colorSpace : nil) ?? CGColorSpaceCreateDeviceRGB()
+            guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4, space: cs,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+            else { return decoded }
+            ctx.interpolationQuality = .none
+            ctx.setBlendMode(.copy)
+            ctx.draw(decoded, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return ctx.makeImage() ?? decoded
         }
         // Straight into the image's backing store: one allocation, no bounds checks (review M3).
         // Build 48 (review M2): expanded as BGRA (premultiplied first, little-endian), Core Animation's

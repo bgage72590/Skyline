@@ -53,6 +53,17 @@ enum MeasureHooks {
                 }
             }
         }
+        if let size = defaults.string(forKey: "SkylineWindowSize")?.split(separator: "x").compactMap({ Double($0) }), size.count == 2 {
+            // `-SkylineWindowSize 2560x1440`: a window of that size in points (may exceed this screen), to
+            // measure a large external display's full-screen radar on the laptop.
+            Task {
+                try? await Task.sleep(for: .seconds(3))
+                if let w = NSApp.windows.first(where: { $0.isVisible && $0.styleMask.contains(.titled) && $0.frame.width > 600 }) {
+                    w.setFrame(NSRect(x: 0, y: 0, width: size[0], height: size[1]), display: true)
+                    print("[measure] window \(w.frame.size)"); fflush(stdout)
+                }
+            }
+        }
         let swapAfter = defaults.double(forKey: "SkylineScanSwapAfter")
         if swapAfter > 0 {
             // A new frame set mid-loop (range change = new frame IDs, the same path as fresh scans), then back.
