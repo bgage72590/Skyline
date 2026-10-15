@@ -168,11 +168,11 @@ struct MenuBarContentView: View {
                     }
                     Menu {
                         // SettingsLink is inert in the ⌃⌥W HotkeyPanel, so Settings opens the AppKit way (QA #3).
-                        Button("Settings…") { AppExit.openSettings() }
-                        Button("Check for Updates…") { Updater.checkForUpdates() }
+                        // Each item also closes the ⌃⌥W hotkey panel (QA build-41 F1).
+                        Button("Settings…") { GlobalHotkey.closePanel(); AppExit.openSettings() }
+                        Button("Check for Updates…") { GlobalHotkey.closePanel(); Updater.checkForUpdates() }
                         Divider()
-                        Button("Quit Skyline") { AppExit.perform(.menuBarQuit) }
-                            .help("Quit Skyline completely (closing the window or ⌘Q keeps it in the menu bar)")
+                        Button("Quit Skyline") { GlobalHotkey.closePanel(); AppExit.perform(.menuBarQuit) }
                     } label: {
                         Image(systemName: "ellipsis.circle").frame(minWidth: 28, minHeight: 28).contentShape(Rectangle())
                     }

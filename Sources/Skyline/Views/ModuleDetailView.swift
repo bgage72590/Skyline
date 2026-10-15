@@ -369,7 +369,8 @@ struct ModuleDetailView: View {
         let highTotal = d.sources.filter { $0.high != nil }.reduce(0) { $0 + $1.weight }
         let lowTotal = d.sources.filter { $0.low != nil }.reduce(0) { $0 + $1.weight }
         func share(_ w: Double, _ value: Double?, _ total: Double) -> String {
-            guard value != nil, w > 0 else { return "–" }
+            guard value != nil else { return "–" }          // no value from this source
+            guard w > 0 else { return "0× · not counted" }    // a value that carries no weight
             return total > 0 ? String(format: "%.1f× · %.0f%%", w, 100 * w / total) : String(format: "%.1f×", w)
         }
         func cell(_ value: String, _ weight: String) -> some View {
@@ -394,7 +395,7 @@ struct ModuleDetailView: View {
                         if s.name.contains(" = ") {
                             Text("Identical forecasts · 1 vote").font(.caption).opacity(0.65)
                         } else if s.high != nil, s.low == nil {
-                            Text("High only (no low today)").font(.caption).opacity(0.65)
+                            Text("High only (no NWS low for this day)").font(.caption).opacity(0.65)
                         } else if s.high == nil, s.low != nil {
                             Text("Low only").font(.caption).opacity(0.65)
                         }
