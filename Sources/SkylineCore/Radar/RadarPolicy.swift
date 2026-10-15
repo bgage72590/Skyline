@@ -90,6 +90,10 @@ public enum RadarMemoryBudget {
 /// 0.35 s frame crossfade (restored in build 42). Pure state: the view samples it on a timer.
 public struct RadarCrossfade: Equatable, Sendable {
     public static let duration: TimeInterval = 0.35
+    /// Build 48: the new frame fades in over the old (still drawn by MapKit), then the old fades out
+    /// over the new once MapKit has drawn it. Together about `duration` plus MapKit's draw time.
+    public static let fadeIn: TimeInterval = 0.2
+    public static let fadeOut: TimeInterval = 0.15
     public private(set) var from: Int?
     public private(set) var to: Int
     /// Alpha the outgoing frame starts from (1, or less when a new switch lands mid-fade).

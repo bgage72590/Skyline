@@ -256,7 +256,24 @@ final class RadarImageCache {
         }
         // Decode inside an autorelease pool so ImageIO's temporaries are freed per tile, not per burst
         // (less heap growth/fragmentation while a loop of ~100 tiles decodes).
-        let image: RadarTile? = autoreleasepool {
+        let image: RadarTile? = await withCheckedContinuation { done in
+            decodeQueue.addOperation { done.resume(returning: decode(data)) }
+        }
+        return image.map(Outcome.image) ?? .missing
+    }
+
+    /// Review M2 (build 47): at most two PNG decodes at once. Downloads still run 6 wide; the peak
+    /// during the first fill no longer holds six full-size RGBA decodes plus their packing buffers.
+    nonisolated private static let decodeQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "skyline.radar.decode"
+        q.maxConcurrentOperationCount = 2
+        q.qualityOfService = .userInitiated
+        return q
+    }()
+
+    nonisolated private static func decode(_ data: Data) -> RadarTile? {
+        autoreleasepool {
             guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
             let options = [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
             guard let decoded = CGImageSourceCreateImageAtIndex(source, 0, options) else { return nil }
@@ -265,6 +282,5 @@ final class RadarImageCache {
             RequestStats.shared.notePacked(tile.isPacked, compressed: tile.isCompressed)
             return tile
         }
-        return image.map(Outcome.image) ?? .missing
     }
 }
