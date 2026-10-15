@@ -847,8 +847,10 @@ final class RadarLayerView: NSView {
         let inc = copyLayer(ordered(images), visible: v)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        // Model values at the start values: if an animation isn't applied on the first displayed frame,
+        // the old frame still shows (the build-54 blank capture).
         inc.opacity = 0
-        out.opacity = 0
+        out.opacity = 1
         host.addSublayer(out)
         host.addSublayer(inc)
         // Equal-sum, simultaneous: old 1→0 while new 0→1.
@@ -857,8 +859,15 @@ final class RadarLayerView: NSView {
         CATransaction.commit()
         fadeLayers = [out, inc]
         incoming = (token, inc, images)
-        // MapKit gets the new frame now, drawing nothing under the copies until the fade ends.
-        commit(g, target, token: token, images: images, hidden: true)
+        // MapKit gets the new frame (visible state unchanged), and stops drawing only once the copies
+        // are on screen: after this transaction is flushed and two display frames have passed.
+        CATransaction.flush()
+        commit(g, target, token: token, images: images, hidden: false, redraw: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0 / 60) { [weak self] in
+            guard let self, self.fadeSerial == serial else { return }
+            self.states[0].setHidden(true)
+            self.renderers[0]?.setNeedsDisplay()
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + RadarCrossfade.duration) { [weak self] in
             guard let self, self.fadeSerial == serial else { return }
             self.revealRenderer(serial: serial)
@@ -880,11 +889,14 @@ final class RadarLayerView: NSView {
     }
 
     /// Hands a frame to MapKit's renderer.
-    private func commit(_ g: Generation, _ i: Int, token: AnyHashable, images: [TileKey: CGImage], hidden: Bool = false) {
-        if !hidden, incoming?.token == token { incoming = nil }
+    /// `redraw: false`: the state changes but MapKit isn't asked to redraw yet (start of a fade, where
+    /// it would otherwise draw the new frame under the old copy for a moment).
+    private func commit(_ g: Generation, _ i: Int, token: AnyHashable, images: [TileKey: CGImage], hidden: Bool = false,
+                        redraw: Bool = true) {
+        if !hidden, redraw, incoming?.token == token { incoming = nil }
         states[0].setHidden(hidden)
         let ring = states[0].set(g.tiles[i], zoom: zoom, token: token, prebuilt: images, expandMissing: false)
-        renderers[0]?.setNeedsDisplay()
+        if redraw { renderers[0]?.setNeedsDisplay() }
         guard !ring.isEmpty else { return }
         // Tiles that arrived after the frame was prepared: expanded in the background, then drawn.
         ringWork?.cancel()
@@ -912,7 +924,7 @@ final class RadarLayerView: NSView {
     /// redraw is asynchronous and piecewise), or after 0.5 s (nothing visible to draw).
     private func awaitDraw(since: Int, started: CFTimeInterval = CACurrentMediaTime(), _ done: @escaping () -> Void) {
         let now = CACurrentMediaTime()
-        let drew = states[0].drawCount > since && now - states[0].lastDraw > 0.033
+        let drew = states[0].drawCount > since && now - states[0].lastDraw > 0.017
         if drew || now - started > 0.5 { done(); return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 120) { [weak self] in
             self?.awaitDraw(since: since, started: started, done)
