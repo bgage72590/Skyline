@@ -20,6 +20,12 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     /// Removals the user made with the delete action (item 1). Tombstones not listed here were inferred
     /// by builds before the fix and are what the one-time recovery may bring back.
     public var deletedByUser: [String: Date] = [:]
+    /// Sint Maarten fix: per-city logical version (Lamport counter), bumped by every add, re-add and
+    /// delete, always above the highest version this Mac has seen for that city. Between two
+    /// version-aware documents the higher version decides whether a city exists, whatever the Macs'
+    /// clocks say (CR H1). nil = written by a build without versions (or a first-time migration):
+    /// those merges fall back to the timestamp rule.
+    public var versions: [String: Int]? = [:]
     /// Setting key → encoded value (see `SyncValue`). Missing value with a stamp = reset to default.
     public var settings: [String: String] = [:]
     public var settingStamps: [String: Date] = [:]
@@ -38,7 +44,7 @@ public struct SyncDocument: Codable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case format, locations, locationStamps, removed, settings, settingStamps, orderStamp, accuracy, accuracyResetAt,
-             writtenBy, writtenAt, deletedByUser
+             writtenBy, writtenAt, deletedByUser, versions
     }
 
     /// Same as the synthesized decoder, except the build-31 `accuracy` pairs are decoded leniently (M3): a
@@ -57,7 +63,10 @@ public struct SyncDocument: Codable, Equatable, Sendable {
         writtenBy = try c.decode(String.self, forKey: .writtenBy)
         writtenAt = try c.decode(Date.self, forKey: .writtenAt)
         deletedByUser = (try? c.decodeIfPresent([String: Date].self, forKey: .deletedByUser)) ?? [:]
+        versions = try? c.decodeIfPresent([String: Int].self, forKey: .versions)
     }
+
+    public func version(_ id: String) -> Int { versions?[id] ?? 0 }
 
     /// The newest stamp this document has seen. New local stamps are kept later than it, so a change made
     /// after seeing another Mac's change wins even when this Mac's clock is behind (hybrid logical clock).
@@ -71,15 +80,26 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     /// become tombstones. A city that is merely missing from `locations` is kept, never inferred removed.
     public static func noting(locations: [WeatherLocation], settings: [String: String],
                               previous: SyncDocument, now wallClock: Date,
-                              deletions: [String: Date]) -> SyncDocument {
+                              deletions: [String: Date], additions: [String: Date] = [:],
+                              deletionVersions: [String: Int] = [:]) -> SyncDocument {
         // A delete applies unless the last-synced state already has it, or saw a re-add newer than it.
         let prevIDs = Set(previous.locations.map(\.id))
+        // With the version seen at delete time, a re-add elsewhere is one with a higher version (logical
+        // order, CR H1); entries from before versions keep the wall-clock comparison.
         let applied = deletions.filter { id, at in
-            prevIDs.contains(id) && (previous.removed[id].map { $0 < at } ?? true)
-                && (previous.locationStamps[id].map { $0 <= at } ?? true)
+            guard prevIDs.contains(id) else { return false }
+            if let seen = deletionVersions[id], previous.versions != nil { return previous.version(id) <= seen }
+            return (previous.removed[id].map { $0 < at } ?? true) && (previous.locationStamps[id].map { $0 <= at } ?? true)
         }
         let localIDs = Set(locations.map(\.id))
-        var effective = locations.filter { applied[$0.id] == nil }
+        // Sint Maarten (CR H2): a city the last-synced state shows as deleted by the user, still in this Mac's list
+        // without a logged re-add (search or undo), is a stale copy the UI never dropped. Tombstones an old
+        // build inferred (not in `deletedByUser`) never purge (CR #10 M1): the city stays, as before. It is not a new
+        // add: drop it (the store is then purged by applying the result) instead of stamping it fresh.
+        var effective = locations.filter { l in
+            applied[l.id] == nil && !(!prevIDs.contains(l.id) && previous.removed[l.id] != nil
+                && previous.deletedByUser[l.id] != nil && additions[l.id] == nil)
+        }
         // Missing without a recorded delete: never inferred removed, put back.
         for l in previous.locations where !localIDs.contains(l.id) && deletions[l.id] == nil { effective.append(l) }
         // Deleted here but re-added on another Mac after the delete: keep the city.
@@ -90,8 +110,17 @@ public struct SyncDocument: Codable, Equatable, Sendable {
             let stamp = max(at, (previous.locationStamps[id] ?? .distantPast).addingTimeInterval(0.001))
             doc.removed[id] = stamp
             doc.deletedByUser[id] = stamp
+            doc.bumpVersion(id, seen: previous)
         }
+        // Every city that is new here (add, or logged re-add) takes the next logical version.
+        for l in doc.locations where !prevIDs.contains(l.id) { doc.bumpVersion(l.id, seen: previous) }
         return doc
+    }
+
+    mutating func bumpVersion(_ id: String, seen: SyncDocument) {
+        var v = versions ?? [:]
+        v[id] = max(version(id), seen.version(id)) + 1
+        versions = v
     }
 
     /// Legacy form (builds before item 1): any id missing from `locations` is inferred removed. Kept for
@@ -125,6 +154,7 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     /// earlier on another Mac can't delete a city this Mac still has (migration keeps everything).
     public static func migrating(locations: [WeatherLocation], settings: [String: String], now: Date) -> SyncDocument {
         var doc = SyncDocument()
+        doc.versions = nil   // first merge on this Mac uses the timestamp rule (it has seen no versions)
         doc.locations = locations
         for l in locations { doc.locationStamps[l.id] = now }
         doc.settings = settings
@@ -155,12 +185,32 @@ public struct SyncDocument: Codable, Equatable, Sendable {
             let r = [local.removed[id], remote.removed[id]].compactMap { $0 }.max()
             if let r, now.timeIntervalSince(r) < 180 * 86400 { out.removed[id] = r }
         }
+        let versionAware = local.versions != nil && remote.versions != nil
+        if local.versions != nil || remote.versions != nil {
+            var v = local.versions ?? [:]
+            for (id, n) in remote.versions ?? [:] { v[id] = max(v[id] ?? 0, n) }
+            out.versions = v
+        } else {
+            out.versions = nil
+        }
         for id in order {
             let ls = localByID[id] != nil ? (local.locationStamps[id] ?? .distantPast) : nil
             let rs = remoteByID[id] != nil ? (remote.locationStamps[id] ?? .distantPast) : nil
             let live = [ls, rs].compactMap { $0 }.max() ?? .distantPast
             let removedAt = [local.removed[id], remote.removed[id]].compactMap { $0 }.max()
-            if let removedAt, removedAt >= live { continue }
+            // Logical order first (CR H1): the side with the higher version for this city decides whether
+            // it exists, if that side knows its state (present, or a tombstone). Equal versions (concurrent
+            // or both unversioned) and old-build documents keep the timestamp rule.
+            let lv = local.version(id), rv = remote.version(id)
+            let decided: Bool? = {
+                guard versionAware, lv != rv else { return nil }
+                let side = lv > rv ? local : remote
+                let present = (lv > rv ? localByID : remoteByID)[id] != nil
+                if present { return true }
+                return side.removed[id] != nil ? false : nil
+            }()
+            if decided == false { continue }
+            if decided == nil, let removedAt, removedAt >= live { continue }
             let pick: WeatherLocation? = {
                 switch (localByID[id], remoteByID[id]) {
                 case let (l?, r?): return (rs ?? .distantPast) > (ls ?? .distantPast) ? r : l
@@ -212,8 +262,10 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     /// never reverts them. Returns `merged` unchanged when nothing changed locally in the meantime.
     public static func rebasing(locations: [WeatherLocation], settings: [String: String],
                                 snapshot: SyncDocument, onto merged: SyncDocument, now: Date,
-                                deletions: [String: Date]? = nil) -> SyncDocument {
-        let edits = deletions.map { noting(locations: locations, settings: settings, previous: snapshot, now: now, deletions: $0) }
+                                deletions: [String: Date]? = nil, additions: [String: Date] = [:],
+                                deletionVersions: [String: Int] = [:]) -> SyncDocument {
+        let edits = deletions.map { noting(locations: locations, settings: settings, previous: snapshot, now: now, deletions: $0,
+                                           additions: additions, deletionVersions: deletionVersions) }
             ?? noting(locations: locations, settings: settings, previous: snapshot, now: now)
         guard !edits.sameContent(as: snapshot) else { return merged }
         var out = merge(local: edits, remote: merged, now: now)
@@ -225,6 +277,7 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     public func sameContent(as other: SyncDocument) -> Bool {
         locations == other.locations && orderStamp == other.orderStamp && settings == other.settings && removed == other.removed && deletedByUser == other.deletedByUser
             && locationStamps == other.locationStamps && settingStamps == other.settingStamps
+            && (versions ?? [:]) == (other.versions ?? [:])
 
     }
 
