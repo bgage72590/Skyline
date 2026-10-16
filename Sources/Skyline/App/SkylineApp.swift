@@ -6,7 +6,7 @@ import SkylineCore
 @main
 struct SkylineApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var store = WeatherStore()
+    @State private var store = WeatherStore.forApp()
 
     init() {
         // L23: start the request-rate clock at launch, not at the first request.

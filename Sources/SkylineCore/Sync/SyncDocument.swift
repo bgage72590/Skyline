@@ -17,6 +17,9 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     public var locationStamps: [String: Date] = [:]
     /// When each city was removed (kept so a removal reaches the other Macs; pruned after 180 days).
     public var removed: [String: Date] = [:]
+    /// Removals the user made with the delete action (item 1). Tombstones not listed here were inferred
+    /// by builds before the fix and are what the one-time recovery may bring back.
+    public var deletedByUser: [String: Date] = [:]
     /// Setting key → encoded value (see `SyncValue`). Missing value with a stamp = reset to default.
     public var settings: [String: String] = [:]
     public var settingStamps: [String: Date] = [:]
@@ -35,7 +38,7 @@ public struct SyncDocument: Codable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case format, locations, locationStamps, removed, settings, settingStamps, orderStamp, accuracy, accuracyResetAt,
-             writtenBy, writtenAt
+             writtenBy, writtenAt, deletedByUser
     }
 
     /// Same as the synthesized decoder, except the build-31 `accuracy` pairs are decoded leniently (M3): a
@@ -53,6 +56,7 @@ public struct SyncDocument: Codable, Equatable, Sendable {
         accuracyResetAt = try? c.decodeIfPresent(Date.self, forKey: .accuracyResetAt)
         writtenBy = try c.decode(String.self, forKey: .writtenBy)
         writtenAt = try c.decode(Date.self, forKey: .writtenAt)
+        deletedByUser = (try? c.decodeIfPresent([String: Date].self, forKey: .deletedByUser)) ?? [:]
     }
 
     /// The newest stamp this document has seen. New local stamps are kept later than it, so a change made
@@ -63,6 +67,35 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     }
 
     /// Rebuild the local side after the user changed something: stamps what differs from `previous`.
+    /// Item 1: the explicit form. Only ids in `deletions` (recorded synchronously by the delete action)
+    /// become tombstones. A city that is merely missing from `locations` is kept, never inferred removed.
+    public static func noting(locations: [WeatherLocation], settings: [String: String],
+                              previous: SyncDocument, now wallClock: Date,
+                              deletions: [String: Date]) -> SyncDocument {
+        // A delete applies unless the last-synced state already has it, or saw a re-add newer than it.
+        let prevIDs = Set(previous.locations.map(\.id))
+        let applied = deletions.filter { id, at in
+            prevIDs.contains(id) && (previous.removed[id].map { $0 < at } ?? true)
+                && (previous.locationStamps[id].map { $0 <= at } ?? true)
+        }
+        let localIDs = Set(locations.map(\.id))
+        var effective = locations.filter { applied[$0.id] == nil }
+        // Missing without a recorded delete: never inferred removed, put back.
+        for l in previous.locations where !localIDs.contains(l.id) && deletions[l.id] == nil { effective.append(l) }
+        // Deleted here but re-added on another Mac after the delete: keep the city.
+        for l in previous.locations where deletions[l.id] != nil && applied[l.id] == nil
+            && !effective.contains(where: { $0.id == l.id }) { effective.append(l) }
+        var doc = noting(locations: effective, settings: settings, previous: previous, now: wallClock)
+        for (id, at) in applied {
+            let stamp = max(at, (previous.locationStamps[id] ?? .distantPast).addingTimeInterval(0.001))
+            doc.removed[id] = stamp
+            doc.deletedByUser[id] = stamp
+        }
+        return doc
+    }
+
+    /// Legacy form (builds before item 1): any id missing from `locations` is inferred removed. Kept for
+    /// the older tests; the app calls the explicit form above.
     public static func noting(locations: [WeatherLocation], settings: [String: String],
                               previous: SyncDocument, now wallClock: Date) -> SyncDocument {
         var doc = previous
@@ -113,6 +146,10 @@ public struct SyncDocument: Codable, Equatable, Sendable {
         out.orderStamp = max(lo, ro) == .distantPast ? nil : max(lo, ro)
         var order: [String] = []
         for id in (remoteFirst ? rIDs + lIDs : lIDs + rIDs) where !order.contains(id) { order.append(id) }
+        for id in Set(local.deletedByUser.keys).union(remote.deletedByUser.keys) {
+            let d = [local.deletedByUser[id], remote.deletedByUser[id]].compactMap { $0 }.max()
+            if let d, now.timeIntervalSince(d) < 180 * 86400 { out.deletedByUser[id] = d }
+        }
         let allRemovedIDs = Set(local.removed.keys).union(remote.removed.keys)
         for id in allRemovedIDs {
             let r = [local.removed[id], remote.removed[id]].compactMap { $0 }.max()
@@ -136,6 +173,7 @@ public struct SyncDocument: Codable, Equatable, Sendable {
             out.locations.append(pick)
             out.locationStamps[id] = live
             out.removed[id] = nil
+            out.deletedByUser[id] = nil
         }
         for key in Set(local.settingStamps.keys).union(remote.settingStamps.keys)
             .union(local.settings.keys).union(remote.settings.keys) {
@@ -173,8 +211,10 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     /// handed to the merge, and now) are re-noted on top of the merge result, so applying that result
     /// never reverts them. Returns `merged` unchanged when nothing changed locally in the meantime.
     public static func rebasing(locations: [WeatherLocation], settings: [String: String],
-                                snapshot: SyncDocument, onto merged: SyncDocument, now: Date) -> SyncDocument {
-        let edits = noting(locations: locations, settings: settings, previous: snapshot, now: now)
+                                snapshot: SyncDocument, onto merged: SyncDocument, now: Date,
+                                deletions: [String: Date]? = nil) -> SyncDocument {
+        let edits = deletions.map { noting(locations: locations, settings: settings, previous: snapshot, now: now, deletions: $0) }
+            ?? noting(locations: locations, settings: settings, previous: snapshot, now: now)
         guard !edits.sameContent(as: snapshot) else { return merged }
         var out = merge(local: edits, remote: merged, now: now)
         out.writtenBy = merged.writtenBy
@@ -183,7 +223,7 @@ public struct SyncDocument: Codable, Equatable, Sendable {
 
     /// Same content (ignores who wrote it and when, and the build-31 accuracy fields, see `merge`).
     public func sameContent(as other: SyncDocument) -> Bool {
-        locations == other.locations && orderStamp == other.orderStamp && settings == other.settings && removed == other.removed
+        locations == other.locations && orderStamp == other.orderStamp && settings == other.settings && removed == other.removed && deletedByUser == other.deletedByUser
             && locationStamps == other.locationStamps && settingStamps == other.settingStamps
 
     }

@@ -1,0 +1,26 @@
+name: Tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  swift-test:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select newest Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          swift --version
+      - name: swift test
+        shell: bash
+        run: swift test 2>&1 | tee test.log
+      - name: Summary
+        if: always()
+        run: grep -E "Executed [0-9]+ tests" test.log | tail -1 >> "$GITHUB_STEP_SUMMARY" || true

@@ -154,7 +154,23 @@ final class WeatherStore {
     /// Refresh cadence while only the menu bar is in use (at least twice the normal interval, ≥ 30 min).
     var menuBarOnlyMinutes: Int { max(refreshMinutes * 2, 30) }
 
-    init(service: WeatherService = WeatherStore.makeService(), defaults: UserDefaults = .standard) {
+    /// The app's store: sync only in the real bundle or with the isolated `-SkylineSyncFile` override,
+    /// whose defaults are a separate suite (item 1).
+    static func forApp() -> WeatherStore {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        let env = SyncEnvironment.resolve(bundleIdentifier: Bundle.main.bundleIdentifier, arguments: CommandLine.arguments,
+                                          home: home, iCloudAvailable: fm.fileExists(atPath: home
+                                            .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs").path))
+        let defaults = env?.defaultsSuite.flatMap(UserDefaults.init(suiteName:)) ?? .standard
+        return WeatherStore(defaults: defaults, sync: env)
+    }
+
+    @ObservationIgnored private let syncEnvironment: SyncEnvironment?
+
+    init(service: WeatherService = WeatherStore.makeService(), defaults: UserDefaults = .standard,
+         sync: SyncEnvironment? = nil) {
+        self.syncEnvironment = sync
         self.service = service
         self.radar = RadarPlayback(service: service)
         self.defaults = defaults
@@ -212,7 +228,7 @@ final class WeatherStore {
         setUpNotifications()
         IntentStore.shared = self
         // Saved cities and settings shared across Macs through iCloud Drive (polish 1).
-        if defaults === UserDefaults.standard { SyncCoordinator.start(store: self, defaults: defaults) }
+        if let syncEnvironment { SyncCoordinator.start(store: self, defaults: defaults, env: syncEnvironment) }
         // Download-cache clean-up (entries older than 14 days), off the launch path.
         let service = self.service
         Task.detached(priority: .utility) {
@@ -722,6 +738,7 @@ final class WeatherStore {
         if let existing = LocationList.existingDuplicate(of: location, in: savedLocations) {
             selectedID = existing.id
         } else {
+            SyncCoordinator.shared?.forgetDeletion(location.id)
             savedLocations.append(location)
             selectedID = location.id
         }
@@ -740,6 +757,8 @@ final class WeatherStore {
         // exists); undo puts the pin back.
         let wasPinned = menuBarPinID == location.id
         let notified = notifyLocationIDs?.contains(location.id) == true
+        // Item 1: the tombstone is on disk before the list changes (survives a quit or crash).
+        SyncCoordinator.shared?.recordDeletion(location.id)
         savedLocations.remove(at: index)
         reports[location.id] = nil
         errors[location.id] = nil
@@ -760,6 +779,7 @@ final class WeatherStore {
 
     func restore(_ location: WeatherLocation, at index: Int, select: Bool, pinned: Bool = false, notified: Bool = false,
                  undoManager: UndoManager? = nil) {
+        SyncCoordinator.shared?.forgetDeletion(location.id)
         savedLocations = LocationList.restoring(location, at: index, into: savedLocations)
         if select { selectedID = location.id }
         if pinned { menuBarPinID = location.id }
@@ -806,7 +826,6 @@ final class WeatherStore {
 
     // MARK: Sync (polish 1)
 
-    /// The city list from another Mac (merged; nothing local is dropped unless it was removed there later).
     /// Cities brought back by the item-1 recovery carry a coordinate name; look the real one up once.
     func nameRecoveredLocations(_ recovered: [WeatherLocation]) {
         Task { @MainActor in
@@ -826,6 +845,7 @@ final class WeatherStore {
         }
     }
 
+    /// The city list from another Mac (merged; nothing local is dropped unless it was removed there later).
     func applySyncedLocations(_ locations: [WeatherLocation]) {
         guard locations != savedLocations else { return }
         savedLocations = locations
