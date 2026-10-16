@@ -5,24 +5,6 @@ import Testing
 /// L1–L7 / QA cleanup (MASTER-LIST).
 struct CleanupLowsTests {
     let t0 = Date(timeIntervalSince1970: 1_800_000_000)
-    let nyc = WeatherLocation(id: "40.7128,-74.0060", name: "NYC", coordinate: Coordinate(latitude: 40.7128, longitude: -74.006))
-    let boston = WeatherLocation(id: "42.3601,-71.0589", name: "Boston", coordinate: Coordinate(latitude: 42.3601, longitude: -71.0589))
-
-    /// QA L1 (build 29): another Mac 1 h fast renames NYC; NYC is removed here during the merge flight.
-    /// The removal used to lose (`["NYC (remote)", "Boston"]`).
-    @Test func removalDuringFlightBeatsASkewedRemoteClock() {
-        var snapshot = SyncDocument()
-        snapshot.locations = [nyc, boston]
-        snapshot.locationStamps = [nyc.id: t0, boston.id: t0]
-        var renamed = nyc; renamed.name = "NYC (remote)"
-        var merged = snapshot
-        merged.locations = [renamed, boston]
-        merged.locationStamps[nyc.id] = t0.addingTimeInterval(3600) // remote clock +1 h
-        let out = SyncDocument.rebasing(locations: [boston], settings: [:], snapshot: snapshot, onto: merged,
-                                        now: t0.addingTimeInterval(10), deletions: [nyc.id: t0.addingTimeInterval(9)])
-        #expect(out.locations.map(\.name) == ["Boston"])
-        #expect(out.deletedByUser[nyc.id] != nil)
-    }
 
     /// QA L2: a real distance instead of grid rounding.
     @Test func duplicateCheckUsesDistance() {

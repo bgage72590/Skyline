@@ -1068,9 +1068,9 @@ final class RadarLayerView: NSView {
         group.actions = Self.noActions
         group.allowsGroupOpacity = false
         // Review L1: the whole pan ring used to get layers in every copy (about 2× per switch). Only tiles
-        // within half a screen of the view get one: enough for a pan during the 0.35 s fade, and a longer
-        // pan hands back to MapKit anyway (`gestureMoved`).
-        let reach = bounds.insetBy(dx: -bounds.width / 2, dy: -bounds.height / 2)
+        // within one screen of the view get one: enough for even a fast pan during the 0.35 s fade (CR #9
+        // low: half a screen showed a blank edge), and a longer pan hands back to MapKit (`gestureMoved`).
+        let reach = bounds.insetBy(dx: -bounds.width, dy: -bounds.height)
         for (key, image) in tiles where tileFrame(key, visible: v).intersects(reach) { addTileLayer(key, image, to: group, visible: v) }
         return group
     }
