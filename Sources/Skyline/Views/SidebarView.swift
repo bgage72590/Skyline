@@ -110,7 +110,7 @@ struct SidebarView: View {
                        inMenuBar: store.menuBarLocation?.id == location.id,
                        status: store.reports[location.id] != nil ? nil
                            : (store.errors[location.id] != nil ? "Couldn’t update · retrying"
-                              : (store.loadingIDs.contains(location.id) ? "Updating…" : nil)))
+                              : (store.isLoading(location) ? "Updating…" : nil)))
         }
         .buttonStyle(.plain)
         .help(index < 9 ? "⌘\(index + 1)" : "")

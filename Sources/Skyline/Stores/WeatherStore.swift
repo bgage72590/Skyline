@@ -304,7 +304,12 @@ final class WeatherStore {
     /// Set when the widget's data file couldn't be written (Settings shows it).
     var widgetError: String?
 
-    func isLoading(_ location: WeatherLocation) -> Bool { loadingIDs.contains(location.id) }
+    func isLoading(_ location: WeatherLocation) -> Bool {
+        loadingIDs.contains(location.id) || quietRetries.updating.contains(location.id)
+    }
+    /// Item 2: cities with nothing on screen whose last attempt failed transiently and retry quickly
+    /// without a banner (shown as "Updating…"). See `QuietRetryTracker` for when it clears.
+    var quietRetries = QuietRetryTracker()
 
     /// Data older than this is flagged as stale (see `DataAge.staleAfter`).
     var staleDataAge: TimeInterval { DataAge.staleAfter(refreshMinutes: refreshMinutes) }
@@ -332,10 +337,14 @@ final class WeatherStore {
         loadingIDs.insert(location.id)
         defer { loadingIDs.remove(location.id) }
         do {
-            var report = try await service.report(for: location, forceRefresh: force)
+            let priority = FetchRetryPolicy.priority(force: force, hasReport: reports[location.id] != nil)
+            var report = try await service.report(for: location, forceRefresh: force, priority: priority)
             // My Location moved while this was loading: this answer is for the old place (L4).
             if location.isCurrentLocation,
-               !CurrentLocationGuard.isCurrent(location.coordinate, current: currentLocation?.coordinate) { return }
+               !CurrentLocationGuard.isCurrent(location.coordinate, current: currentLocation?.coordinate) {
+                quietRetries.abandoned(location.id) // follow-up L3: don't leave "Updating…" behind
+                return
+            }
             report.location = location
             if defaults.bool(forKey: "SkylineDemoAlert"), report.alerts.isEmpty { report.alerts = [Self.demoAlert(near: location)] }
             if defaults.bool(forKey: "SkylineDemoRain") { report.minutely = Self.demoRain(from: report.current.time) }
@@ -346,9 +355,13 @@ final class WeatherStore {
             let follow = RefreshBookkeeping.afterReport(isOfflineFallback: report.isOfflineFallback, backoffUntil: until)
             if follow.clearError {
                 if errors[location.id] != nil { errors[location.id] = nil }
+                quietRetries.succeeded(location.id)
                 retryTasks.removeValue(forKey: location.id)?.cancel()
                 retryAttempts[location.id] = nil
             } else {
+                // Follow-ups M2/M3: saved data is on screen, so no quiet quick retries; the banner shows
+                // at once (a real offline included) and the PR #2 ladder applies.
+                quietRetries.abandoned(location.id)
                 // Saved data stays up. A live back-off retries at `until` ("Open-Meteo busy, retrying at h:mm")
                 // instead of hammering the host and keeping the spinner on.
                 setError(follow.message, for: location.id)
@@ -362,6 +375,13 @@ final class WeatherStore {
             // Force during a long back-off throws `backingOff` immediately (no multi-minute sleep, so
             // `loadingIDs` clears and Refresh stays usable). The banner keeps the saved report.
             let follow = RefreshBookkeeping.afterFailure(error)
+            if errors[location.id] == nil,
+               followUpQuietly(location, error: error,
+                               backoffUntil: await service.backoff(for: RefreshBookkeeping.openMeteoHost)) {
+                // A first fetch: "Updating…", retried in seconds, no banner yet (item 2).
+                scheduleHousekeeping()
+                return
+            }
             setError(follow.message, for: location.id)
             if let existing = reports[location.id], existing.dataAge() > DataAge.maxDisplayAge {
                 reports[location.id] = nil
@@ -371,6 +391,19 @@ final class WeatherStore {
         }
     }
 
+    /// Item 2: schedules a quiet quick retry when the policy allows; false = show the error as before.
+    private func followUpQuietly(_ location: WeatherLocation, error: Error, backoffUntil: Date?) -> Bool {
+        let id = location.id
+        let decision = quietRetries.failed(id, error: error, attempt: retryAttempts[id, default: 0],
+                                           hasReport: reports[id] != nil, backoffUntil: backoffUntil,
+                                           refreshInterval: Double(refreshMinutes) * 60)
+        guard decision.quiet else { return false }
+        // Follow-up L3: an older, slower retry would keep "Updating…" up until it fires; replace it.
+        retryTasks.removeValue(forKey: id)?.cancel()
+        scheduleRetry(location, delay: decision.retryAfter)
+        return true
+    }
+
     private func setError(_ message: String, for id: String) {
         if errors[id] != message { errors[id] = message }
     }
@@ -378,12 +411,14 @@ final class WeatherStore {
     /// After a failure, try again in about a minute instead of waiting for the next refresh cycle
     /// (backing off 1 → 2 → 4 … minutes up to the refresh interval while it keeps failing). Only for
     /// locations the user can currently see (menu-bar location, or any when the window is visible).
-    private func scheduleRetry(_ location: WeatherLocation, notBefore: Date? = nil) {
+    private func scheduleRetry(_ location: WeatherLocation, notBefore: Date? = nil, delay fixed: TimeInterval? = nil) {
         let id = location.id
         guard retryTasks[id] == nil else { return }
         let attempt = retryAttempts[id, default: 0]
         retryAttempts[id] = attempt + 1
-        var delay = min(60 * pow(2, Double(min(attempt, 6))), Double(refreshMinutes) * 60)
+        // After the quiet quick retries, the exponential ladder starts at 1 min again (item 2).
+        let slow = quietRetries.ladderIndex(id, attempt: attempt)
+        var delay = fixed ?? min(60 * pow(2, Double(min(slow, 6))), Double(refreshMinutes) * 60)
         if let notBefore { delay = max(delay, notBefore.timeIntervalSinceNow + 2) }
         retryTasks[id] = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay), tolerance: .seconds(10))
@@ -391,7 +426,10 @@ final class WeatherStore {
             self.retryTasks[id] = nil
             guard let current = self.allLocations.first(where: { $0.id == id }),
                   self.isMainWindowVisible || self.menuBarLocation?.id == id || self.reports[id] == nil
-                    || ((self.notificationPrefs.alerts || self.notificationPrefs.rain) && self.notifies(current)) else { return }
+                    || ((self.notificationPrefs.alerts || self.notificationPrefs.rain) && self.notifies(current)) else {
+                self.quietRetries.abandoned(id)
+                return
+            }
             await self.load(current)
         }
     }
