@@ -126,10 +126,23 @@ struct ExpandedRadarView: View {
                 .padding(12)
                 Spacer()
                 HStack(alignment: .bottom) {
-                    RadarLegend(provider: radar.provider, layer: radar.layer, showsForecastNote: radar.hasForecastFrames)
+                    RadarLegend(provider: radar.provider, layer: radar.layer,
+                                showsForecastNote: radar.hasForecastFrames,
+                                showingForecastFrame: radar.currentFrame?.isForecast == true)
                         .padding(10)
                         .glassChip(RoundedRectangle(cornerRadius: 10, style: .continuous))
                     Spacer()
+                    if radar.currentFrame?.isForecast == true {
+                        Text("FORECAST · HRRR")
+                            .font(.caption2.weight(.bold))
+                            .tracking(0.6)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .foregroundStyle(Color(red: 0.92, green: 0.86, blue: 1.0))
+                            .background(Capsule().fill(Color(red: 0.35, green: 0.22, blue: 0.55).opacity(0.85)))
+                            .overlay(Capsule().stroke(Color(red: 0.78, green: 0.62, blue: 1.0), lineWidth: 1))
+                            .accessibilityLabel("Forecast, HRRR model")
+                    }
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 8)
@@ -416,13 +429,18 @@ struct RadarTimeline: View {
                         }
                     }
                     .overlay(alignment: .topLeading) {
-                        // "Now" tick between the observed scans and the model forecast frames (T12).
+                        // Hatched forecast segment + "Now" tick (T12 / radar-features §4).
                         if radar.hasForecastFrames, radar.frames.count > 1 {
                             GeometryReader { geo in
-                                let f = Double(radar.nowIndex) / Double(radar.frames.count - 1)
+                                let track = geo.size.width - 16
+                                let nowFrac = Double(radar.nowIndex) / Double(radar.frames.count - 1)
+                                let x0 = 8 + track * nowFrac
+                                ForecastHatch(width: max(0, geo.size.width - 8 - x0), height: 8)
+                                    .position(x: x0 + max(0, geo.size.width - 8 - x0) / 2,
+                                              y: geo.size.height / 2)
                                 Rectangle().fill(.white.opacity(0.85))
                                     .frame(width: 2, height: 14)
-                                    .position(x: 8 + (geo.size.width - 16) * f, y: geo.size.height / 2)
+                                    .position(x: x0, y: geo.size.height / 2)
                             }
                             .allowsHitTesting(false)
                         }
@@ -464,12 +482,39 @@ struct RadarTimeline: View {
     }
 }
 
+/// Diagonal hatch over the forecast half of the timeline scrubber.
+private struct ForecastHatch: View {
+    var width: CGFloat
+    var height: CGFloat
+    var body: some View {
+        Canvas { ctx, size in
+            let color = Color(red: 0.78, green: 0.62, blue: 1.0).opacity(0.55)
+            var path = Path()
+            let step: CGFloat = 5
+            var x: CGFloat = -size.height
+            while x < size.width + size.height {
+                path.move(to: CGPoint(x: x, y: size.height))
+                path.addLine(to: CGPoint(x: x + size.height, y: 0))
+                x += step
+            }
+            ctx.stroke(path, with: .color(color), lineWidth: 1.2)
+            ctx.fill(Path(CGRect(origin: .zero, size: size)),
+                     with: .color(Color(red: 0.78, green: 0.62, blue: 1.0).opacity(0.12)))
+        }
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 2))
+        .allowsHitTesting(false)
+    }
+}
+
 /// Legend. NEXRAD uses the standard NWS reflectivity scale (what the IEM N0Q tiles are coloured with),
-/// labelled in dBZ with plain-English intensity.
+/// labelled in dBZ with plain-English intensity. Forecast frames switch to the HRRR REFP precip-type ramp.
 struct RadarLegend: View {
     let provider: RadarProvider
     var layer: RadarLayer = .reflectivity
     var showsForecastNote = false
+    /// When true, show REFP rain/snow/mix colours instead of the dBZ ramp.
+    var showingForecastFrame = false
     @Environment(WeatherStore.self) private var store
 
     static let nexradStops: [(dbz: Int, color: Color)] = [
@@ -483,7 +528,30 @@ struct RadarLegend: View {
     ]
 
     var body: some View {
-        if layer.isRainfallTotal { rainfallLegend } else { reflectivityLegend }
+        if layer.isRainfallTotal { rainfallLegend }
+        else if showingForecastFrame && provider == .nexrad { forecastLegend }
+        else { reflectivityLegend }
+    }
+
+    private var forecastLegend: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("FORECAST · PRECIP TYPE")
+                .font(.caption2.weight(.semibold)).foregroundStyle(Glass.secondaryText)
+            HStack(spacing: 8) {
+                ForEach(IEMHRRR.legendTypes, id: \.name) { stop in
+                    HStack(spacing: 4) {
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Color(red: Double((stop.hex >> 16) & 0xFF) / 255,
+                                        green: Double((stop.hex >> 8) & 0xFF) / 255,
+                                        blue: Double(stop.hex & 0xFF) / 255))
+                            .frame(width: 12, height: 8)
+                        Text(stop.name).font(.system(size: 10, weight: .medium))
+                    }
+                }
+            }
+            Text("NOAA HRRR precip type via Iowa Environmental Mesonet")
+                .font(.system(size: 10)).foregroundStyle(Glass.secondaryText)
+        }
     }
 
     /// IEM's MRMS ramp, labelled in the user's precipitation unit (L21).
@@ -545,8 +613,8 @@ struct RadarLegend: View {
                     .font(.caption2).frame(width: 196).foregroundStyle(Glass.secondaryText)
             }
             Text(provider.attribution).font(.system(size: 10)).foregroundStyle(Glass.secondaryText)
-            if showsForecastNote {
-                Text(provider == .nexrad ? "After “Now”: NOAA HRRR model forecast via IEM" : "After “Now”: RainViewer nowcast")
+            if showsForecastNote, provider == .nexrad {
+                Text("After “Now”: NOAA HRRR precip-type forecast via IEM")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Color(red: 0.78, green: 0.62, blue: 1.0))
             }

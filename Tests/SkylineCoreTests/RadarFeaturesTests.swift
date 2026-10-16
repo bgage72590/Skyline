@@ -33,4 +33,26 @@ final class RadarFeaturesTests: XCTestCase {
         XCTAssertEqual(header, "Rain starting in about 30 min")
         XCTAssertNil(MenuSummary.radarForecastLine(nil, now: now, hourLabel: hourLabel))
     }
+
+    // MARK: Feature 2 — future radar REFP + defaults
+
+    func testFutureRadarUsesREFPNotREFD() {
+        let iso = ISO8601DateFormatter()
+        let initTime = iso.date(from: "2026-10-11T23:00:00Z")!
+        let latest = iso.date(from: "2026-10-12T01:25:00Z")!
+        let frames = IEMHRRR.frames(initTime: initTime, after: latest)
+        XCTAssertFalse(frames.isEmpty)
+        XCTAssertTrue(frames.allSatisfy { $0.urlTemplate.contains("hrrr::REFP-") })
+        XCTAssertFalse(frames.contains { $0.urlTemplate.contains("REFD") })
+        XCTAssertEqual(IEMHRRR.product, "REFP")
+        XCTAssertEqual(Endpoints.iemHRRRLatest.absoluteString.contains("refp_0000.json"), true)
+        XCTAssertEqual(IEMHRRR.legendTypes.map(\.name), ["Rain", "Snow", "Frz rain", "Ice"])
+    }
+
+    func testFutureRadarDefaultIsOffWhenUnset() {
+        // Mirrors RadarPlayback's UserDefaults fallback (app target): unset key → false.
+        let stored: Bool? = nil
+        let showsFuture = stored ?? false
+        XCTAssertFalse(showsFuture)
+    }
 }

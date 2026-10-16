@@ -133,19 +133,23 @@ public enum IEMNexrad {
     }
 }
 
-/// Future radar (T12): HRRR simulated reflectivity from IEM's free tiles, appended after "now" and always
-/// labelled as a model forecast. Uses the archived layer name (`hrrr::REFD-F<minute>-<run>`), so a frame's
-/// URL never changes for a given run and caches like the NEXRAD frames.
+/// Future radar (T12): HRRR precipitation-type (REFP) tiles from IEM, appended after "now" and always
+/// labelled as a model forecast. REFP (not REFD) so rain / snow / mix paint as separate colours.
+/// Uses the archived layer name (`hrrr::REFP-F<minute>-<run>`), so a frame's URL never changes for a
+/// given run and caches like the NEXRAD frames.
 public enum IEMHRRR {
     struct Raw: Decodable { var model_init_utc: String }
 
     /// Minutes after the latest scan's quarter hour: finer steps first, out to 2 hours. Six frames, so
     /// the whole loop stays inside the same tile budget.
     public static let offsetsMinutes = [15, 30, 45, 60, 90, 120]
-    /// HRRR's sub-hourly reflectivity runs out at 18 h.
+    /// HRRR's sub-hourly products run out at 18 h.
     public static let maxForecastMinute = 18 * 60
 
-    /// Run time of the newest HRRR on IEM (from `refd_0000.json`).
+    /// Product code in the tile URL (`REFP` = precip type; rain/snow/mix are distinct colours).
+    public static let product = "REFP"
+
+    /// Run time of the newest HRRR on IEM (from `refp_0000.json`).
     public static func initTime(_ data: Data) throws -> Date? {
         let raw = try JSONDecoder().decode(Raw.self, from: data)
         return ISO8601DateFormatter().date(from: raw.model_init_utc)
@@ -163,10 +167,18 @@ public enum IEMHRRR {
             let t = Date(timeIntervalSince1970: quarter + Double(offset * 60))
             let minute = Int((t.timeIntervalSince(initTime) / 60).rounded())
             guard t > latest, minute > 0, minute <= maxForecastMinute, minute % 15 == 0 else { return nil }
-            return RadarFrame(time: t, urlTemplate: "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/hrrr::REFD-F\(String(format: "%04d", minute))-\(run)/{z}/{x}/{y}.png",
+            return RadarFrame(time: t, urlTemplate: "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/hrrr::\(product)-F\(String(format: "%04d", minute))-\(run)/{z}/{x}/{y}.png",
                               isForecast: true)
         }
     }
+
+    /// Legend stops for REFP precip-type colours (IEM / pyIEM `radar_ptype`): rain, snow, freezing rain, ice pellets.
+    public static let legendTypes: [(name: String, hex: UInt32)] = [
+        ("Rain", 0x40AA5D),
+        ("Snow", 0x3399BB),
+        ("Frz rain", 0xF7593F),
+        ("Ice", 0x6E58A7),
+    ]
 }
 
 /// What the radar map shows: the reflectivity loop, or a rainfall-total overlay (L21, US only).

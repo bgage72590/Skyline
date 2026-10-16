@@ -19,8 +19,9 @@ final class RadarPlayback {
     private(set) var frames: [RadarFrame] = []
     /// Loop length (NEXRAD). Persisted; RainViewer ignores it (its free tier is fixed at ~2 h).
     private(set) var range: RadarRange = RadarRange(rawValue: UserDefaults.standard.string(forKey: "radarRange") ?? "") ?? .oneHour
-    /// Future radar (T12): HRRR forecast frames after "now" (NEXRAD only). Persisted, on by default.
-    private(set) var showsFuture: Bool = UserDefaults.standard.object(forKey: "radarFuture") as? Bool ?? true
+    /// Future radar (T12): HRRR forecast frames after "now" (NEXRAD only). Persisted; off by default
+    /// (radar-features §4) so a first launch stays on observed scans until the user opts in.
+    private(set) var showsFuture: Bool = UserDefaults.standard.object(forKey: "radarFuture") as? Bool ?? false
     /// Reflectivity loop, or a rainfall-total overlay (L21, NEXRAD/US only). Not persisted: each launch
     /// starts on the radar.
     private(set) var layer: RadarLayer = .reflectivity

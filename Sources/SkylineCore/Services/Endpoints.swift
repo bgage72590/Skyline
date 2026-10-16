@@ -80,8 +80,8 @@ public enum Endpoints {
     public static func spcOutlook(day: Int) -> URL {
         URL(string: "https://www.spc.noaa.gov/products/outlook/day\(day)otlk_cat.lyr.geojson")!
     }
-    /// Run time of the newest HRRR on IEM (future radar).
-    public static let iemHRRRLatest = URL(string: "https://mesonet.agron.iastate.edu/data/gis/images/4326/hrrr/refd_0000.json")!
+    /// Run time of the newest HRRR on IEM (future radar; REFP precip-type product).
+    public static let iemHRRRLatest = URL(string: "https://mesonet.agron.iastate.edu/data/gis/images/4326/hrrr/refp_0000.json")!
 
     public static let rainViewerMaps = URL(string: "https://api.rainviewer.com/public/weather-maps.json")!
     public static let iemLatest = URL(string: "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.json")!
