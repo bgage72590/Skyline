@@ -53,6 +53,9 @@ public actor WeatherService {
     /// while it was in flight: NWS requests run concurrently, and a slower success must not cancel a 503
     /// that arrived meanwhile (QA batch 2).
     private var throttleEpoch: [String: Int] = [:]
+    /// The pause a forced refresh uses to wait out Retry-After. Production sleeps; tests that drive
+    /// `now` jump their clock by the same interval so the suite doesn't wait on the wall clock.
+    private var backoffSleep: @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) }
     /// Forecast verification + adaptive weights (nil = fixed weights, nothing recorded; used by tests).
     public nonisolated let verifier: ForecastVerifier?
     /// Recent daily-forecast snapshots for "why the forecast changed" (nil = none kept; used by tests).
@@ -348,8 +351,15 @@ public actor WeatherService {
             return Fetched(data: hit.data, storedAt: hit.storedAt, isFallback: false)
         }
         let host = url.host ?? ""
+        // Banner Retry / toolbar Refresh waits out the host's back-off, then fetches once. Returning the
+        // stale copy here is what left "Offline · showing data from …" stuck after Open-Meteo recovered.
+        if force, let until = backoffUntil[host], until > now() {
+            try await waitOutBackoff(until)
+        }
         do {
-            if let until = backoffUntil[host], until > now() { throw HTTPError.backingOff(host: host, until: until) }
+            if !force, let until = backoffUntil[host], until > now() {
+                throw HTTPError.backingOff(host: host, until: until)
+            }
             let epoch = throttleEpoch[host, default: 0]
             let data = try await client.get(url, headers: headers)
             if throttleEpoch[host, default: 0] == epoch {
@@ -367,6 +377,14 @@ public actor WeatherService {
         }
     }
 
+    /// Sleeps until `until` on the service clock, then the caller fetches once.
+    private func waitOutBackoff(_ until: Date) async throws {
+        let delay = until.timeIntervalSince(now())
+        guard delay > 0 else { return }
+        try Task.checkCancellation()
+        try await backoffSleep(delay)
+    }
+
     /// A host said "slow down": honour its Retry-After (5 s – 1 h), else back off 1, 2, 4 … 30 min.
     private func noteThrottled(_ host: String, retryAfter: TimeInterval?) {
         let strikes = backoffStrikes[host, default: 0]
@@ -380,6 +398,11 @@ public actor WeatherService {
     public func backoff(for host: String) -> Date? {
         guard let until = backoffUntil[host], until > now() else { return nil }
         return until
+    }
+
+    /// Replaces the pause a forced refresh uses to wait out Retry-After.
+    func setBackoffSleep(_ sleep: @escaping @Sendable (TimeInterval) async throws -> Void) {
+        backoffSleep = sleep
     }
 
     /// Drops download-cache entries older than `maxAge` (memory and disk). Called once at launch.

@@ -42,6 +42,10 @@ final class Batch7Tests: XCTestCase {
         XCTAssertTrue(CurrentLocationGuard.isCurrent(a, current: a))
         XCTAssertFalse(CurrentLocationGuard.isCurrent(a, current: b), "moved meanwhile: the old answer is dropped")
         XCTAssertFalse(CurrentLocationGuard.isCurrent(a, current: nil))
+        // A few hundred metres of GPS jitter is the same ~1 km cell, not a new place.
+        let jitter = Coordinate(latitude: a.latitude + 0.004, longitude: a.longitude - 0.003)
+        XCTAssertNotEqual(jitter, a)
+        XCTAssertTrue(CurrentLocationGuard.isCurrent(a, current: jitter))
     }
 
     // MARK: L17 type-to-jump

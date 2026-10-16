@@ -70,10 +70,11 @@ public struct WeatherLocation: Codable, Hashable, Identifiable, Sendable {
 }
 
 /// My Location results (forecast, place name) apply only while they're for where the Mac is now; a
-/// slower answer for an earlier fix is dropped (L4).
+/// slower answer for an earlier fix is dropped (L4). Compared at ~1 km, the same cell sent to the
+/// weather services, so a GPS fix jittering a few metres doesn't discard a successful load.
 public enum CurrentLocationGuard {
     public static func isCurrent(_ requested: Coordinate, current: Coordinate?) -> Bool {
         guard let current else { return false }
-        return requested == current
+        return requested.coarse == current.coarse
     }
 }

@@ -202,6 +202,7 @@ final class Batch2Tests: XCTestCase {
         let client = ThrottlingClient()
         let clock = TestClock(fixtureTime)
         let service = WeatherService(client: client, cache: ResponseCache(directory: nil, now: { clock.now }), now: { clock.now })
+        await service.setBackoffSleep { seconds in clock.now = clock.now.addingTimeInterval(seconds) }
         let nyc = WeatherLocation(name: "New York", coordinate: Coordinate(latitude: 40.71, longitude: -74.01))
         _ = try await service.report(for: nyc)
         client.throttled = true
@@ -210,17 +211,26 @@ final class Batch2Tests: XCTestCase {
         XCTAssertTrue(r1.isOfflineFallback, "429 → cached copy, flagged")
         let hits = client.forecastHits
         let until = await service.backoff(for: "api.open-meteo.com")
-        XCTAssertEqual(until?.timeIntervalSince(clock.now) ?? 0, 120, accuracy: 1)
+        let windowEnd = try XCTUnwrap(until)
+        XCTAssertEqual(windowEnd.timeIntervalSince(clock.now), 120, accuracy: 1)
 
+        // Non-force traffic still honours the window (no network, stale copy, retry time intact).
         clock.now = clock.now.addingTimeInterval(60)
-        _ = try await service.report(for: nyc, forceRefresh: true)
-        XCTAssertEqual(client.forecastHits, hits, "no request to a host inside its Retry-After window")
+        let held = try await service.report(for: nyc)
+        XCTAssertTrue(held.isOfflineFallback)
+        XCTAssertEqual(held.dataAsOf, r1.dataAsOf)
+        XCTAssertEqual(client.forecastHits, hits, "no non-force request inside the Retry-After window")
+        let still = await service.backoff(for: "api.open-meteo.com")
+        XCTAssertEqual(still, windowEnd)
 
-        clock.now = clock.now.addingTimeInterval(90)
+        // Force (banner Retry / toolbar Refresh) waits out the window, then fetches once.
+        // Open-Meteo has recovered; the report must not stay an offline fallback at the old cache time.
         client.throttled = false
         let r3 = try await service.report(for: nyc, forceRefresh: true)
+        XCTAssertGreaterThanOrEqual(clock.now, windowEnd, "force waits out Retry-After instead of skipping it")
         XCTAssertEqual(client.forecastHits, hits + 1)
         XCTAssertFalse(r3.isOfflineFallback)
+        XCTAssertGreaterThan(r3.dataAsOf, r1.dataAsOf, "fresh download, not the pre-429 cache time")
         let cleared = await service.backoff(for: "api.open-meteo.com")
         XCTAssertNil(cleared)
     }

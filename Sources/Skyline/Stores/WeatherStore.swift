@@ -327,8 +327,10 @@ final class WeatherStore {
             publishWidget()
             if report.isOfflineFallback {
                 // Old data is better than none, but it must say so, and we try again soon.
+                // A 429 left api.open-meteo.com in back-off; retrying before that just returns this
+                // same stale copy and the offline banner never clears.
                 setError("Couldn’t reach the weather service; showing saved data.", for: location.id)
-                scheduleRetry(location)
+                scheduleRetry(location, notBefore: await service.backoff(for: "api.open-meteo.com"))
             } else {
                 if errors[location.id] != nil { errors[location.id] = nil }
                 retryTasks.removeValue(forKey: location.id)?.cancel()
