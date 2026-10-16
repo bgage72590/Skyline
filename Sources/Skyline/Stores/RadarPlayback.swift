@@ -398,6 +398,8 @@ final class RadarPlayback {
         .milliseconds(Int(playbackSpeed.holdMilliseconds(baseMs: Self.baseHoldOnLatestMs).rounded()))
     }
     private var holdOnNowInterval: Duration {
-        .milliseconds(Int(playbackSpeed.holdMilliseconds(baseMs: Self.baseHoldOnNowMs).rounded()))
+        let ms = playbackSpeed.holdMilliseconds(baseMs: Self.baseHoldOnNowMs,
+                                                minimumMs: RadarPlaybackSpeed.minHoldOnNowMs)
+        return .milliseconds(Int(ms.rounded()))
     }
 }

@@ -26,9 +26,10 @@ struct RadarCard: View {
                     .contentShape(Rectangle())
                     .onTapGesture { expand() }
                 VStack {
-                    HStack {
-                        Spacer()
+                    HStack(spacing: 8) {
+                        // Badge on the leading edge so it never sits on top of the expand control.
                         if radar.currentFrame?.isForecast == true { ForecastHRRRBadge() }
+                        Spacer(minLength: 8)
                         CircleButton(systemImage: "arrow.up.left.and.arrow.down.right", help: "Expand map") { expand() }
                     }
                     Spacer()
@@ -432,11 +433,13 @@ struct RadarTimeline: View {
             } label: {
                 Text("Now")
                     .font(.caption.weight(.bold))
+                    .lineLimit(1)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 6)
                     .background(Capsule().fill(.white.opacity(0.18)))
             }
             .buttonStyle(.plain)
+            .fixedSize()
             .disabled(radar.frames.isEmpty || radar.index == radar.nowIndex)
             .help("Jump to the newest scan")
             .accessibilityLabel("Jump to now")
@@ -448,8 +451,10 @@ struct RadarTimeline: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .frame(width: 150)
+            .fixedSize()
             .help("Playback speed")
 
+            // Scrubber takes remaining width so end labels / hint aren't crushed into a 1-pt column.
             VStack(spacing: 4) {
                 Slider(value: Binding(get: { Double(radar.index) },
                                       set: { radar.crossfade = false; radar.scrub(to: Int($0.rounded())) }),
@@ -504,23 +509,39 @@ struct RadarTimeline: View {
                     }
                     .onKeyPress(.leftArrow) { radar.crossfade = false; radar.scrub(to: radar.index - 1); radar.crossfade = true; return .handled }
                     .onKeyPress(.rightArrow) { radar.crossfade = false; radar.scrub(to: radar.index + 1); radar.crossfade = true; return .handled }
-                HStack {
+                HStack(spacing: 6) {
                     Text(radar.frames.first.map { Fmt.time($0.time, timeZone) } ?? "")
-                    Spacer()
-                    Text("← → step · Space play").opacity(0.8)
-                    Spacer()
-                    if radar.hasForecastFrames, let last = radar.frames.last {
-                        Text("Forecast to \(Fmt.time(last.time, timeZone))")
-                            .foregroundStyle(Color(red: 0.78, green: 0.62, blue: 1.0))
-                    } else {
-                        Text("Now")
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                    Spacer(minLength: 4)
+                    // Drop the keyboard hint when the scrubber row is too narrow to keep it on one line.
+                    ViewThatFits(in: .horizontal) {
+                        Text("← → step · Space play")
+                            .opacity(0.8)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                        Color.clear.frame(width: 0, height: 0)
                     }
+                    Spacer(minLength: 4)
+                    Group {
+                        if radar.hasForecastFrames, let last = radar.frames.last {
+                            Text("Forecast to \(Fmt.time(last.time, timeZone))")
+                                .foregroundStyle(Color(red: 0.78, green: 0.62, blue: 1.0))
+                        } else {
+                            Text("Now")
+                        }
+                    }
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                 }
                 .font(.caption2)
                 .opacity(0.75)
             }
+            .frame(minWidth: 120, maxWidth: .infinity)
+            .layoutPriority(1)
             RadarTimeLabel(radar: radar, timeZone: timeZone)
                 .frame(minWidth: 150, alignment: .trailing)
+                .fixedSize(horizontal: true, vertical: false)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)

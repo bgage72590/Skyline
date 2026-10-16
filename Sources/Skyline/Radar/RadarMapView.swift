@@ -650,7 +650,6 @@ final class PinView: NSView {
         label.fontSize = 13
         label.foregroundColor = NSColor.white.cgColor
         label.alignmentMode = .center
-        label.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
         label.actions = noActions
         dot.backgroundColor = NSColor.white.cgColor
         dot.cornerRadius = 3.5
@@ -666,6 +665,15 @@ final class PinView: NSView {
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        relayoutLayers()
+    }
+
+    private var screenScale: CGFloat {
+        window?.screen?.backingScaleFactor ?? 2
+    }
+
     private func relayoutLayers() {
         let string = text ?? "•"
         let textWidth = ceil((string as NSString).size(withAttributes: [.font: Self.font]).width)
@@ -673,6 +681,7 @@ final class PinView: NSView {
         preferredSize = CGSize(width: bubbleSize.width, height: bubbleSize.height + 10)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        label.contentsScale = screenScale
         dot.frame = CGRect(x: bubbleSize.width / 2 - 3.5, y: 0, width: 7, height: 7)
         bubble.frame = CGRect(x: 0, y: 10, width: bubbleSize.width, height: bubbleSize.height)
         bubble.cornerRadius = bubbleSize.height / 2

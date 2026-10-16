@@ -24,7 +24,11 @@ public enum RadarPlaybackSpeed: Double, CaseIterable, Codable, Sendable, Identif
     }
 
     /// Hold-on-latest / hold-on-now dwells scale with speed the same way as frame interval.
-    public func holdMilliseconds(baseMs: Double) -> Double {
-        max(40, baseMs / rawValue)
+    /// - Parameter minimumMs: floor so a fast speed can't make a hold imperceptible (hold-on-now uses 600).
+    public func holdMilliseconds(baseMs: Double, minimumMs: Double = 40) -> Double {
+        max(minimumMs, baseMs / rawValue)
     }
+
+    /// Shortest hold on the "now" frame at any playback speed (~600 ms).
+    public static let minHoldOnNowMs: Double = 600
 }

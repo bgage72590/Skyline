@@ -197,4 +197,16 @@ final class RadarFeaturesTests: XCTestCase {
         XCTAssertEqual(RadarPlaybackSpeed.two.holdMilliseconds(baseMs: 1600), 800, accuracy: 0.01)
         XCTAssertEqual(RadarPlaybackSpeed.allCases.map(\.label), ["½×", "1×", "2×", "4×"])
     }
+
+    func testHoldOnNowHasFloorAtEverySpeed() {
+        let base = 900.0
+        let floor = RadarPlaybackSpeed.minHoldOnNowMs
+        XCTAssertEqual(floor, 600, accuracy: 0.01)
+        for speed in RadarPlaybackSpeed.allCases {
+            let ms = speed.holdMilliseconds(baseMs: base, minimumMs: floor)
+            XCTAssertGreaterThanOrEqual(ms, floor, "\(speed.label) hold-on-now must stay ≥ \(Int(floor)) ms")
+        }
+        XCTAssertEqual(RadarPlaybackSpeed.four.holdMilliseconds(baseMs: base, minimumMs: floor), 600, accuracy: 0.01)
+        XCTAssertEqual(RadarPlaybackSpeed.one.holdMilliseconds(baseMs: base, minimumMs: floor), 900, accuracy: 0.01)
+    }
 }
