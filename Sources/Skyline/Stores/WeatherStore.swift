@@ -305,11 +305,11 @@ final class WeatherStore {
     var widgetError: String?
 
     func isLoading(_ location: WeatherLocation) -> Bool {
-        loadingIDs.contains(location.id) || quietRetryIDs.contains(location.id)
+        loadingIDs.contains(location.id) || quietRetries.updating.contains(location.id)
     }
-    /// Item 2: cities whose last attempt failed transiently and retry quickly without a banner
-    /// (shown as "Updating…"); cleared by a success or once the quick retries run out.
-    var quietRetryIDs: Set<String> = []
+    /// Item 2: cities with nothing on screen whose last attempt failed transiently and retry quickly
+    /// without a banner (shown as "Updating…"). See `QuietRetryTracker` for when it clears.
+    var quietRetries = QuietRetryTracker()
 
     /// Data older than this is flagged as stale (see `DataAge.staleAfter`).
     var staleDataAge: TimeInterval { DataAge.staleAfter(refreshMinutes: refreshMinutes) }
@@ -341,7 +341,10 @@ final class WeatherStore {
             var report = try await service.report(for: location, forceRefresh: force, priority: priority)
             // My Location moved while this was loading: this answer is for the old place (L4).
             if location.isCurrentLocation,
-               !CurrentLocationGuard.isCurrent(location.coordinate, current: currentLocation?.coordinate) { return }
+               !CurrentLocationGuard.isCurrent(location.coordinate, current: currentLocation?.coordinate) {
+                quietRetries.abandoned(location.id) // follow-up L3: don't leave "Updating…" behind
+                return
+            }
             report.location = location
             if defaults.bool(forKey: "SkylineDemoAlert"), report.alerts.isEmpty { report.alerts = [Self.demoAlert(near: location)] }
             if defaults.bool(forKey: "SkylineDemoRain") { report.minutely = Self.demoRain(from: report.current.time) }
@@ -352,13 +355,13 @@ final class WeatherStore {
             let follow = RefreshBookkeeping.afterReport(isOfflineFallback: report.isOfflineFallback, backoffUntil: until)
             if follow.clearError {
                 if errors[location.id] != nil { errors[location.id] = nil }
-                quietRetryIDs.remove(location.id)
+                quietRetries.succeeded(location.id)
                 retryTasks.removeValue(forKey: location.id)?.cancel()
                 retryAttempts[location.id] = nil
-            } else if followUpQuietly(location, error: until.map { HTTPError.backingOff(host: RefreshBookkeeping.openMeteoHost, until: $0) }
-                                        ?? URLError(.networkConnectionLost), backoffUntil: until) {
-                // Saved data stays up without a banner while the quick retries run (item 2).
             } else {
+                // Follow-ups M2/M3: saved data is on screen, so no quiet quick retries; the banner shows
+                // at once (a real offline included) and the PR #2 ladder applies.
+                quietRetries.abandoned(location.id)
                 // Saved data stays up. A live back-off retries at `until` ("Open-Meteo busy, retrying at h:mm")
                 // instead of hammering the host and keeping the spinner on.
                 setError(follow.message, for: location.id)
@@ -375,11 +378,10 @@ final class WeatherStore {
             if errors[location.id] == nil,
                followUpQuietly(location, error: error,
                                backoffUntil: await service.backoff(for: RefreshBookkeeping.openMeteoHost)) {
-                // A slow or first fetch: "Updating…", retried in seconds, no banner yet (item 2).
+                // A first fetch: "Updating…", retried in seconds, no banner yet (item 2).
                 scheduleHousekeeping()
                 return
             }
-            quietRetryIDs.remove(location.id)
             setError(follow.message, for: location.id)
             if let existing = reports[location.id], existing.dataAge() > DataAge.maxDisplayAge {
                 reports[location.id] = nil
@@ -392,11 +394,12 @@ final class WeatherStore {
     /// Item 2: schedules a quiet quick retry when the policy allows; false = show the error as before.
     private func followUpQuietly(_ location: WeatherLocation, error: Error, backoffUntil: Date?) -> Bool {
         let id = location.id
-        let decision = FetchRetryPolicy.decide(error: error, attempt: retryAttempts[id, default: 0],
-                                               backoffUntil: backoffUntil, refreshInterval: Double(refreshMinutes) * 60,
-                                               jitterSeed: id.unicodeScalars.reduce(0) { $0 &+ Int($1.value) })
+        let decision = quietRetries.failed(id, error: error, attempt: retryAttempts[id, default: 0],
+                                           hasReport: reports[id] != nil, backoffUntil: backoffUntil,
+                                           refreshInterval: Double(refreshMinutes) * 60)
         guard decision.quiet else { return false }
-        quietRetryIDs.insert(id)
+        // Follow-up L3: an older, slower retry would keep "Updating…" up until it fires; replace it.
+        retryTasks.removeValue(forKey: id)?.cancel()
         scheduleRetry(location, delay: decision.retryAfter)
         return true
     }
@@ -414,7 +417,7 @@ final class WeatherStore {
         let attempt = retryAttempts[id, default: 0]
         retryAttempts[id] = attempt + 1
         // After the quiet quick retries, the exponential ladder starts at 1 min again (item 2).
-        let slow = max(0, attempt - FetchRetryPolicy.quickRetries.count)
+        let slow = quietRetries.ladderIndex(id, attempt: attempt)
         var delay = fixed ?? min(60 * pow(2, Double(min(slow, 6))), Double(refreshMinutes) * 60)
         if let notBefore { delay = max(delay, notBefore.timeIntervalSinceNow + 2) }
         retryTasks[id] = Task { [weak self] in
@@ -424,7 +427,7 @@ final class WeatherStore {
             guard let current = self.allLocations.first(where: { $0.id == id }),
                   self.isMainWindowVisible || self.menuBarLocation?.id == id || self.reports[id] == nil
                     || ((self.notificationPrefs.alerts || self.notificationPrefs.rain) && self.notifies(current)) else {
-                self.quietRetryIDs.remove(id)
+                self.quietRetries.abandoned(id)
                 return
             }
             await self.load(current)

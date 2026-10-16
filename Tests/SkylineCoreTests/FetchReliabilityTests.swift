@@ -34,20 +34,80 @@ final class FetchReliabilityTests: XCTestCase {
         WeatherService(client: client, cache: ResponseCache(directory: nil, now: { clock.now }), now: { clock.now })
     }
 
+    /// Holds the first Open-Meteo GET until the test opens it; ordering tests wait on the service's queue
+    /// depth instead of sleeping (follow-up: less timing-dependent).
+    actor Gate {
+        private var open = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+        func wait() async { if open { return }; await withCheckedContinuation { waiters.append($0) } }
+        func release() { open = true; waiters.forEach { $0.resume() }; waiters = [] }
+    }
+    final class GatedClient: HTTPClient, @unchecked Sendable {
+        let inner = MockHTTPClient()
+        let gate = Gate()
+        private let lock = NSLock()
+        private var _order: [String] = []
+        var order: [String] { lock.lock(); defer { lock.unlock() }; return _order }
+        private func note(_ url: URL) -> Int? {
+            guard url.host == "api.open-meteo.com" else { return nil }
+            let lat = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .first { $0.name == "latitude" }?.value ?? "?"
+            lock.lock(); defer { lock.unlock() }
+            _order.append(String(lat.prefix(2)))
+            return _order.count
+        }
+        func get(_ url: URL, headers: [String: String]) async throws -> Data {
+            if note(url) == 1 { await gate.wait() }
+            return try await inner.get(url, headers: headers)
+        }
+    }
+
+    func waitForQueue(_ s: WeatherService, depth: Int) async throws {
+        for _ in 0..<500 {
+            if await s.openMeteoQueueDepth() >= depth { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("queue never reached \(depth)")
+    }
+    func waitForFirstGet(_ c: GatedClient) async throws {
+        for _ in 0..<500 where c.order.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+    }
+
     func testNewCityJumpsTheQueuedRefreshes() async throws {
-        let clock = TestClock(fixtureTime)
-        let client = OrderClient()
-        let s = service(client, clock)
-        async let a = s.report(for: city(40.0))                       // holds the lock
-        try await Task.sleep(for: .milliseconds(60))
-        async let b = s.report(for: city(41.0))                       // queued refresh
-        async let c = s.report(for: city(42.0))                       // queued refresh
-        try await Task.sleep(for: .milliseconds(60))
-        async let d = s.report(for: city(43.0), priority: .interactive) // just added
+        let client = GatedClient()
+        let s = service(client, TestClock(fixtureTime))
+        async let a = s.report(for: city(40.0))
+        try await waitForFirstGet(client)
+        async let b = s.report(for: city(41.0))
+        try await waitForQueue(s, depth: 1)
+        async let c = s.report(for: city(42.0))
+        try await waitForQueue(s, depth: 2)
+        async let d = s.report(for: city(43.0), priority: .interactive)
+        try await waitForQueue(s, depth: 3)
+        await client.gate.release()
         _ = try await (a, b, c, d)
-        XCTAssertEqual(client.order.first, "40.0000")
-        XCTAssertEqual(client.order[1], "43.0000", "the new city goes next, ahead of queued refreshes: \(client.order)")
-        XCTAssertEqual(Set(client.order.suffix(2)), ["41.0000", "42.0000"])
+        XCTAssertEqual(client.order, ["40", "43", "41", "42"])
+    }
+
+    /// Follow-up M1: a new city that joins a queued background GET for the same URL promotes it.
+    func testJoiningNewCityPromotesTheSharedBackgroundGet() async throws {
+        let client = GatedClient()
+        let s = service(client, TestClock(fixtureTime))
+        async let a = s.report(for: city(40.0))
+        try await waitForFirstGet(client)
+        async let c = s.report(for: city(42.0))                 // queued first
+        try await waitForQueue(s, depth: 1)
+        async let b = s.report(for: city(41.0))                 // background, behind 42
+        try await waitForQueue(s, depth: 2)
+        var joiner = city(41.0); joiner.id = "just-added"       // same URL, new city
+        async let j = s.report(for: joiner, priority: .interactive)
+        for _ in 0..<50 { await Task.yield() }
+        try await Task.sleep(for: .milliseconds(30))            // let the join register (no new queue slot)
+        let depth = await s.openMeteoQueueDepth()
+        XCTAssertEqual(depth, 2, "joined, not queued again")
+        await client.gate.release()
+        _ = try await (a, b, c, j)
+        XCTAssertEqual(client.order, ["40", "41", "42"], "promoted ahead of the earlier background GET")
     }
 
     func testStillOneOpenMeteoGetAtATimeWithPriorities() async throws {
@@ -156,5 +216,52 @@ final class FetchReliabilityTests: XCTestCase {
         XCTAssertEqual(FetchRetryPolicy.priority(force: false, hasReport: false), .interactive)
         XCTAssertEqual(FetchRetryPolicy.priority(force: true, hasReport: true), .interactive)
         XCTAssertEqual(FetchRetryPolicy.priority(force: false, hasReport: true), .background)
+    }
+
+    // MARK: Follow-ups
+
+    func testCachedCitiesGetNoQuickRetries() {
+        let d = FetchRetryPolicy.decide(error: URLError(.timedOut), attempt: 0, backoffUntil: nil, refreshInterval: 900,
+                                        hasReport: true, jitter: 0)
+        XCTAssertFalse(d.quiet, "M3: saved data on screen, PR #2 ladder only")
+        XCTAssertEqual(d.retryAfter, 60, accuracy: 0.001)
+    }
+
+    func testOfflineShowsPromptlyEvenWithoutData() {
+        var t = QuietRetryTracker()
+        let d = t.failed("a", error: URLError(.notConnectedToInternet), attempt: 0, hasReport: false, backoffUntil: nil,
+                         refreshInterval: 900)
+        XCTAssertFalse(d.quiet, "M2: a real offline is never quiet")
+        XCTAssertFalse(t.updating.contains("a"))
+    }
+
+    func testUpdatingClearsOnSuccessFailureAndAbandon() {
+        var t = QuietRetryTracker()
+        _ = t.failed("a", error: URLError(.timedOut), attempt: 0, hasReport: false, backoffUntil: nil, refreshInterval: 900)
+        XCTAssertTrue(t.updating.contains("a"))
+        t.succeeded("a")
+        XCTAssertFalse(t.updating.contains("a"), "success clears")
+        XCTAssertNil(t.quietAttempts["a"])
+
+        for n in 0..<3 {
+            let d = t.failed("b", error: URLError(.timedOut), attempt: n, hasReport: false, backoffUntil: nil, refreshInterval: 900)
+            XCTAssertTrue(d.quiet)
+        }
+        let last = t.failed("b", error: URLError(.timedOut), attempt: 3, hasReport: false, backoffUntil: nil, refreshInterval: 900)
+        XCTAssertFalse(last.quiet)
+        XCTAssertFalse(t.updating.contains("b"), "quick retries used up: banner, not Updating…")
+        XCTAssertEqual(t.ladderIndex("b", attempt: 3), 0, "the slow ladder starts at 1 min")
+
+        _ = t.failed("c", error: URLError(.timedOut), attempt: 0, hasReport: false, backoffUntil: nil, refreshInterval: 900)
+        t.abandoned("c")
+        XCTAssertFalse(t.updating.contains("c"), "My Location moved / retry not run: cleared")
+    }
+
+    func testWiderJitter() {
+        let ids = (0..<200).map { "\(40 + Double($0) / 100),-74.0000" }
+        let js = ids.map(FetchRetryPolicy.jitter(for:))
+        XCTAssertTrue(js.allSatisfy { $0 >= 0 && $0 < FetchRetryPolicy.maxJitter })
+        XCTAssertGreaterThan(Set(js).count, 150, "far more than the old 4 values")
+        XCTAssertEqual(FetchRetryPolicy.jitter(for: "x"), FetchRetryPolicy.jitter(for: "x"), "stable per city")
     }
 }
