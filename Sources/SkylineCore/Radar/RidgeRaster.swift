@@ -127,6 +127,16 @@ public enum PalettePNG {
         for _ in 0..<8 { c = (c & 1) != 0 ? 0xEDB8_8320 ^ (c >> 1) : c >> 1 }
         return c
     }
+    public static func adler32(_ b: [UInt8]) -> UInt32 {
+        var a: UInt32 = 1, s: UInt32 = 0, i = 0
+        while i < b.count {
+            let end = min(i + 5552, b.count) // largest block before the sums can overflow 32 bits
+            while i < end { a += UInt32(b[i]); s += a; i += 1 }
+            a %= 65521; s %= 65521
+        }
+        return s << 16 | a
+    }
+
     public static func crc32(_ b: ArraySlice<UInt8>) -> UInt32 {
         var c: UInt32 = 0xFFFF_FFFF
         for x in b { c = crcTable[Int((c ^ UInt32(x)) & 0xFF)] ^ (c >> 8) }
@@ -137,24 +147,27 @@ public enum PalettePNG {
         guard data.count <= maxFileBytes else { return nil }
         let b = [UInt8](data)
         guard b.count >= 8 + 25, b[0..<8].elementsEqual([137, 80, 78, 71, 13, 10, 26, 10]) else { return nil }
-        func u32(_ i: Int) -> Int { Int(b[i]) << 24 | Int(b[i + 1]) << 16 | Int(b[i + 2]) << 8 | Int(b[i + 3]) }
+        // CR #7 (final): read as UInt32, never as a signed Int shift (a length with the top bit set went
+        // negative on 32-bit Int and slipped past the bounds check). PNG lengths are ≤ 2³¹ − 1.
+        func be32(_ i: Int) -> UInt32 { UInt32(b[i]) << 24 | UInt32(b[i + 1]) << 16 | UInt32(b[i + 2]) << 8 | UInt32(b[i + 3]) }
+        func u32(_ i: Int) -> Int? { let v = be32(i); return v <= 0x7FFF_FFFF ? Int(v) : nil }
         var i = 8, w = 0, h = 0, sawIHDR = false, sawIEND = false
         var palette: [(UInt8, UInt8, UInt8)] = []
         var alpha: [UInt8] = []
         var idat: [UInt8] = []
         while i < b.count {
             guard b.count - i >= 12 else { return nil }
-            let len = u32(i)
-            guard len <= b.count - i - 12 else { return nil } // chunk + type + CRC must fit
+            guard let len = u32(i), len <= b.count - i - 12 else { return nil } // chunk + type + CRC must fit
             let start = i + 8, end = start + len
             let type = String(bytes: b[(i + 4)..<start], encoding: .ascii) ?? ""
-            guard UInt32(u32(end)) == crc32(b[(i + 4)..<end]) else { return nil }
+            guard be32(end) == crc32(b[(i + 4)..<end]) else { return nil }
             if !sawIHDR, type != "IHDR" { return nil }
             switch type {
             case "IHDR":
                 guard !sawIHDR, len == 13 else { return nil }
                 sawIHDR = true
-                w = u32(start); h = u32(start + 4)
+                guard let iw = u32(start), let ih = u32(start + 4) else { return nil }
+                w = iw; h = ih
                 // Capped *before* any multiplication (CR #7.1: no overflow).
                 guard w > 0, h > 0, w <= maxDimension, h <= maxDimension else { return nil }
                 // bit depth 8, palette, deflate, filter method 0, no interlace.
@@ -181,6 +194,9 @@ public enum PalettePNG {
               idat[0] & 0x0F == 8, (UInt16(idat[0]) << 8 | UInt16(idat[1])) % 31 == 0, idat[1] & 0x20 == 0 else { return nil }
         let stride = w + 1, expected = stride * h // ≤ 4097 × 4096: no overflow
         guard let raw = inflate(idat[2...], exactly: expected) else { return nil }
+        // CR #7 (final): the zlib trailer's Adler-32 must match what was inflated.
+        let n = idat.count, trailer = UInt32(idat[n - 4]) << 24 | UInt32(idat[n - 3]) << 16 | UInt32(idat[n - 2]) << 8 | UInt32(idat[n - 1])
+        guard adler32(raw) == trailer else { return nil }
         var out = [UInt8](repeating: 0, count: w * h)
         for y in 0..<h {
             let f = raw[y * stride], row = y * stride + 1

@@ -126,25 +126,85 @@ struct RidgeRasterTests {
         }
     }
 
-    // CR #7.2: the "horizontal cut" is in the source. The raster's echo ends on a straight row
-    // (row 486 has echo across the tile, row 487 mostly none), and IEM's own tile ends on the same line.
-    // Smooth coverage tracks IEM's row by row, so no seam is introduced (no row differs by more than ~1/6, the contour-vs-block difference at cell edges).
-    @Test func noSeamRowCoverageTracksIEM() throws {
+    /// Tile-pixel centre → (lat, lon).
+    static func pixelLatLon(z: Int, x: Int, y: Int, px: Int, py: Int) -> (Double, Double) {
+        let n = pow(2.0, Double(z))
+        let lon = (Double(x) + (Double(px) + 0.5) / 256) / n * 360 - 180
+        let lat = atan(sinh(Double.pi * (1 - 2 * (Double(y) + (Double(py) + 0.5) / 256) / n))) * 180 / .pi
+        return (lat, lon)
+    }
+
+    /// Longest horizontal run of "drawn here, nothing directly below" in an RGBA image (w × h).
+    static func longestFlatEdge(_ px: [UInt8], width w: Int, rows: Range<Int>) -> Int {
+        var best = 0
+        for y in rows where y + 1 < px.count / (w * 4) {
+            var run = 0
+            for x in 0..<w {
+                if px[(y * w + x) * 4 + 3] > 0, px[((y + 1) * w + x) * 4 + 3] == 0 { run += 1; best = max(best, run) } else { run = 0 }
+            }
+        }
+        return best
+    }
+
+    // CR #7.2 (final), the ~41.01°N "cut" 16 km north of KOKX. Evidence, all strict:
+    // 1. The raw IEM grid has echo on both sides of 41.01°N (rows 486/487) and no straight edge there.
+    // 2. Our render never clips: wherever all four cells around a pixel have echo it is drawn, wherever
+    //    none do it is clear. Zero exceptions, across the 40.98°N tile edge (the nearest tile boundary at
+    //    every zoom) at z9 and z10.
+    // 3. Coverage tracks IEM's own tile row by row (per IEM pixel band, ≤ max(8, 1/12)).
+    @Test func noSeamAt41N() throws {
         let r = try Self.raster()
+        let seamRow = (41.01 - r.lat0) / r.dLat
+        #expect(Int(seamRow) == 486)
+        let north = (0..<r.width).filter { r.echo(486, $0) != nil }.count
+        let south = (0..<r.width).filter { r.echo(487, $0) != nil }.count
+        #expect(north > 50 && south > 50 && abs(north - south) <= 10, "raw rows 486/487: \(north) / \(south)")
+        // Source: no straight east–west echo edge longer than 10 cells (≈ 9 km) anywhere in rows 476–497.
+        var longest = 0
+        for row in 476...497 {
+            var run = 0
+            for c in 0..<r.width {
+                if r.echo(row, c) != nil, r.echo(row + 1, c) == nil { run += 1; longest = max(longest, run) } else { run = 0 }
+            }
+        }
+        #expect(longest <= 10, "raw straight edge \(longest) cells")
+
+        // Render: the strict support rule on a 2-tile-tall strip straddling the 40.98°N tile boundary.
+        for (z, xs, y0) in [(10, [305, 306, 307], 383), (9, [152, 153], 191)] {
+            for x in xs {
+                let strip = r.renderTile(z: z, x: x, y: y0) + r.renderTile(z: z, x: x, y: y0 + 1)
+                var violations = 0
+                for py in 0..<512 { for px in 0..<256 {
+                    let (lat, lon) = Self.pixelLatLon(z: z, x: x, y: y0, px: px, py: py)
+                    let fc = (lon - r.lon0) / r.dLon, fr = (lat - r.lat0) / r.dLat
+                    let c0 = Int(fc.rounded(.down)), r0 = Int(fr.rounded(.down))
+                    let cells = [r.echo(r0, c0), r.echo(r0, c0 + 1), r.echo(r0 + 1, c0), r.echo(r0 + 1, c0 + 1)]
+                    let drawn = strip[(py * 256 + px) * 4 + 3] > 0
+                    if cells.allSatisfy({ $0 != nil }) && !drawn { violations += 1 }
+                    if cells.allSatisfy({ $0 == nil }) && drawn { violations += 1 }
+                } }
+                #expect(violations == 0, "z\(z) x\(x): \(violations) clipped/extra pixels")
+                // No flat edge in our output at the seam latitudes beyond what the source has (≤ 10 cells).
+                let cellPx = Int((256 * pow(2.0, Double(z)) / 360 * r.dLon).rounded(.up))
+                #expect(Self.longestFlatEdge(strip, width: 256, rows: 0..<511) <= 10 * cellPx)
+            }
+        }
+
+        // IEM's own tile for the same scan: identical coverage per pixel band (each IEM band is one raster
+        // row, so compare band means; the per-pixel-row difference is the contour inside a band).
         let smooth = r.renderTile(z: 10, x: 307, y: 383)
         let png = try Self.fixture("OKX_N0B_tile_10_307_383", "png")
         let src = try #require(CGImageSourceCreateWithData(png as CFData, nil))
         let iem = RadarTilePacker.render(try #require(CGImageSourceCreateImageAtIndex(src, 0, nil)))
         func row(_ p: [UInt8], _ y: Int) -> Int { (0..<256).filter { p[(y * 256 + $0) * 4 + 3] > 0 }.count }
-        for y in 0..<256 {
-            let a = row(iem, y), b = row(smooth, y)
-            #expect(abs(a - b) <= max(8, a / 6), "row \(y): IEM \(a) vs smooth \(b)")
-        }
-        // And smoothing adds no horizontal cut of its own: every row-to-row coverage jump in the smooth
-        // tile is matched by a jump in IEM's tile at the same row (the straight edge lives in the source).
-        for y in 1..<256 {
-            let di = abs(row(iem, y) - row(iem, y - 1)), ds = abs(row(smooth, y) - row(smooth, y - 1))
-            #expect(ds <= di + 24, "row \(y): smooth jumps \(ds) where IEM jumps \(di)")
+        var y = 0
+        while y < 256 {
+            var e = y + 1
+            while e < 256, (0..<256).allSatisfy({ iem[(e * 256 + $0) * 4 + 3] == iem[((e - 1) * 256 + $0) * 4 + 3] }) { e += 1 }
+            let a = (y..<e).map { row(iem, $0) }.reduce(0, +) / (e - y)
+            let b = (y..<e).map { row(smooth, $0) }.reduce(0, +) / (e - y)
+            #expect(abs(a - b) <= max(8, a / 12), "IEM band \(y)..<\(e): IEM \(a) vs smooth \(b)")
+            y = e
         }
     }
 
@@ -247,5 +307,25 @@ struct RidgeRasterTests {
         let small = RidgeRasterStore(limit: 1) { url in url.pathExtension == "png" ? png : wld }
         _ = await small.raster(base: "https://a/1"); _ = await small.raster(base: "https://a/2"); _ = await small.raster(base: "https://a/1")
         #expect(await small.fetches == 3) // evicted at the limit (memory bound)
+    }
+
+    // CR #7 (final), item 4: the newest scan shows IEM's tile at once and swaps to smooth in place.
+    @Test func newestFrameShowsBlockyThenSwapsToSmoothInPlace() {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        let scans = (0..<6).map { t0.addingTimeInterval(Double($0) * 300) }
+        let smooth = IEMRidge.frames(site: "OKX", scans: scans, range: .oneHour)
+        let pending = IEMRidge.newestBlocky(smooth, site: "OKX")
+        #expect(pending.count == smooth.count)
+        #expect(pending.dropLast().allSatisfy { $0.urlTemplate.contains("#raw=") }) // older frames stay smooth
+        #expect(!pending.last!.urlTemplate.contains("#raw=") && pending.last!.urlTemplate.contains("ridge::OKX-N0B-"))
+        #expect(IEMRidge.isPendingSmooth(pending))
+        #expect(!IEMRidge.isPendingSmooth(smooth))
+        #expect(!IEMRidge.isPendingSmooth(IEMRidge.frames(site: "OKX", scans: scans, range: .oneHour, smooth: false)))
+        // Raster archived: only the newest changes, so it's an in-place swap (no loop reload).
+        #expect(IEMRidge.isNewestUpgrade(from: pending, to: smooth))
+        #expect(!IEMRidge.isNewestUpgrade(from: smooth, to: pending))
+        // A new scan arriving is a normal reload, not an upgrade.
+        let later = IEMRidge.frames(site: "OKX", scans: scans + [t0.addingTimeInterval(1800)], range: .oneHour)
+        #expect(!IEMRidge.isNewestUpgrade(from: pending, to: later))
     }
 }

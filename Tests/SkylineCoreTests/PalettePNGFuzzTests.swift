@@ -12,19 +12,19 @@ struct PalettePNGFuzzTests {
         if badCRC { crc ^= 1 }
         return be32(UInt32(body.count)) + t + body + be32(crc)
     }
-    static func deflate(_ raw: [UInt8]) -> [UInt8] {
+    static func deflate(_ raw: [UInt8], badAdler: Bool = false) -> [UInt8] {
         var out = [UInt8](repeating: 0, count: raw.count + 1024)
         let n = compression_encode_buffer(&out, out.count, raw, raw.count, nil, COMPRESSION_ZLIB)
-        return [0x78, 0x9C] + Array(out[0..<n]) + [0, 0, 0, 0] // adler not checked
+        return [0x78, 0x9C] + Array(out[0..<n]) + be32(PalettePNG.adler32(raw) ^ (badAdler ? 1 : 0))
     }
     static func ihdr(_ w: UInt32, _ h: UInt32, depth: UInt8 = 8, type: UInt8 = 3, interlace: UInt8 = 0) -> [UInt8] {
         chunk("IHDR", be32(w) + be32(h) + [depth, type, 0, 0, interlace])
     }
     static let sig: [UInt8] = [137, 80, 78, 71, 13, 10, 26, 10]
-    static func png(w: Int = 4, h: Int = 3, raw: [UInt8]? = nil, ihdrChunk: [UInt8]? = nil, trns: Bool = true) -> [UInt8] {
+    static func png(w: Int = 4, h: Int = 3, raw: [UInt8]? = nil, ihdrChunk: [UInt8]? = nil, trns: Bool = true, badAdler: Bool = false) -> [UInt8] {
         let rows: [UInt8] = raw ?? (0..<h).flatMap { y -> [UInt8] in [0] + (0..<w).map { UInt8(($0 + y) % 4) } }
         return sig + (ihdrChunk ?? ihdr(UInt32(w), UInt32(h))) + chunk("PLTE", (0..<12).map { UInt8($0 * 20) })
-            + (trns ? chunk("tRNS", [0, 0]) : []) + chunk("IDAT", deflate(rows)) + chunk("IEND", [])
+            + (trns ? chunk("tRNS", [0, 0]) : []) + chunk("IDAT", deflate(rows, badAdler: badAdler)) + chunk("IEND", [])
     }
 
     @Test func decodesAWellFormedImage() throws {
@@ -87,5 +87,36 @@ struct PalettePNGFuzzTests {
             // Must not trap; most flips fail the CRC, the rest decode to a valid-sized image or nil.
             if let img = PalettePNG.decode(Data(b)) { #expect(img.indices.count == img.width * img.height) }
         }
+    }
+
+    /// CR #7 (final): chunk lengths with the top bit set (or any value past the file) are rejected, not
+    /// turned into negative Ints.
+    @Test func hugeChunkLengthsAreRejectedNotTrapped() {
+        let good = Self.png()
+        let firstLength = 8 // the IHDR length field
+        for v: UInt32 in [0x8000_0000, 0xFFFF_FFFF, 0xFFFF_FFF4, 0x7FFF_FFFF, UInt32(good.count)] {
+            var b = good
+            b.replaceSubrange(firstLength..<(firstLength + 4), with: Self.be32(v))
+            #expect(PalettePNG.decode(Data(b)) == nil)
+            // And on a later chunk (PLTE starts after the 25-byte IHDR chunk).
+            var c = good
+            c.replaceSubrange(33..<37, with: Self.be32(v))
+            #expect(PalettePNG.decode(Data(c)) == nil)
+        }
+    }
+
+    /// CR #7 (final): the zlib Adler-32 trailer is verified.
+    @Test func adlerMismatchIsRejected() throws {
+        #expect(PalettePNG.decode(Data(Self.png())) != nil)
+        #expect(PalettePNG.decode(Data(Self.png(badAdler: true))) == nil)
+        #expect(PalettePNG.adler32(Array("Wikipedia".utf8)) == 0x11E6_0398) // reference value
+        #expect(PalettePNG.adler32([]) == 1)
+        // Long input exercises the modulo blocks.
+        let big = [UInt8](repeating: 0xFF, count: 100_000)
+        var a: UInt64 = 1, s: UInt64 = 0
+        for x in big { a = (a + UInt64(x)) % 65521; s = (s + a) % 65521 }
+        #expect(PalettePNG.adler32(big) == UInt32(s << 16 | a))
+        // The real IEM raster passes (its trailer is genuine).
+        #expect(PalettePNG.decode(try RidgeRasterTests.fixture("OKX_N0B_202610161748", "png")) != nil)
     }
 }

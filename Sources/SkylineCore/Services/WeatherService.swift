@@ -148,19 +148,25 @@ public actor WeatherService {
         }
     }
 
-    /// CR #7.6: the whole loop is smooth or none of it is. The newest scan's raster can trail the scan
-    /// list; then that scan is held back (the loop ends one scan earlier, ~5 min) until it's archived.
-    /// If even the previous one isn't there (archive down), the loop uses IEM's tiles throughout.
+    /// True once IEM has archived `time`'s scan raster for `site` (its world file parses). A miss isn't
+    /// cached, so callers can poll it.
+    public func rasterArchived(site: String, time: Date) async -> Bool {
+        guard let url = URL(string: IEMRidge.rasterBase(site: site, time: time) + ".wld") else { return false }
+        return await optionalFetch(url, ttl: 24 * 3600, force: false).flatMap { String(data: $0, encoding: .ascii) }
+            .flatMap(RidgeRaster.parseWorldFile) != nil
+    }
+
+    /// CR #7 (final): the newest scan's raster often trails the scan list by a minute or two. That scan is
+    /// shown at once from IEM's tile (blocky) and RadarPlayback swaps it to smooth as soon as the raster is
+    /// archived (`IEMRidge.isPendingSmooth`). Every older frame is smooth, so only the newest can differ.
+    /// If the previous scan isn't archived either (archive down), the whole loop uses IEM's tiles.
     func smoothSiteFrames(site: String, scans: [Date], range: RadarRange, force: Bool) async -> [RadarFrame] {
-        func archived(_ t: Date) async -> Bool {
-            guard let url = URL(string: IEMRidge.rasterBase(site: site, time: t) + ".wld") else { return false }
-            return await optionalFetch(url, ttl: 24 * 3600, force: false).flatMap { String(data: $0, encoding: .ascii) }
-                .flatMap(RidgeRaster.parseWorldFile) != nil
-        }
         guard let last = scans.last else { return [] }
-        if await archived(last) { return IEMRidge.frames(site: site, scans: scans, range: range) }
-        let held = Array(scans.dropLast())
-        if let prev = held.last, await archived(prev) { return IEMRidge.frames(site: site, scans: held, range: range) }
+        if await rasterArchived(site: site, time: last) { return IEMRidge.frames(site: site, scans: scans, range: range) }
+        let frames = IEMRidge.frames(site: site, scans: scans, range: range)
+        if frames.count > 1, await rasterArchived(site: site, time: frames[frames.count - 2].time) {
+            return IEMRidge.newestBlocky(frames, site: site)
+        }
         return IEMRidge.frames(site: site, scans: scans, range: range, smooth: false)
     }
 
