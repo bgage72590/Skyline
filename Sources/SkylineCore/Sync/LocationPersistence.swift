@@ -23,6 +23,8 @@ public struct SyncEnvironment: Equatable, Sendable {
     public var fileURL: URL?
     public var stateURL: URL
     public var deletionsURL: URL
+    /// Logged re-adds (search, undo) not yet synced, next to the delete log.
+    public var additionsURL: URL { deletionsURL.deletingLastPathComponent().appendingPathComponent("additions.json") }
     /// nil = UserDefaults.standard; otherwise an isolated suite that never touches the real app's defaults.
     public var defaultsSuite: String?
     public var isOverride: Bool { defaultsSuite != nil }
@@ -48,11 +50,18 @@ public struct SyncEnvironment: Equatable, Sendable {
     }
 }
 
+/// Logged re-adds use the same on-disk log (`additions.json`).
+public typealias AdditionLog = DeletionLog
+
 /// The user's deletes, written synchronously (atomic) at delete time so a quit or crash before the next
 /// push can't bring the city back. Entries age out after 180 days, like tombstones.
 public final class DeletionLog: @unchecked Sendable {
     public let url: URL
     public private(set) var entries: [String: Date]
+    /// The city's sync version this Mac had seen when the entry was recorded (Sint Maarten fix): a pending
+    /// delete is overruled only by a re-add with a higher version, never by a later wall-clock stamp.
+    public private(set) var seenVersions: [String: Int]
+    private var versionsURL: URL { url.deletingPathExtension().appendingPathExtension("versions.json") }
     private let lock = NSLock()
 
     public init(url: URL, now: Date = Date()) {
@@ -60,17 +69,22 @@ public final class DeletionLog: @unchecked Sendable {
         let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
         let read = (try? Data(contentsOf: url)).flatMap { try? dec.decode([String: Date].self, from: $0) } ?? [:]
         entries = read.filter { now.timeIntervalSince($0.value) < 180 * 86400 }
+        let vURL = url.deletingPathExtension().appendingPathExtension("versions.json")
+        let v = (try? Data(contentsOf: vURL)).flatMap { try? JSONDecoder().decode([String: Int].self, from: $0) } ?? [:]
+        seenVersions = v.filter { read[$0.key] != nil && now.timeIntervalSince(read[$0.key]!) < 180 * 86400 }
     }
 
-    public func record(_ id: String, at date: Date = Date()) {
+    public func record(_ id: String, at date: Date = Date(), seenVersion: Int? = nil) {
         lock.lock(); defer { lock.unlock() }
         entries[id] = date
+        seenVersions[id] = seenVersion
         write()
     }
 
     public func forget(_ id: String) {
         lock.lock(); defer { lock.unlock() }
         guard entries.removeValue(forKey: id) != nil else { return }
+        seenVersions[id] = nil
         write()
     }
 
@@ -79,6 +93,7 @@ public final class DeletionLog: @unchecked Sendable {
         guard let data = try? enc.encode(entries) else { return }
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? data.write(to: url, options: .atomic)
+        if let v = try? enc.encode(seenVersions) { try? v.write(to: versionsURL, options: .atomic) }
     }
 }
 

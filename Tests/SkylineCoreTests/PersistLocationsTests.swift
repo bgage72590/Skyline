@@ -183,7 +183,8 @@ final class PersistLocationsTests: XCTestCase {
     func testRecoveredCitiesSurviveTheMergeOnEveryMac() {
         var remote = synced([ny]); remote.removed = [syd.id: t0, wpb.id: t0]
         let back = LocationRecovery.recover(current: [ny], legacy: [], removed: remote.removed, before: t0 + 1)
-        let local = SyncDocument.noting(locations: [ny] + back, settings: [:], previous: remote, now: t0 + 60, deletions: [:])
+        let local = SyncDocument.noting(locations: [ny] + back, settings: [:], previous: remote, now: t0 + 60, deletions: [:],
+                                            additions: Dictionary(uniqueKeysWithValues: back.map { ($0.id, t0) }))
         let merged = SyncDocument.merge(local: remote, remote: local, now: t0 + 60)
         XCTAssertEqual(Set(merged.locations.map(\.id)), [ny.id, syd.id, wpb.id])
         XCTAssertTrue(merged.removed.isEmpty)

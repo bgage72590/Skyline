@@ -774,9 +774,12 @@ final class WeatherStore {
         let location = result.asLocation
         // Same place by id, ~1 km, or name+region+country: select the one we already have (QA #5).
         if let existing = LocationList.existingDuplicate(of: location, in: savedLocations) {
+            // CR H2: the copy we select may be a stale one another Mac deleted; picking it in search is
+            // the user re-adding it, so log the re-add (otherwise the next sync purges it).
+            SyncCoordinator.shared?.recordAddition(existing.id)
             selectedID = existing.id
         } else {
-            SyncCoordinator.shared?.forgetDeletion(location.id)
+            SyncCoordinator.shared?.recordAddition(location.id)
             savedLocations.append(location)
             selectedID = location.id
         }
@@ -817,7 +820,7 @@ final class WeatherStore {
 
     func restore(_ location: WeatherLocation, at index: Int, select: Bool, pinned: Bool = false, notified: Bool = false,
                  undoManager: UndoManager? = nil) {
-        SyncCoordinator.shared?.forgetDeletion(location.id)
+        SyncCoordinator.shared?.recordAddition(location.id)
         savedLocations = LocationList.restoring(location, at: index, into: savedLocations)
         if select { selectedID = location.id }
         if pinned { menuBarPinID = location.id }
