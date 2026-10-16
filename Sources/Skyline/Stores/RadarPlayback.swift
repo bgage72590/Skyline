@@ -87,6 +87,8 @@ final class RadarPlayback {
     @ObservationIgnored private var generation = RequestGeneration()
 
     static let baseFrameMs: Double = 550
+    static let baseHoldOnLatestMs: Double = 1600
+    static let baseHoldOnNowMs: Double = 900
     static let frameInterval: Duration = .milliseconds(550)
     static let holdOnLatest: Duration = .milliseconds(1600)
     /// A short pause on "now" before the forecast frames, so the hand-off is visible.
@@ -112,7 +114,10 @@ final class RadarPlayback {
     /// has holes. `load: false` when the caller awaits `loadFrames()` itself (L7: two index loads raced).
     func configure(for location: WeatherLocation, load: Bool = true) {
         inCONUS = location.isInCONUS
-        coordinate = location.coordinate
+        // Wipe storm arrows immediately on a city change so the old place's cells never linger.
+        let next = location.coordinate
+        stormCells = StormMotion.cellsAfterLocationChange(previous: coordinate, new: next, cells: stormCells)
+        coordinate = next
         updateStormPoll()
         let newStation = siteChoice.resolvedStation(for: location.coordinate, inCONUS: inCONUS)
         if newStation != station {
@@ -344,7 +349,8 @@ final class RadarPlayback {
                 guard let self else { return }
                 let atLatest = self.index >= self.frames.count - 1
                 let atNow = self.hasForecastFrames && self.index == self.nowIndex
-                try? await Task.sleep(for: atLatest ? Self.holdOnLatest : (atNow ? Self.holdOnNow : self.frameInterval))
+                try? await Task.sleep(for: atLatest ? self.holdOnLatestInterval
+                                       : (atNow ? self.holdOnNowInterval : self.frameInterval))
                 if Task.isCancelled || !self.clock.owns(token) { return }
                 if atLatest, let loadedAt = self.loadedAt, Date().timeIntervalSince(loadedAt) > Self.indexMaxAge {
                     // New scans: the map keeps showing the old frames until the new ones are prefetched.
@@ -375,6 +381,8 @@ final class RadarPlayback {
                 guard let self, self.stormPoll.owns(token), let c = self.coordinate else { return }
                 let cells = await self.service.stormCells(near: c)
                 if Task.isCancelled || !self.stormPoll.owns(token) { return }
+                // Drop a response that arrived after the user switched cities (we already cleared).
+                guard self.coordinate == c else { continue }
                 if cells != self.stormCells { self.stormCells = cells }
                 try? await Task.sleep(for: .seconds(StormMotion.pollInterval))
                 if Task.isCancelled || !self.stormPoll.owns(token) { return }
@@ -384,7 +392,12 @@ final class RadarPlayback {
 
     /// Effective frame interval at the current playback speed.
     private var frameInterval: Duration {
-        let ms = playbackSpeed.frameMilliseconds(baseMs: Self.baseFrameMs)
-        return .milliseconds(Int(ms.rounded()))
+        .milliseconds(Int(playbackSpeed.frameMilliseconds(baseMs: Self.baseFrameMs).rounded()))
+    }
+    private var holdOnLatestInterval: Duration {
+        .milliseconds(Int(playbackSpeed.holdMilliseconds(baseMs: Self.baseHoldOnLatestMs).rounded()))
+    }
+    private var holdOnNowInterval: Duration {
+        .milliseconds(Int(playbackSpeed.holdMilliseconds(baseMs: Self.baseHoldOnNowMs).rounded()))
     }
 }

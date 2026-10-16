@@ -28,6 +28,7 @@ struct RadarCard: View {
                 VStack {
                     HStack {
                         Spacer()
+                        if radar.currentFrame?.isForecast == true { ForecastHRRRBadge() }
                         CircleButton(systemImage: "arrow.up.left.and.arrow.down.right", help: "Expand map") { expand() }
                     }
                     Spacer()
@@ -137,17 +138,7 @@ struct ExpandedRadarView: View {
                         .padding(10)
                         .glassChip(RoundedRectangle(cornerRadius: 10, style: .continuous))
                     Spacer()
-                    if radar.currentFrame?.isForecast == true {
-                        Text("FORECAST · HRRR")
-                            .font(.caption2.weight(.bold))
-                            .tracking(0.6)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .foregroundStyle(Color(red: 0.92, green: 0.86, blue: 1.0))
-                            .background(Capsule().fill(Color(red: 0.35, green: 0.22, blue: 0.55).opacity(0.85)))
-                            .overlay(Capsule().stroke(Color(red: 0.78, green: 0.62, blue: 1.0), lineWidth: 1))
-                            .accessibilityLabel("Forecast, HRRR model")
-                    }
+                    if radar.currentFrame?.isForecast == true { ForecastHRRRBadge() }
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 8)
@@ -226,6 +217,21 @@ struct CircleButton: View {
         }
         .buttonStyle(.plain)
         .help(help)
+    }
+}
+
+/// Shown on both the inline card and the expanded map while a model forecast frame is on screen.
+struct ForecastHRRRBadge: View {
+    var body: some View {
+        Text("FORECAST · HRRR")
+            .font(.caption2.weight(.bold))
+            .tracking(0.6)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .foregroundStyle(Color(red: 0.92, green: 0.86, blue: 1.0))
+            .background(Capsule().fill(Color(red: 0.35, green: 0.22, blue: 0.55).opacity(0.85)))
+            .overlay(Capsule().stroke(Color(red: 0.78, green: 0.62, blue: 1.0), lineWidth: 1))
+            .accessibilityLabel("Forecast, HRRR model")
     }
 }
 

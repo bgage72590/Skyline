@@ -22,4 +22,9 @@ public enum RadarPlaybackSpeed: Double, CaseIterable, Codable, Sendable, Identif
     public func frameMilliseconds(baseMs: Double) -> Double {
         max(40, baseMs / rawValue)
     }
+
+    /// Hold-on-latest / hold-on-now dwells scale with speed the same way as frame interval.
+    public func holdMilliseconds(baseMs: Double) -> Double {
+        max(40, baseMs / rawValue)
+    }
 }

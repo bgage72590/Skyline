@@ -31,6 +31,8 @@ public enum StormMotion {
     /// Path must pass within this many miles of the location to show an ETA.
     public static let etaPassMiles = 5.0
     public static let maxETAHours = 3.0
+    /// Cap how many arrows we draw (nearest first).
+    public static let maxCells = 3
 
     /// Parse GeoJSON (or CSV with a header) from IEM `nexrad_attr.py`.
     public static func parse(_ data: Data) throws -> [StormCell] {
@@ -83,14 +85,40 @@ public enum StormMotion {
         return []
     }
 
-    /// Keep strong, moving cells within `maxDistanceKm`, then dedupe nearby duplicates across radars.
+    /// Keep strong, moving cells within `maxDistanceKm`, dedupe nearby duplicates across radars,
+    /// then keep at most `maxCells` nearest to `location`.
     public static func relevant(_ cells: [StormCell], near location: Coordinate) -> [StormCell] {
         let strong = cells.filter { cell in
             cell.maxDBZ >= minDBZ
                 && cell.speedKnots >= minSpeedKnots
                 && NexradStation.distanceKm(location, cell.coordinate) <= maxDistanceKm
         }
-        return dedupe(strong)
+        return Array(dedupe(strong)
+            .sorted { NexradStation.distanceKm(location, $0.coordinate) < NexradStation.distanceKm(location, $1.coordinate) }
+            .prefix(maxCells))
+    }
+
+    /// Wipe arrows as soon as the forecast location changes (before the next poll returns).
+    public static func cellsAfterLocationChange(previous: Coordinate?, new: Coordinate,
+                                                cells: [StormCell]) -> [StormCell] {
+        previous == new ? cells : []
+    }
+
+    /// Screen-space tip offset for an arrow of `length` pt in `directionDegrees` (0 = north).
+    /// Overlay NSViews here grow **up** (same as MapKit convert into them), so north is +y and a
+    /// NE-moving cell (45°) must land in the upper-right quadrant — matching its "moving NE" label.
+    public static func arrowTipOffset(directionDegrees: Double, length: Double) -> (dx: Double, dy: Double) {
+        let rad = directionDegrees * .pi / 180
+        return (sin(rad) * length, cos(rad) * length)
+    }
+
+    /// Arrow colour by intensity (max dBZ): yellow → orange → red.
+    public static func arrowColorRGB(maxDBZ: Int) -> (r: Double, g: Double, b: Double) {
+        switch maxDBZ {
+        case ..<50: return (1.0, 0.85, 0.2)
+        case ..<55: return (1.0, 0.55, 0.1)
+        default: return (1.0, 0.25, 0.15)
+        }
     }
 
     /// Prefer the stronger (higher max dBZ) cell when two are within `dedupeKm`.
@@ -144,13 +172,13 @@ public enum StormMotion {
         return max(1, Int((t / 60).rounded()))
     }
 
-    /// Short callout: motion line, plus "~20 min" when ETA applies.
+    /// Short callout: motion line, plus "near you in ~20 min" when ETA applies.
     public static func callout(cell: StormCell, location: Coordinate,
                                speedUnit: SpeedUnit = .mph) -> String {
         let motion = motionLabel(directionDegrees: cell.directionDegrees,
                                  speedKnots: cell.speedKnots, speedUnit: speedUnit)
         if let eta = etaMinutes(cell: cell, to: location) {
-            return "\(motion) · ~\(eta) min"
+            return "\(motion) · near you in ~\(eta) min"
         }
         return motion
     }

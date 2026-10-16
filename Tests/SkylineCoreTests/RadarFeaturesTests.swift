@@ -137,13 +137,54 @@ final class RadarFeaturesTests: XCTestCase {
         let eta = StormMotion.etaMinutes(cell: toward, to: loc)
         XCTAssertNotNil(eta)
         XCTAssertGreaterThan(eta ?? 0, 0)
-        XCTAssertTrue(StormMotion.callout(cell: toward, location: loc).contains("~"))
+        XCTAssertTrue(StormMotion.callout(cell: toward, location: loc).contains("near you in ~"))
         // Cell due east moving further east — path never near the location.
         let away = StormCell(id: "a", radar: "OKX", stormID: "A",
                              coordinate: Coordinate(latitude: 40.0, longitude: -74.0),
                              maxDBZ: 55, directionDegrees: 90, speedKnots: 30, valid: Date())
         XCTAssertNil(StormMotion.etaMinutes(cell: away, to: loc))
-        XCTAssertFalse(StormMotion.callout(cell: away, location: loc).contains("~"))
+        XCTAssertFalse(StormMotion.callout(cell: away, location: loc).contains("near you"))
+    }
+
+    /// Fix 1: NE-moving storms draw into the upper-right (+x, +y) so the arrow matches "moving NE".
+    func testStormArrowTipOffsetMatchesCompassLabel() {
+        let ne = StormMotion.arrowTipOffset(directionDegrees: 45, length: 10)
+        XCTAssertGreaterThan(ne.dx, 0, "NE must point east (+x)")
+        XCTAssertGreaterThan(ne.dy, 0, "NE must point north (+y) in the overlay's y-up space")
+        let n = StormMotion.arrowTipOffset(directionDegrees: 0, length: 10)
+        XCTAssertEqual(n.dx, 0, accuracy: 1e-9)
+        XCTAssertEqual(n.dy, 10, accuracy: 1e-9)
+        let s = StormMotion.arrowTipOffset(directionDegrees: 180, length: 10)
+        XCTAssertEqual(s.dx, 0, accuracy: 1e-9)
+        XCTAssertEqual(s.dy, -10, accuracy: 1e-9)
+        let e = StormMotion.arrowTipOffset(directionDegrees: 90, length: 10)
+        XCTAssertEqual(e.dx, 10, accuracy: 1e-9)
+        XCTAssertEqual(e.dy, 0, accuracy: 1e-9)
+        XCTAssertEqual(Compass.abbreviation(45), "NE")
+    }
+
+    /// Fix 3: changing the forecast location clears storm cells immediately.
+    func testStormCellsClearImmediatelyOnLocationChange() {
+        let nyc = Coordinate(latitude: 40.71, longitude: -74.01)
+        let bos = Coordinate(latitude: 42.36, longitude: -71.06)
+        let cell = StormCell(id: "c", radar: "OKX", stormID: "A1", coordinate: nyc,
+                             maxDBZ: 55, directionDegrees: 45, speedKnots: 20, valid: Date())
+        XCTAssertTrue(StormMotion.cellsAfterLocationChange(previous: nyc, new: bos, cells: [cell]).isEmpty)
+        XCTAssertEqual(StormMotion.cellsAfterLocationChange(previous: nyc, new: nyc, cells: [cell]), [cell])
+        XCTAssertTrue(StormMotion.cellsAfterLocationChange(previous: nil, new: nyc, cells: [cell]).isEmpty)
+    }
+
+    func testStormMotionKeepsAtMostThreeNearest() {
+        let near = Coordinate(latitude: 40.0, longitude: -75.0)
+        var cells: [StormCell] = []
+        for i in 0..<5 {
+            cells.append(StormCell(id: "c\(i)", radar: "OKX", stormID: "S\(i)",
+                                   coordinate: Coordinate(latitude: 40.0 + Double(i) * 0.2, longitude: -75.0),
+                                   maxDBZ: 50, directionDegrees: 90, speedKnots: 20, valid: Date()))
+        }
+        let kept = StormMotion.relevant(cells, near: near)
+        XCTAssertEqual(kept.count, 3)
+        XCTAssertEqual(kept.map(\.stormID), ["S0", "S1", "S2"])
     }
 
     // MARK: Feature 5 — playback speed
@@ -153,6 +194,7 @@ final class RadarFeaturesTests: XCTestCase {
         XCTAssertEqual(RadarPlaybackSpeed.two.frameMilliseconds(baseMs: 550), 275, accuracy: 0.01)
         XCTAssertEqual(RadarPlaybackSpeed.four.frameMilliseconds(baseMs: 550), 137.5, accuracy: 0.01)
         XCTAssertEqual(RadarPlaybackSpeed.half.frameMilliseconds(baseMs: 550), 1100, accuracy: 0.01)
+        XCTAssertEqual(RadarPlaybackSpeed.two.holdMilliseconds(baseMs: 1600), 800, accuracy: 0.01)
         XCTAssertEqual(RadarPlaybackSpeed.allCases.map(\.label), ["½×", "1×", "2×", "4×"])
     }
 }
