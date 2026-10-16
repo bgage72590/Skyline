@@ -24,6 +24,12 @@ public enum MenuSummary {
                           : "No rain expected in the next 12 hours"
     }
 
+    /// Radar-header "Forecast" line: the exact same string as the menu bar. Never derived from HRRR tiles.
+    public static func radarForecastLine(_ report: WeatherReport?, now: Date, hourLabel: (Date) -> String) -> String? {
+        guard let report else { return nil }
+        return rainTiming(report, now: now, hourLabel: hourLabel)
+    }
+
     /// The next sunrise or sunset after `now` (today's or tomorrow's).
     public static func nextSunEvent(_ report: WeatherReport, now: Date) -> (isSunrise: Bool, time: Date)? {
         let events = report.daily.prefix(3).flatMap { d -> [(Bool, Date)] in

@@ -106,6 +106,16 @@ struct ExpandedRadarView: View {
                         Text(location.isCurrentLocation ? "My Location" : location.name).font(.headline)
                         Text(alerts.isEmpty ? "Precipitation" : "Precipitation · \(alerts.count) alert\(alerts.count == 1 ? "" : "s") outlined")
                             .font(.caption).foregroundStyle(Glass.secondaryText)
+                        // Same rain-timing string as the menu bar (MenuSummary / nowcast) — not from HRRR tiles.
+                        if let forecast = MenuSummary.radarForecastLine(
+                            store.reports[location.id], now: Date(),
+                            hourLabel: { Fmt.hour($0, location.timeZone) }) {
+                            Text("Forecast · \(forecast)")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Glass.secondaryText)
+                                .accessibilityLabel("Forecast")
+                                .accessibilityValue(forecast)
+                        }
                     }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
