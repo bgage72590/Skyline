@@ -41,6 +41,10 @@ struct RadarMapView: NSViewRepresentable {
     var onAlertSelect: ((String) -> Void)? = nil
     /// Bumped to ask the map to re-centre on `center` (the "center on me" button).
     var recenterToken: Int = 0
+    /// Storm-motion arrows (empty when the radar is hidden or outside CONUS).
+    var stormCells: [StormCell] = []
+    /// Speed unit for storm callouts (mph by default).
+    var stormSpeedUnit: SpeedUnit = .mph
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -75,6 +79,9 @@ struct RadarMapView: NSViewRepresentable {
         container.alertOverlay.onSelect = interactive ? onAlertSelect : nil
         container.alertOverlay.setAlerts(alerts.map { AlertOverlayView.Shape(alert: $0) }, focused: focusedAlertID)
         container.rangeRings.setCenter(center)
+        if interactive {
+            container.stormOverlay.setCells(stormCells, location: center, speedUnit: stormSpeedUnit)
+        }
         if focusedAlertID != c.lastFocusedAlertID {
             c.lastFocusedAlertID = focusedAlertID
             if let id = focusedAlertID, let alert = alerts.first(where: { $0.id == id }), !alert.polygons.isEmpty {
@@ -202,6 +209,7 @@ final class RadarMapContainer: NSView {
     let map = MKMapView()
     let radar = RadarLayerView()
     let rangeRings = RangeRingsOverlay()
+    let stormOverlay = StormMotionOverlay()
     let alertOverlay = AlertOverlayView()
     let pin = PinView()
     var pinCoordinate: CLLocationCoordinate2D?
@@ -234,12 +242,15 @@ final class RadarMapContainer: NSView {
         addSubview(map)
         addSubview(radar) // invisible tile manager; the radar itself is drawn by MapKit
         addSubview(rangeRings)
+        addSubview(stormOverlay)
         addSubview(alertOverlay)
         addSubview(pin)
         radar.map = map
         rangeRings.map = map
+        stormOverlay.map = map
         alertOverlay.map = map
         rangeRings.isHidden = !interactive
+        stormOverlay.isHidden = !interactive
     }
 
     @available(*, unavailable)
@@ -279,9 +290,11 @@ final class RadarMapContainer: NSView {
         radar.frame = bounds
         if resized { radar.sizeDidChange() }
         rangeRings.frame = bounds
+        stormOverlay.frame = bounds
         alertOverlay.frame = bounds
         radar.updateTiles(allowZoomChange: true)
         rangeRings.relayout()
+        stormOverlay.relayout()
         alertOverlay.relayout()
         layoutPin()
     }
@@ -289,6 +302,7 @@ final class RadarMapContainer: NSView {
     func regionChanged(settled: Bool) {
         if settled { radar.updateTiles(allowZoomChange: true) } else { radar.gestureMoved() }
         rangeRings.relayout()
+        stormOverlay.relayout()
         alertOverlay.relayout()
         layoutPin()
     }
@@ -487,6 +501,105 @@ final class RangeRingsOverlay: NSView {
                 labels[i].string = "\(Int(miles)) mi"
                 labels[i].frame = CGRect(x: p.x + 4, y: p.y - 6, width: 40, height: 14)
             }
+        }
+        CATransaction.commit()
+    }
+}
+
+/// Storm-motion arrows: tip at the cell, shaft along DRCT, label "moving NE at 25 mph" (± ETA).
+/// Never claims hits (pass-through to the map / alert polygons).
+final class StormMotionOverlay: NSView {
+    weak var map: MKMapView?
+    private var cells: [StormCell] = []
+    private var location: Coordinate?
+    private var speedUnit: SpeedUnit = .mph
+    private var arrows: [String: (shaft: CAShapeLayer, head: CAShapeLayer, label: CATextLayer)] = [:]
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func setCells(_ new: [StormCell], location loc: Coordinate, speedUnit unit: SpeedUnit) {
+        guard new != cells || loc != location || unit != speedUnit else { return }
+        cells = new
+        location = loc
+        speedUnit = unit
+        let ids = Set(new.map(\.id))
+        for (id, layers) in arrows where !ids.contains(id) {
+            layers.shaft.removeFromSuperlayer()
+            layers.head.removeFromSuperlayer()
+            layers.label.removeFromSuperlayer()
+            arrows[id] = nil
+        }
+        for cell in new where arrows[cell.id] == nil {
+            let shaft = CAShapeLayer()
+            shaft.fillColor = nil
+            shaft.strokeColor = NSColor.white.withAlphaComponent(0.9).cgColor
+            shaft.lineWidth = 2
+            shaft.lineCap = .round
+            shaft.actions = ["path": NSNull()]
+            let head = CAShapeLayer()
+            head.fillColor = NSColor.white.withAlphaComponent(0.95).cgColor
+            head.strokeColor = nil
+            head.actions = ["path": NSNull()]
+            let label = CATextLayer()
+            label.fontSize = 11
+            label.foregroundColor = NSColor.white.cgColor
+            label.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
+            label.cornerRadius = 4
+            label.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+            label.actions = ["position": NSNull(), "string": NSNull()]
+            layer?.addSublayer(shaft)
+            layer?.addSublayer(head)
+            layer?.addSublayer(label)
+            arrows[cell.id] = (shaft, head, label)
+        }
+        relayout()
+    }
+
+    func relayout() {
+        guard let map, let location, bounds.width > 0 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for cell in cells {
+            guard let layers = arrows[cell.id] else { continue }
+            let origin = map.convert(CLLocationCoordinate2D(latitude: cell.coordinate.latitude,
+                                                            longitude: cell.coordinate.longitude),
+                                     toPointTo: self)
+            // Arrow length scales gently with speed (12–36 pt) so slow cells stay readable.
+            let len = CGFloat(min(36, max(14, cell.speedKnots)))
+            let rad = cell.directionDegrees * .pi / 180
+            // Screen y grows upward in this NSView; geographic north is +latitude = +y after convert...
+            // MapKit convert: higher latitude → higher y in view coords on an unrotated map? Actually on
+            // macOS MKMapView, y increases downward. So north is −y.
+            let tip = CGPoint(x: origin.x + CGFloat(sin(rad)) * len,
+                              y: origin.y - CGFloat(cos(rad)) * len)
+            let shaft = CGMutablePath()
+            shaft.move(to: origin)
+            shaft.addLine(to: tip)
+            layers.shaft.frame = bounds
+            layers.shaft.path = shaft
+            // Arrowhead.
+            let headLen: CGFloat = 8
+            let left = CGPoint(x: tip.x - CGFloat(sin(rad - 0.4)) * headLen,
+                               y: tip.y + CGFloat(cos(rad - 0.4)) * headLen)
+            let right = CGPoint(x: tip.x - CGFloat(sin(rad + 0.4)) * headLen,
+                                y: tip.y + CGFloat(cos(rad + 0.4)) * headLen)
+            let head = CGMutablePath()
+            head.move(to: tip); head.addLine(to: left); head.addLine(to: right); head.closeSubpath()
+            layers.head.frame = bounds
+            layers.head.path = head
+            let text = StormMotion.callout(cell: cell, location: location, speedUnit: speedUnit)
+            layers.label.string = "  \(text)  "
+            let width = (text as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11)]).width + 12
+            layers.label.frame = CGRect(x: tip.x + 6, y: tip.y - 8, width: width, height: 18)
         }
         CATransaction.commit()
     }

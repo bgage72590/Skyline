@@ -100,4 +100,49 @@ final class RadarFeaturesTests: XCTestCase {
         XCTAssertEqual(ring.first, ring.last)
         XCTAssertEqual(ring.count, 73)
     }
+
+    // MARK: Feature 4 — storm motion
+
+    func testStormMotionParseFilterDedupeAndLabel() throws {
+        let json = """
+        {"type":"FeatureCollection","features":[
+          {"type":"Feature","properties":{"nexrad":"OKX","storm_id":"A1","max_dbz":55,"drct":45,"sknt":22,"valid":"2026-10-15T12:00:00Z"},
+           "geometry":{"type":"Point","coordinates":[-73.9,40.8]}},
+          {"type":"Feature","properties":{"nexrad":"DIX","storm_id":"B2","max_dbz":52,"drct":44,"sknt":20,"valid":"2026-10-15T12:00:00Z"},
+           "geometry":{"type":"Point","coordinates":[-73.91,40.81]}},
+          {"type":"Feature","properties":{"nexrad":"OKX","storm_id":"C3","max_dbz":40,"drct":90,"sknt":30,"valid":"2026-10-15T12:00:00Z"},
+           "geometry":{"type":"Point","coordinates":[-74.0,40.7]}},
+          {"type":"Feature","properties":{"nexrad":"OKX","storm_id":"D4","max_dbz":50,"drct":0,"sknt":2,"valid":"2026-10-15T12:00:00Z"},
+           "geometry":{"type":"Point","coordinates":[-74.1,40.75]}},
+          {"type":"Feature","properties":{"nexrad":"TLX","storm_id":"E5","max_dbz":60,"drct":180,"sknt":25,"valid":"2026-10-15T12:00:00Z"},
+           "geometry":{"type":"Point","coordinates":[-97.5,35.4]}}
+        ]}
+        """
+        let all = try StormMotion.parse(Data(json.utf8))
+        XCTAssertEqual(all.count, 5)
+        let near = Coordinate(latitude: 40.71, longitude: -74.01)
+        let kept = StormMotion.relevant(all, near: near)
+        // Weak (40 dBZ), erratic (2 kt), and Oklahoma cell are dropped; OKX+DIX dedupe to one.
+        XCTAssertEqual(kept.count, 1)
+        XCTAssertEqual(kept[0].stormID, "A1")
+        XCTAssertEqual(StormMotion.motionLabel(directionDegrees: 45, speedKnots: 22), "moving NE at 25 mph")
+    }
+
+    func testStormMotionETAOnlyWhenPathPassesClose() {
+        let loc = Coordinate(latitude: 40.0, longitude: -75.0)
+        // Cell due south, moving north toward the location — will pass close.
+        let toward = StormCell(id: "t", radar: "OKX", stormID: "T",
+                               coordinate: Coordinate(latitude: 39.5, longitude: -75.0),
+                               maxDBZ: 55, directionDegrees: 0, speedKnots: 30, valid: Date())
+        let eta = StormMotion.etaMinutes(cell: toward, to: loc)
+        XCTAssertNotNil(eta)
+        XCTAssertGreaterThan(eta ?? 0, 0)
+        XCTAssertTrue(StormMotion.callout(cell: toward, location: loc).contains("~"))
+        // Cell due east moving further east — path never near the location.
+        let away = StormCell(id: "a", radar: "OKX", stormID: "A",
+                             coordinate: Coordinate(latitude: 40.0, longitude: -74.0),
+                             maxDBZ: 55, directionDegrees: 90, speedKnots: 30, valid: Date())
+        XCTAssertNil(StormMotion.etaMinutes(cell: away, to: loc))
+        XCTAssertFalse(StormMotion.callout(cell: away, location: loc).contains("~"))
+    }
 }

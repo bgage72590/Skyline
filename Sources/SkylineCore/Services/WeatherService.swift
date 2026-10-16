@@ -22,6 +22,8 @@ public actor WeatherService {
         /// SPC updates its outlooks a handful of times a day; one file serves every US city.
         public static let spcOutlook: TimeInterval = 30 * 60
         public static let hrrrRun: TimeInterval = 10 * 60
+        /// Storm-attribute GeoJSON (~2 min poll while radar is visible).
+        public static let stormAttr: TimeInterval = 2 * 60
     }
 
     /// The oldest cached copy that may stand in when the network fails ("offline fallback").
@@ -133,6 +135,14 @@ public actor WeatherService {
                   let initTime = try? IEMHRRR.initTime(run) else { return past }
             return past + IEMHRRR.frames(initTime: initTime, after: latest)
         }
+    }
+
+    /// Latest NEXRAD storm attributes near `location` (strong moving cells only). Cheap GeoJSON; nil on failure.
+    public func stormCells(near location: Coordinate, forceRefresh: Bool = false) async -> [StormCell] {
+        guard let data = await optionalFetch(Endpoints.iemNexradAttr, ttl: TTL.stormAttr, force: forceRefresh,
+                                             maxStale: 10 * 60),
+              let all = try? StormMotion.parse(data) else { return [] }
+        return StormMotion.relevant(all, near: location)
     }
 
     // MARK: Assembly

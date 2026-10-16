@@ -167,7 +167,9 @@ struct ExpandedRadarView: View {
                                  selectedAlert = alert
                              }
                          },
-                         recenterToken: recenterToken)
+                         recenterToken: recenterToken,
+                         stormCells: radar.stormCells,
+                         stormSpeedUnit: store.units.speed)
                 .padding(.horizontal, -mapOverscan)
         }
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))

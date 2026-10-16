@@ -85,4 +85,6 @@ public enum Endpoints {
 
     public static let rainViewerMaps = URL(string: "https://api.rainviewer.com/public/weather-maps.json")!
     public static let iemLatest = URL(string: "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.json")!
+    /// Latest NEXRAD storm attributes (GeoJSON) for storm-motion arrows.
+    public static let iemNexradAttr = URL(string: "https://mesonet.agron.iastate.edu/geojson/nexrad_attr.py")!
 }

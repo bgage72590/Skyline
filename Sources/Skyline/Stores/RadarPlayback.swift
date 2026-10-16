@@ -45,11 +45,13 @@ final class RadarPlayback {
     var isPlaying = false { didSet { updateHoldsLoop(); updateClock() } }
     var isVisible = false {
         didSet {
-            updateHoldsLoop(); updateClock()
+            updateHoldsLoop(); updateClock(); updateStormPoll()
             // Tile retries pause while the window is hidden; catch up once it's back (next main-queue turn).
             if isVisible && !oldValue { RadarImageCache.shared.requestRetryWhenVisible() }
         }
     }
+    /// Strong nearby storm cells for motion arrows (polled only while the radar is visible).
+    private(set) var stormCells: [StormCell] = []
     /// True while the user drags the radar scrubber (frames are loaded for scrubbing).
     var isScrubbingRadar = false { didSet { if isScrubbingRadar != oldValue { updateHoldsLoop() } } }
     /// Whether map views hold every frame of the loop. Only while playing (or queued to play), scrubbing,
@@ -74,6 +76,8 @@ final class RadarPlayback {
     @ObservationIgnored private let service: WeatherService
     /// The play clock. A TaskSlot so a clock task that resumes after being replaced can't orphan its successor.
     @ObservationIgnored private let clock = TaskSlot()
+    /// Storm-attribute poll (~2 min) — only while `isVisible` and in CONUS.
+    @ObservationIgnored private let stormPoll = TaskSlot()
     @ObservationIgnored private var loadedAt: Date?
     @ObservationIgnored private var generation = RequestGeneration()
 
@@ -103,6 +107,7 @@ final class RadarPlayback {
     func configure(for location: WeatherLocation, load: Bool = true) {
         inCONUS = location.isInCONUS
         coordinate = location.coordinate
+        updateStormPoll()
         let newStation = siteChoice.resolvedStation(for: location.coordinate, inCONUS: inCONUS)
         if newStation != station {
             station = newStation
@@ -317,7 +322,7 @@ final class RadarPlayback {
                 guard let self else { return }
                 let atLatest = self.index >= self.frames.count - 1
                 let atNow = self.hasForecastFrames && self.index == self.nowIndex
-                try? await Task.sleep(for: atLatest ? Self.holdOnLatest : (atNow ? Self.holdOnNow : Self.frameInterval))
+                try? await Task.sleep(for: atLatest ? Self.holdOnLatest : (atNow ? Self.holdOnNow : self.frameInterval))
                 if Task.isCancelled || !self.clock.owns(token) { return }
                 if atLatest, let loadedAt = self.loadedAt, Date().timeIntervalSince(loadedAt) > Self.indexMaxAge {
                     // New scans: the map keeps showing the old frames until the new ones are prefetched.
@@ -330,4 +335,33 @@ final class RadarPlayback {
             }
         }
     }
+
+    /// Poll IEM storm attributes ~every 2 min only while the radar is on screen (CONUS).
+    private func updateStormPoll() {
+        let should = isVisible && inCONUS && coordinate != nil
+        if should == stormPoll.isOccupied {
+            if !should, !stormCells.isEmpty { stormCells = [] }
+            return
+        }
+        stormPoll.cancel()
+        if !should {
+            if !stormCells.isEmpty { stormCells = [] }
+            return
+        }
+        stormPoll.start { [weak self] token in
+            while !Task.isCancelled {
+                guard let self, self.stormPoll.owns(token), let c = self.coordinate else { return }
+                let cells = await self.service.stormCells(near: c)
+                if Task.isCancelled || !self.stormPoll.owns(token) { return }
+                if cells != self.stormCells { self.stormCells = cells }
+                try? await Task.sleep(for: .seconds(StormMotion.pollInterval))
+                if Task.isCancelled || !self.stormPoll.owns(token) { return }
+            }
+        }
+    }
+
+    // MARK: Playback speed (feature 5 hooks live here too when added)
+
+    /// Effective frame interval (respects playback speed once feature 5 lands).
+    private var frameInterval: Duration { Self.frameInterval }
 }
