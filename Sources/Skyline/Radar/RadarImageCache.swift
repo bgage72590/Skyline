@@ -46,6 +46,8 @@ final class RadarImageCache {
     /// once their back-off is over, replacing them with the masked tile.
     private var provisional: Set<String> = []
     func isProvisional(_ url: URL) -> Bool { provisional.contains(url.absoluteString) }
+    /// Provisional tiles that used up their retries; cleared by `retryFailedNow`.
+    private var gaveUp: Set<String> = []
     /// The last unmasked copy of a provisional tile, for views that ask during its back-off. Not in
     /// `images`, so it is never mistaken for the final (masked) tile.
     private let provisionalImages = NSCache<NSString, RadarTile>()
@@ -103,6 +105,7 @@ final class RadarImageCache {
     func retryFailedNow() {
         transient.removeAll()
         failures.removeAll()
+        gaveUp.removeAll()
         NotificationCenter.default.post(name: Self.retryNotification, object: nil)
     }
 
@@ -193,6 +196,7 @@ final class RadarImageCache {
         let key = url.absoluteString
         let now = Date()
         if let at = failures[key], now.timeIntervalSince(at) < Self.missingTTL { return true }
+        if gaveUp.contains(key) { return true }
         if let t = transient[key], now.timeIntervalSince(t.at) < Self.backoff(attempts: t.attempts) { return true }
         return false
     }
@@ -252,6 +256,7 @@ final class RadarImageCache {
                 failures[key] = nil
                 transient[key] = nil
                 provisional.remove(key)
+                gaveUp.remove(key)
                 provisionalImages.removeObject(forKey: key as NSString)
             case .provisional(let unmasked):
                 image = unmasked
@@ -259,7 +264,11 @@ final class RadarImageCache {
                 provisionalImages.setObject(unmasked, forKey: key as NSString, cost: unmasked.heldBytes)
                 let attempts = (transient[key]?.attempts ?? 0) + 1
                 transient[key] = (Date(), attempts)
-                scheduleRetryTick(after: Self.backoff(attempts: attempts))
+                if RadarProvisionalRetry.shouldRetry(attempts: attempts) {
+                    scheduleRetryTick(after: Self.backoff(attempts: attempts))
+                } else {
+                    gaveUp.insert(key)
+                }
             case .missing:
                 failures[key] = Date()
             case .transientFailure:

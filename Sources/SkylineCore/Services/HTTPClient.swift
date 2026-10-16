@@ -61,17 +61,26 @@ public enum UserFacingError {
     }
 
     /// "Open-Meteo busy, retrying at 3:05 PM" — local clock time, not a duration.
-    public static func busyLine(host: String, until: Date, timeZone: TimeZone = .current) -> String {
+    /// The retry fires `retrySlack` after `until` at the latest (a 2 s margin plus the sleep's 10 s
+    /// tolerance), and the time shown is rounded up, so the banner never names a minute before the retry.
+    public static let retrySlack: TimeInterval = 12
+
+    public static func busyLine(host: String, until: Date, timeZone: TimeZone = .current, locale: Locale = .autoupdatingCurrent) -> String {
         let who = host == "api.open-meteo.com" ? "Open-Meteo" : "Weather service"
-        return "\(who) busy, retrying at \(clockTime(until, timeZone: timeZone))"
+        return "\(who) busy, retrying at \(clockTime(until.addingTimeInterval(retrySlack), timeZone: timeZone, locale: locale, roundUp: true))"
     }
 
-    public static func clockTime(_ date: Date, timeZone: TimeZone = .current) -> String {
+    /// Hours and minutes in the user's own 12/24-hour style (the "j" template follows the locale and the
+    /// system's 24-hour setting). `roundUp` moves any partial minute to the next one.
+    public static func clockTime(_ date: Date, timeZone: TimeZone = .current, locale: Locale = .autoupdatingCurrent,
+                                 roundUp: Bool = false) -> String {
         let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
+        f.locale = locale
         f.timeZone = timeZone
-        f.dateFormat = "h:mm a"
-        return f.string(from: date)
+        f.dateFormat = DateFormatter.dateFormat(fromTemplate: "jmm", options: 0, locale: locale) ?? "h:mm a"
+        let shown = roundUp ? Date(timeIntervalSince1970: (date.timeIntervalSince1970 / 60).rounded(.up) * 60) : date
+        // Newer ICU puts a narrow no-break space before AM/PM; keep plain spaces in banner text.
+        return f.string(from: shown).replacingOccurrences(of: "\u{202F}", with: " ")
     }
 
     private static func wait(_ seconds: TimeInterval?) -> String {

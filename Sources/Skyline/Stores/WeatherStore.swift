@@ -371,6 +371,8 @@ final class WeatherStore {
             if !report.isOfflineFallback { considerNotifications(report, for: location) }
             await refreshAccuracy(for: location)
         } catch is CancellationError {
+            // Deferred #5 note: a cancelled load must not leave "Updating…" up unless a retry is pending.
+            if retryTasks[location.id] == nil { quietRetries.abandoned(location.id) }
         } catch {
             // Force during a long back-off throws `backingOff` immediately (no multi-minute sleep, so
             // `loadingIDs` clears and Refresh stays usable). The banner keeps the saved report.
@@ -394,7 +396,7 @@ final class WeatherStore {
     /// Item 2: schedules a quiet quick retry when the policy allows; false = show the error as before.
     private func followUpQuietly(_ location: WeatherLocation, error: Error, backoffUntil: Date?) -> Bool {
         let id = location.id
-        let decision = quietRetries.failed(id, error: error, attempt: retryAttempts[id, default: 0],
+        let decision = quietRetries.failed(id, error: error,
                                            hasReport: reports[id] != nil, backoffUntil: backoffUntil,
                                            refreshInterval: Double(refreshMinutes) * 60)
         guard decision.quiet else { return false }

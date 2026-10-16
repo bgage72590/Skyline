@@ -170,7 +170,7 @@ final class Batch2Tests: XCTestCase {
         let tz = TimeZone(secondsFromGMT: -5 * 3600)!
         XCTAssertEqual(UserFacingError.message(HTTPError.backingOff(host: "api.open-meteo.com", until: until),
                                                 now: Date(timeIntervalSince1970: 1_800_000_000), timeZone: tz),
-                       "Open-Meteo busy, retrying at 3:03 AM")
+                       "Open-Meteo busy, retrying at 3:04 AM")
     }
 
     /// The store seam: a back-off fallback remembers `notBefore` and the banner copy; a later success
@@ -186,9 +186,9 @@ final class Batch2Tests: XCTestCase {
         errors[id] = saved.message
         XCTAssertEqual(saved.notBefore, until)
         XCTAssertFalse(saved.clearError)
-        XCTAssertEqual(saved.message, "Open-Meteo busy, retrying at 3:03 AM")
+        XCTAssertEqual(saved.message, "Open-Meteo busy, retrying at 3:04 AM")
         XCTAssertEqual(RefreshBookkeeping.bannerLine(offline: true, error: errors[id], dataTime: "2:10 PM"),
-                       "Open-Meteo busy, retrying at 3:03 AM")
+                       "Open-Meteo busy, retrying at 3:04 AM")
         XCTAssertTrue(RefreshBookkeeping.isOffline(isOfflineFallback: isOfflineFallback, error: errors[id]))
 
         let thrown = RefreshBookkeeping.afterFailure(

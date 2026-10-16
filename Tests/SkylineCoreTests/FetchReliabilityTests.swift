@@ -63,14 +63,14 @@ final class FetchReliabilityTests: XCTestCase {
     }
 
     func waitForQueue(_ s: WeatherService, depth: Int) async throws {
-        for _ in 0..<500 {
+        for _ in 0..<20_000 {
             if await s.openMeteoQueueDepth() >= depth { return }
-            try await Task.sleep(for: .milliseconds(5))
+            await Task.yield()
         }
         XCTFail("queue never reached \(depth)")
     }
     func waitForFirstGet(_ c: GatedClient) async throws {
-        for _ in 0..<500 where c.order.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+        for _ in 0..<20_000 where c.order.isEmpty { await Task.yield() }
     }
 
     func testNewCityJumpsTheQueuedRefreshes() async throws {
@@ -101,8 +101,10 @@ final class FetchReliabilityTests: XCTestCase {
         try await waitForQueue(s, depth: 2)
         var joiner = city(41.0); joiner.id = "just-added"       // same URL, new city
         async let j = s.report(for: joiner, priority: .interactive)
-        for _ in 0..<50 { await Task.yield() }
-        try await Task.sleep(for: .milliseconds(30))            // let the join register (no new queue slot)
+        // Wait until the join has registered (a counter, not a fixed sleep).
+        for _ in 0..<20_000 { if await s.joinedGetCount() > 0 { break }; await Task.yield() }
+        let joined = await s.joinedGetCount()
+        XCTAssertEqual(joined, 1)
         let depth = await s.openMeteoQueueDepth()
         XCTAssertEqual(depth, 2, "joined, not queued again")
         await client.gate.release()
@@ -229,7 +231,7 @@ final class FetchReliabilityTests: XCTestCase {
 
     func testOfflineShowsPromptlyEvenWithoutData() {
         var t = QuietRetryTracker()
-        let d = t.failed("a", error: URLError(.notConnectedToInternet), attempt: 0, hasReport: false, backoffUntil: nil,
+        let d = t.failed("a", error: URLError(.notConnectedToInternet), hasReport: false, backoffUntil: nil,
                          refreshInterval: 900)
         XCTAssertFalse(d.quiet, "M2: a real offline is never quiet")
         XCTAssertFalse(t.updating.contains("a"))
@@ -237,22 +239,22 @@ final class FetchReliabilityTests: XCTestCase {
 
     func testUpdatingClearsOnSuccessFailureAndAbandon() {
         var t = QuietRetryTracker()
-        _ = t.failed("a", error: URLError(.timedOut), attempt: 0, hasReport: false, backoffUntil: nil, refreshInterval: 900)
+        _ = t.failed("a", error: URLError(.timedOut), hasReport: false, backoffUntil: nil, refreshInterval: 900)
         XCTAssertTrue(t.updating.contains("a"))
         t.succeeded("a")
         XCTAssertFalse(t.updating.contains("a"), "success clears")
         XCTAssertNil(t.quietAttempts["a"])
 
         for n in 0..<3 {
-            let d = t.failed("b", error: URLError(.timedOut), attempt: n, hasReport: false, backoffUntil: nil, refreshInterval: 900)
+            let d = t.failed("b", error: URLError(.timedOut), hasReport: false, backoffUntil: nil, refreshInterval: 900)
             XCTAssertTrue(d.quiet)
         }
-        let last = t.failed("b", error: URLError(.timedOut), attempt: 3, hasReport: false, backoffUntil: nil, refreshInterval: 900)
+        let last = t.failed("b", error: URLError(.timedOut), hasReport: false, backoffUntil: nil, refreshInterval: 900)
         XCTAssertFalse(last.quiet)
         XCTAssertFalse(t.updating.contains("b"), "quick retries used up: banner, not Updating…")
         XCTAssertEqual(t.ladderIndex("b", attempt: 3), 0, "the slow ladder starts at 1 min")
 
-        _ = t.failed("c", error: URLError(.timedOut), attempt: 0, hasReport: false, backoffUntil: nil, refreshInterval: 900)
+        _ = t.failed("c", error: URLError(.timedOut), hasReport: false, backoffUntil: nil, refreshInterval: 900)
         t.abandoned("c")
         XCTAssertFalse(t.updating.contains("c"), "My Location moved / retry not run: cleared")
     }

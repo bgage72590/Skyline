@@ -118,6 +118,8 @@ final class RadarPlayback {
         let next = location.coordinate
         stormCells = StormMotion.cellsAfterLocationChange(previous: coordinate, new: next, cells: stormCells)
         coordinate = next
+        let nearest = inCONUS ? NexradStation.nearest(to: next) : nil
+        if nearest != nearestStation { nearestStation = nearest }
         updateStormPoll()
         let newStation = siteChoice.resolvedStation(for: location.coordinate, inCONUS: inCONUS)
         if newStation != station {
@@ -187,11 +189,10 @@ final class RadarPlayback {
         Task { await loadFrames(force: true) }
     }
 
-    /// The nearest site for the current place (shown next to "Nearest" in the picker).
-    var nearestStation: NexradStation? {
-        guard inCONUS, let coordinate else { return nil }
-        return NexradStation.nearest(to: coordinate)
-    }
+    /// The nearest site for the current place (shown next to "Nearest" in the picker). Stored and
+    /// observed: it used to be computed from an unobserved coordinate, so with a picked site (station
+    /// unchanged) the label kept the previous city's site (KOTX while Fairfield was selected).
+    private(set) var nearestStation: NexradStation?
 
     func setRange(_ r: RadarRange) {
         guard r != range else { return }
