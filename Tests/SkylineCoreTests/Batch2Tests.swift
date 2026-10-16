@@ -169,7 +169,8 @@ final class Batch2Tests: XCTestCase {
         let until = Date(timeIntervalSince1970: 1_800_000_180)
         let tz = TimeZone(secondsFromGMT: -5 * 3600)!
         XCTAssertEqual(UserFacingError.message(HTTPError.backingOff(host: "api.open-meteo.com", until: until),
-                                                now: Date(timeIntervalSince1970: 1_800_000_000), timeZone: tz),
+                                                now: Date(timeIntervalSince1970: 1_800_000_000), timeZone: tz,
+                                                locale: Locale(identifier: "en_US")),
                        "Open-Meteo busy, retrying at 3:04 AM")
     }
 
@@ -182,7 +183,8 @@ final class Batch2Tests: XCTestCase {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let until = now.addingTimeInterval(180)
         let tz = TimeZone(secondsFromGMT: -5 * 3600)!
-        let saved = RefreshBookkeeping.afterReport(isOfflineFallback: true, backoffUntil: until, now: now, timeZone: tz)
+        let saved = RefreshBookkeeping.afterReport(isOfflineFallback: true, backoffUntil: until, now: now, timeZone: tz,
+                                                   locale: Locale(identifier: "en_US")) // pinned: 12-hour wording
         errors[id] = saved.message
         XCTAssertEqual(saved.notBefore, until)
         XCTAssertFalse(saved.clearError)
@@ -192,7 +194,8 @@ final class Batch2Tests: XCTestCase {
         XCTAssertTrue(RefreshBookkeeping.isOffline(isOfflineFallback: isOfflineFallback, error: errors[id]))
 
         let thrown = RefreshBookkeeping.afterFailure(
-            HTTPError.backingOff(host: RefreshBookkeeping.openMeteoHost, until: until), now: now, timeZone: tz)
+            HTTPError.backingOff(host: RefreshBookkeeping.openMeteoHost, until: until), now: now, timeZone: tz,
+            locale: Locale(identifier: "en_US"))
         XCTAssertEqual(thrown.notBefore, until)
         XCTAssertEqual(thrown.message, saved.message)
 

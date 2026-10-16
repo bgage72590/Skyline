@@ -213,8 +213,16 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     public static func rebasing(locations: [WeatherLocation], settings: [String: String],
                                 snapshot: SyncDocument, onto merged: SyncDocument, now: Date,
                                 deletions: [String: Date]? = nil) -> SyncDocument {
-        let edits = deletions.map { noting(locations: locations, settings: settings, previous: snapshot, now: now, deletions: $0) }
-            ?? noting(locations: locations, settings: settings, previous: snapshot, now: now)
+        // QA L1: edits made during the flight are stamped after everything in the merge result, so a
+        // remote Mac with a fast clock (its stamps in our future) can't outrank them (hybrid logical clock,
+        // as MF3 does for ordinary pushes). Deletes still pending in the snapshot get the same bump.
+        let stamp = max(now, merged.latestStamp.addingTimeInterval(0.001))
+        let pendingIDs = Set(snapshot.locations.map(\.id))
+        let bumped = deletions.map { d in
+            Dictionary(uniqueKeysWithValues: d.map { id, at in (id, pendingIDs.contains(id) ? max(at, stamp) : at) })
+        }
+        let edits = bumped.map { noting(locations: locations, settings: settings, previous: snapshot, now: stamp, deletions: $0) }
+            ?? noting(locations: locations, settings: settings, previous: snapshot, now: stamp)
         guard !edits.sameContent(as: snapshot) else { return merged }
         var out = merge(local: edits, remote: merged, now: now)
         out.writtenBy = merged.writtenBy

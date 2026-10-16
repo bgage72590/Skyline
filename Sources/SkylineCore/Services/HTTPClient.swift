@@ -31,7 +31,8 @@ extension HTTPError: LocalizedError {
 
 /// Plain-English wording for errors shown in the UI (instead of "…HTTPError error 0.").
 public enum UserFacingError {
-    public static func message(_ error: Error, now: Date = Date(), timeZone: TimeZone = .current) -> String {
+    public static func message(_ error: Error, now: Date = Date(), timeZone: TimeZone = .current,
+                               locale: Locale = .autoupdatingCurrent) -> String {
         if let u = error as? URLError {
             switch u.code {
             case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed, .internationalRoamingOff:
@@ -48,7 +49,7 @@ public enum UserFacingError {
             case .throttled(_, _, let after):
                 return "Weather service is busy. Skyline will try again" + wait(after) + "."
             case .backingOff(let host, let until):
-                return busyLine(host: host, until: until, timeZone: timeZone)
+                return busyLine(host: host, until: until, timeZone: timeZone, locale: locale)
             case .status(let code, _) where code >= 500:
                 return "Weather service didn’t respond (error \(code))."
             case .status(404, _): return "No weather data for this place."

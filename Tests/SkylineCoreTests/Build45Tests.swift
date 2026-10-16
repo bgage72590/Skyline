@@ -69,7 +69,13 @@ final class Build45LocationTests: XCTestCase {
         XCTAssertEqual(f.evaluate(fix(18.04, -63.07, 0), now: now), .holdForConfirmation)
         XCTAssertEqual(f.evaluate(fix(18.04, -63.07, 20), now: now.addingTimeInterval(20)), .holdForConfirmation,
                        "the same Wi-Fi answer 20 s later is not a confirmation")
-        XCTAssertEqual(f.evaluate(fix(18.05, -63.06, 130), now: now.addingTimeInterval(130)), .accept, "real travel: agreement over 2 min")
+        // QA G1-a gap 1: NYC → Sint Maarten is a far jump (> 2,000 km): 2 min of agreement isn't enough.
+        XCTAssertEqual(f.evaluate(fix(18.05, -63.06, 130), now: now.addingTimeInterval(130)), .holdForConfirmation)
+        XCTAssertEqual(f.evaluate(fix(18.05, -63.06, 610), now: now.addingTimeInterval(610)), .accept, "real travel: agreement over 10 min")
+        // A nearer jump (Fairfield → Chicago, ~1,200 km) still confirms over 2 min.
+        var g = LocationFixFilter(last: Coordinate(latitude: 41.14, longitude: -73.26))
+        XCTAssertEqual(g.evaluate(fix(41.88, -87.63, 0), now: now), .holdForConfirmation)
+        XCTAssertEqual(g.evaluate(fix(41.88, -87.63, 130), now: now.addingTimeInterval(130)), .accept)
     }
 
     func testFirstFixWithoutSeedChecksTheTimeZone() {
@@ -78,6 +84,17 @@ final class Build45LocationTests: XCTestCase {
         var ok = LocationFixFilter(timeZoneOffset: -4 * 3600)
         XCTAssertEqual(ok.evaluate(fix(41.14, -73.26, 0), now: now), .accept)
         XCTAssertFalse(LocationFixFilter.zoneMismatch(longitude: 179, offsetSeconds: -11 * 3600), "date-line wrap")
+        // QA G1-a gap 2: Sint Maarten passes the zone check on an ET Mac; the region check holds it.
+        var sxZoneOnly = LocationFixFilter(timeZoneOffset: -4 * 3600)
+        XCTAssertEqual(sxZoneOnly.evaluate(fix(18.04, -63.07, 0), now: now), .accept, "zone alone can't tell")
+        var sx = LocationFixFilter(timeZoneOffset: -4 * 3600, regionCode: "US")
+        XCTAssertEqual(sx.evaluate(fix(18.04, -63.07, 0), now: now), .holdForConfirmation)
+        var home = LocationFixFilter(timeZoneOffset: -4 * 3600, regionCode: "us")
+        XCTAssertEqual(home.evaluate(fix(41.14, -73.26, 0), now: now), .accept)
+        var pr = LocationFixFilter(timeZoneOffset: -4 * 3600, regionCode: "US")
+        XCTAssertEqual(pr.evaluate(fix(18.47, -66.11, 0), now: now), .accept, "San Juan is in the US outline")
+        var other = LocationFixFilter(timeZoneOffset: 1 * 3600, regionCode: "NL")
+        XCTAssertEqual(other.evaluate(fix(52.37, 4.9, 0), now: now), .accept, "region check is US-only")
     }
 }
 

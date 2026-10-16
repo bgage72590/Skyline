@@ -89,10 +89,10 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
 
     /// Build 42 (QA build-41 G1): only plausible fixes reach the app. Inaccurate (> 5 km), stale
     /// (> 5 min), invalid fixes are dropped, and a jump of more than 500 km needs a second fix nearby.
-    private var filter = LocationFixFilter(timeZoneOffset: TimeZone.current.secondsFromGMT())
+    private var filter = LocationFixFilter(timeZoneOffset: TimeZone.current.secondsFromGMT(), regionCode: Locale.current.region?.identifier)
 
     /// The last accepted place (from the saved fix at launch), so a first bogus fix can't jump far.
-    func seed(_ c: Coordinate?) { filter = LocationFixFilter(last: c, timeZoneOffset: TimeZone.current.secondsFromGMT()) }
+    func seed(_ c: Coordinate?) { filter = LocationFixFilter(last: c, timeZoneOffset: TimeZone.current.secondsFromGMT(), regionCode: Locale.current.region?.identifier) }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         let fixes = locations.map {
