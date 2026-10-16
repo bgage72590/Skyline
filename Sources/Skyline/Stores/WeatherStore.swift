@@ -807,6 +807,25 @@ final class WeatherStore {
     // MARK: Sync (polish 1)
 
     /// The city list from another Mac (merged; nothing local is dropped unless it was removed there later).
+    /// Cities brought back by the item-1 recovery carry a coordinate name; look the real one up once.
+    func nameRecoveredLocations(_ recovered: [WeatherLocation]) {
+        Task { @MainActor in
+            for r in recovered {
+                let loc = CLLocation(latitude: r.coordinate.latitude, longitude: r.coordinate.longitude)
+                guard let p = try? await CLGeocoder().reverseGeocodeLocation(loc).first,
+                      let name = p.locality ?? p.name,
+                      let i = savedLocations.firstIndex(where: { $0.id == r.id }) else { continue }
+                var named = savedLocations[i]
+                named.name = name
+                named.region = p.administrativeArea
+                named.country = p.country
+                named.countryCode = p.isoCountryCode
+                named.timeZoneIdentifier = p.timeZone?.identifier
+                savedLocations[i] = named
+            }
+        }
+    }
+
     func applySyncedLocations(_ locations: [WeatherLocation]) {
         guard locations != savedLocations else { return }
         savedLocations = locations

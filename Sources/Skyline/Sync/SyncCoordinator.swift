@@ -45,6 +45,10 @@ final class SyncCoordinator {
     static func start(store: WeatherStore, defaults: UserDefaults = .standard) {
         // QA hook: `-SkylineSyncFile <path>` syncs through another file (tests two "Macs" on one).
         let override = defaults.string(forKey: "SkylineSyncFile").map { URL(fileURLWithPath: $0) }
+        // Item 1: an unbundled or test process reads another defaults domain (another city list) but
+        // would share sync-state.json and sync.json, and wipe every Mac's cities. Real app only.
+        guard LocationPersistence.syncAllowed(bundleIdentifier: Bundle.main.bundleIdentifier,
+                                              hasOverrideFile: override != nil) else { return }
         let url = override ?? iCloudFolder()?.appendingPathComponent("sync.json")
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent("com.briangage.Skyline", isDirectory: true)
@@ -74,6 +78,7 @@ final class SyncCoordinator {
             pushNow()
             syncAccuracy(force: true)
         } else {
+            reconcileAtLaunch()
             pullIfChanged(force: true)
         }
         let nc = NotificationCenter.default
@@ -88,6 +93,25 @@ final class SyncCoordinator {
             MainActor.assumeIsolated { self?.pullIfChanged() }
         })
     }
+
+    /// Item 1: a city that was synced but isn't in this Mac's defaults at launch wasn't removed by the
+    /// user, so put it back instead of letting the next push record it as a removal. Then, once, bring
+    /// back cities an earlier wipe tombstoned (batch removals) and any from the legacy "Skyline" domain.
+    private func reconcileAtLaunch() {
+        guard let previous = last else { return }
+        var cities = LocationPersistence.launchLocations(local: store.savedLocations, lastSynced: previous.locations)
+        if !defaults.bool(forKey: Self.recoveryKey) {
+            let legacy = UserDefaults(suiteName: "Skyline")?.data(forKey: "savedLocations.v1")
+                .flatMap { try? JSONDecoder().decode([WeatherLocation].self, from: $0) } ?? []
+            let back = LocationRecovery.recover(current: cities, legacy: legacy, removed: previous.removed)
+            cities += back
+            defaults.set(true, forKey: Self.recoveryKey)
+            if !back.isEmpty { store.nameRecoveredLocations(back) }
+        }
+        if cities != store.savedLocations { store.applySyncedLocations(cities) }
+    }
+
+    static let recoveryKey = "recovery.wipedCities.v1"
 
     func currentSettings() -> [String: String] {
         var out: [String: String] = [:]
