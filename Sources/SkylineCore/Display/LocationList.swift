@@ -54,7 +54,9 @@ public enum LocationList {
     /// so "Boston, MA" from two geocoders doesn't appear twice.
     public static func isDuplicate(_ candidate: WeatherLocation, of existing: WeatherLocation) -> Bool {
         if candidate.id == existing.id { return true }
-        if candidate.coordinate.coarse == existing.coordinate.coarse { return true }
+        // QA L2: a true distance, not grid rounding (28 m across a cell edge was "different", 1.4 km in
+        // the same cell "the same").
+        if NexradStation.distanceKm(candidate.coordinate, existing.coordinate) < 1 { return true }
         let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
         let nameOK = candidate.name.compare(existing.name, options: opts) == .orderedSame
         let regionOK = (candidate.region ?? "").compare(existing.region ?? "", options: opts) == .orderedSame

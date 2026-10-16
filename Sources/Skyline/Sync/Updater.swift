@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SkylineCore
 
 /// "Update Skyline…" (polish 2): installs the newest build from `iCloud Drive/Skyline/Skyline.zip`,
 /// which `build-app.sh` on the build Mac puts there with `Skyline.version`. The work is done by the
@@ -56,16 +57,7 @@ enum Updater {
         // On failure the log is left in place and Skyline is reopened; showUpdateResultIfNeeded reads it (U2).
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
-        let q = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-        let mark = q(log.path)
-        p.arguments = ["-c", """
-            sleep 1
-            if /bin/bash \(q(script.path)) --newer-than \(installedBuild) \(q(zip.path)) > \(mark) 2>&1; then
-              rm -f \(mark)
-            else
-              open -a Skyline
-            fi
-            """]
+        p.arguments = ["-c", UpdateScript.command(installer: script.path, newerThan: installedBuild, zip: zip.path, resultLog: log.path)]
         do {
             try p.run()
         } catch {

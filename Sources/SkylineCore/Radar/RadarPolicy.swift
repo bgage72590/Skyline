@@ -90,10 +90,28 @@ public enum RadarMemoryBudget {
 /// 0.35 s frame crossfade (restored in build 42). Pure state: the view samples it on a timer.
 public struct RadarCrossfade: Equatable, Sendable {
     public static let duration: TimeInterval = 0.35
-    /// Build 48: the new frame fades in over the old (still drawn by MapKit), then the old fades out
-    /// over the new once MapKit has drawn it. Together about `duration` plus MapKit's draw time.
-    public static let fadeIn: TimeInterval = 0.2
-    public static let fadeOut: TimeInterval = 0.15
+    /// Review L3 / QA X1-b: with both copies linear (old 1→0, new 0→1), rain present in both frames
+    /// stacked to 1 − (1 − t)·t… = 0.75 at the midpoint: a 25 % pulse on every step. The new frame (on
+    /// top) stays linear; the old one fades with an ease-in curve (stays up early, drops late), so the
+    /// stacked alpha never dips below ~0.85 and old-only rain fades out instead of halving at once.
+    /// Cubic Bézier control points of the old frame's timing function (CAMediaTimingFunction).
+    public static let outgoingCurve: (Double, Double, Double, Double) = (0.55, 0, 1, 0.45)
+
+    /// Outgoing copy alpha at linear time fraction `x` (what Core Animation does with `outgoingCurve`).
+    public static func outgoingAlpha(_ x: Double, from start: Double = 1) -> Double {
+        let (x1, y1, x2, y2) = outgoingCurve
+        // Solve the Bézier's x(s) = x by bisection, then evaluate y(s).
+        func bez(_ s: Double, _ a: Double, _ b: Double) -> Double { 3 * a * s * (1 - s) * (1 - s) + 3 * b * s * s * (1 - s) + s * s * s }
+        var lo = 0.0, hi = 1.0
+        for _ in 0..<40 { let mid = (lo + hi) / 2; if bez(mid, x1, x2) < x { lo = mid } else { hi = mid } }
+        return start * (1 - bez((lo + hi) / 2, y1, y2))
+    }
+
+    /// Stacked alpha of an echo present in both frames (new over old), at time fraction `x`.
+    public static func stackedAlpha(_ x: Double) -> Double {
+        let new = min(max(x, 0), 1), old = outgoingAlpha(new)
+        return new + old * (1 - new)
+    }
     public private(set) var from: Int?
     public private(set) var to: Int
     /// Alpha the outgoing frame starts from (1, or less when a new switch lands mid-fade).
@@ -148,6 +166,14 @@ public struct LocationFixFilter: Sendable {
     /// Build 45 (QA build-44 G1-a): a jump is confirmed only by fixes spanning at least this long, so one
     /// mislocated Wi-Fi answer repeated 20 s later isn't enough.
     public static let confirmSpan: TimeInterval = 120
+    /// QA G1-a gap 1: a router mislocated for two minutes still moved My Location (NYC → Sint Maarten).
+    /// A jump this far (a flight, not a drive) needs fixes spanning `farConfirmSpan`; after landing the
+    /// Mac takes a few more minutes to move, which is the price of not trusting a bad Wi-Fi answer.
+    public static let farJump: Double = 2_000_000        // metres
+    public static let farConfirmSpan: TimeInterval = 10 * 60
+    static func confirmSpan(forJump metres: Double?) -> TimeInterval {
+        (metres ?? 0) > farJump ? farConfirmSpan : confirmSpan
+    }
     /// A fix dated this far in the future is invalid.
     public static let futureSkew: TimeInterval = 60
     /// No saved fix yet: a first fix whose solar time is this far from the Mac's time zone is held
@@ -167,11 +193,30 @@ public struct LocationFixFilter: Sendable {
     /// The first fix of an unconfirmed jump.
     private var anchor: Fix?
     private let zoneOffsetSeconds: Int?
+    private let regionCode: String?
+    /// Distance of the pending jump (from `last`), for its confirmation span.
+    private var jumpMetres: Double?
 
-    /// - Parameter timeZoneOffset: the Mac's UTC offset in seconds (checks a first fix with no seed).
-    public init(last: Coordinate? = nil, timeZoneOffset: Int? = nil) {
+    /// - Parameters:
+    ///   - timeZoneOffset: the Mac's UTC offset in seconds (checks a first fix with no seed).
+    ///   - regionCode: the Mac's region ("US"). QA G1-a gap 2: Sint Maarten (−4.2 h solar) passes the
+    ///     zone check on an Eastern-time Mac, so for a US Mac a first fix outside the US is also held.
+    public init(last: Coordinate? = nil, timeZoneOffset: Int? = nil, regionCode: String? = nil) {
         self.last = last
         zoneOffsetSeconds = timeZoneOffset
+        self.regionCode = regionCode?.uppercased()
+    }
+
+    /// Rough US outline (lower 48, Alaska, Hawaii, Puerto Rico/USVI); only used to hold a first fix.
+    static func outsideRegion(latitude: Double, longitude: Double, region: String) -> Bool {
+        guard region == "US" else { return false }
+        let boxes: [(Double, Double, Double, Double)] = [
+            (24.3, 49.5, -125.0, -66.8),   // lower 48
+            (51.0, 71.5, -180.0, -129.9),  // Alaska
+            (18.8, 22.4, -160.5, -154.7),  // Hawaii
+            (17.6, 18.6, -67.4, -64.5),    // Puerto Rico, US Virgin Islands
+        ]
+        return !boxes.contains { latitude >= $0.0 && latitude <= $0.1 && longitude >= $0.2 && longitude <= $0.3 }
     }
 
     /// True when `longitude`'s solar offset is far from the Mac's time zone.
@@ -190,11 +235,14 @@ public struct LocationFixFilter: Sendable {
         let here = Coordinate(latitude: f.latitude, longitude: f.longitude)
         let suspicious: Bool
         if let last { suspicious = Self.distance(last, here) > Self.bigJump }
-        else if let z = zoneOffsetSeconds { suspicious = Self.zoneMismatch(longitude: f.longitude, offsetSeconds: z) }
-        else { suspicious = false }
+        else {
+            let zone = zoneOffsetSeconds.map { Self.zoneMismatch(longitude: f.longitude, offsetSeconds: $0) } ?? false
+            let region = regionCode.map { Self.outsideRegion(latitude: f.latitude, longitude: f.longitude, region: $0) } ?? false
+            suspicious = zone || region
+        }
         if suspicious {
             if let a = anchor, Self.distance(Coordinate(latitude: a.latitude, longitude: a.longitude), here) <= Self.confirmRadius {
-                if f.timestamp.timeIntervalSince(a.timestamp) >= Self.confirmSpan {
+                if f.timestamp.timeIntervalSince(a.timestamp) >= Self.confirmSpan(forJump: jumpMetres) {
                     anchor = nil
                     self.last = here
                     return .accept
@@ -202,6 +250,7 @@ public struct LocationFixFilter: Sendable {
                 return .holdForConfirmation
             }
             anchor = f
+            jumpMetres = last.map { Self.distance($0, here) }
             return .holdForConfirmation
         }
         anchor = nil

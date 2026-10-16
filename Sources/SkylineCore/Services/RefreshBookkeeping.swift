@@ -15,21 +15,22 @@ public enum RefreshBookkeeping {
 
     /// Saved data on screen. A live host back-off schedules the retry at `until` and says when.
     public static func afterReport(isOfflineFallback: Bool, backoffUntil: Date?, now: Date = Date(),
-                                   timeZone: TimeZone = .current) -> FollowUp {
+                                   timeZone: TimeZone = .current, locale: Locale = .autoupdatingCurrent) -> FollowUp {
         guard isOfflineFallback else {
             return FollowUp(message: "", notBefore: nil, clearError: true)
         }
         if let backoffUntil, backoffUntil > now {
             let message = UserFacingError.message(
-                HTTPError.backingOff(host: openMeteoHost, until: backoffUntil), now: now, timeZone: timeZone)
+                HTTPError.backingOff(host: openMeteoHost, until: backoffUntil), now: now, timeZone: timeZone, locale: locale)
             return FollowUp(message: message, notBefore: backoffUntil, clearError: false)
         }
         return FollowUp(message: savedDataMessage, notBefore: nil, clearError: false)
     }
 
     /// A thrown refresh failure (including force during a long back-off).
-    public static func afterFailure(_ error: Error, now: Date = Date(), timeZone: TimeZone = .current) -> FollowUp {
-        FollowUp(message: UserFacingError.message(error, now: now, timeZone: timeZone),
+    public static func afterFailure(_ error: Error, now: Date = Date(), timeZone: TimeZone = .current,
+                                    locale: Locale = .autoupdatingCurrent) -> FollowUp {
+        FollowUp(message: UserFacingError.message(error, now: now, timeZone: timeZone, locale: locale),
                  notBefore: notBefore(error, now: now), clearError: false)
     }
 

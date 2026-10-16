@@ -152,10 +152,12 @@ final class Build42LocationTests: XCTestCase {
         var f = LocationFixFilter(last: Coordinate(latitude: 41.14, longitude: -73.26)) // Fairfield, CT
         XCTAssertEqual(f.evaluate(fix(18.03, -63.05), now: now), .holdForConfirmation, "Sint Maarten from one fix: held")
         XCTAssertEqual(f.evaluate(fix(41.15, -73.25), now: now), .accept, "back home: accepted, candidate dropped")
-        XCTAssertEqual(f.evaluate(fix(18.03, -63.05, age: 150), now: now), .holdForConfirmation)
-        // Build 45: confirmation needs nearby fixes spanning ≥ 2 min (one repeated Wi-Fi answer isn't enough).
-        XCTAssertEqual(f.evaluate(fix(18.04, -63.06, age: 0), now: now), .accept, "nearby fixes over 2.5 min confirm a real trip")
-        XCTAssertEqual(f.evaluate(fix(18.05, -63.04), now: now), .accept)
+        XCTAssertEqual(f.evaluate(fix(18.03, -63.05, age: 299), now: now), .holdForConfirmation)
+        // Build 45: confirmation needs nearby fixes spanning a while; NYC → Sint Maarten is a far jump, so
+        // 10 min (QA G1-a). 299 s old + now is under 10 min: still held; the filter has no fix ≥ 10 min apart
+        // within `maxAge`, so this path can't confirm from fixes all inside 5 min.
+        XCTAssertEqual(f.evaluate(fix(18.04, -63.06, age: 0), now: now), .holdForConfirmation)
+        XCTAssertEqual(f.evaluate(fix(18.05, -63.04, age: -301), now: now.addingTimeInterval(310)), .accept, "fixes 10+ min apart confirm a real trip")
     }
 }
 
