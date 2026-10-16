@@ -51,3 +51,52 @@ public enum RefreshBookkeeping {
         return (offline ? "Offline · showing data from " : "Showing data from ") + dataTime
     }
 }
+
+/// Item 2: how a refresh that didn't produce fresh data is followed up. The first few transient
+/// failures (timeout, dropped connection, 5xx, a short Open-Meteo back-off) retry quickly and quietly:
+/// the city shows "Updating…" (or keeps its saved data) instead of an error banner. After that, or for
+/// a real "you're offline", the PR #2 behaviour applies: a message and the exponential retry, and a
+/// live back-off is always respected (never earlier than `backoffUntil`), so no 429 stampede.
+public enum FetchRetryPolicy {
+    /// Seconds before quiet retry 1, 2, 3.
+    public static let quickRetries: [TimeInterval] = [5, 15, 30]
+
+    public struct Decision: Equatable, Sendable {
+        /// true = no banner; the city stays in the "updating" state.
+        public var quiet: Bool
+        public var retryAfter: TimeInterval
+    }
+
+    public static func isTransient(_ error: Error) -> Bool {
+        if let u = error as? URLError {
+            return [.timedOut, .networkConnectionLost, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+                    .secureConnectionFailed, .badServerResponse].contains(u.code)
+        }
+        if let h = error as? HTTPError {
+            switch h {
+            case .throttled, .backingOff: return true
+            case .status(let code, _): return code >= 500
+            default: return false
+            }
+        }
+        return false
+    }
+
+    /// `attempt` = failures so far for this city (0 for the first). `jitterSeed` spreads cities apart.
+    public static func decide(error: Error, attempt: Int, backoffUntil: Date?, refreshInterval: TimeInterval,
+                              jitterSeed: Int = 0, now: Date = Date()) -> Decision {
+        let jitter = Double(abs(jitterSeed) % 4) // 0–3 s, so retries after one back-off don't line up
+        let wait = max(0, (backoffUntil ?? RefreshBookkeeping.notBefore(error, now: now) ?? now).timeIntervalSince(now))
+        if isTransient(error), attempt < quickRetries.count {
+            return Decision(quiet: true, retryAfter: max(quickRetries[attempt], wait + 1) + jitter)
+        }
+        let slow = attempt - quickRetries.count
+        let base = min(60 * pow(2, Double(min(max(slow, 0), 6))), max(refreshInterval, 60))
+        return Decision(quiet: false, retryAfter: max(base, wait + 2) + jitter)
+    }
+
+    /// Fresh data from a city with nothing on screen goes ahead of queued refreshes.
+    public static func priority(force: Bool, hasReport: Bool) -> FetchPriority {
+        force || !hasReport ? .interactive : .background
+    }
+}
