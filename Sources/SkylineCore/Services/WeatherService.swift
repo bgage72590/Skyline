@@ -53,9 +53,12 @@ public actor WeatherService {
     /// while it was in flight: NWS requests run concurrently, and a slower success must not cancel a 503
     /// that arrived meanwhile (QA batch 2).
     private var throttleEpoch: [String: Int] = [:]
-    /// The pause a forced refresh uses to wait out Retry-After. Production sleeps; tests that drive
-    /// `now` jump their clock by the same interval so the suite doesn't wait on the wall clock.
+    /// The pause a forced refresh uses to wait out a short Retry-After. Production sleeps; tests that
+    /// drive `now` jump their clock by the same interval so the suite doesn't wait on the wall clock.
     private var backoffSleep: @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) }
+    /// One Open-Meteo forecast GET at a time, so a shared back-off ending doesn't stampede the host.
+    private var openMeteoBusy = false
+    private var openMeteoWaiters: [CheckedContinuation<Void, Never>] = []
     /// Forecast verification + adaptive weights (nil = fixed weights, nothing recorded; used by tests).
     public nonisolated let verifier: ForecastVerifier?
     /// Recent daily-forecast snapshots for "why the forecast changed" (nil = none kept; used by tests).
@@ -342,6 +345,10 @@ public actor WeatherService {
 
     // MARK: Fetch with cache
 
+    /// How long a forced refresh (banner Retry, toolbar Refresh) may sleep. Longer than this, the
+    /// store schedules a retry and leaves Refresh usable instead of pinning the spinner.
+    static let forceWaitCap: TimeInterval = 30
+
     /// Fresh cache → network → stale cache no older than `maxStale` (offline fallback) → error.
     /// The result carries the data's real download time, so a cached copy is never passed off as new.
     func fetchEntry(_ url: URL, ttl: TimeInterval, force: Bool = false, headers: [String: String] = [:],
@@ -351,38 +358,104 @@ public actor WeatherService {
             return Fetched(data: hit.data, storedAt: hit.storedAt, isFallback: false)
         }
         let host = url.host ?? ""
-        // Banner Retry / toolbar Refresh waits out the host's back-off, then fetches once. Returning the
-        // stale copy here is what left "Offline · showing data from …" stuck after Open-Meteo recovered.
-        if force, let until = backoffUntil[host], until > now() {
-            try await waitOutBackoff(until)
-        }
-        do {
-            if !force, let until = backoffUntil[host], until > now() {
-                throw HTTPError.backingOff(host: host, until: until)
-            }
-            let epoch = throttleEpoch[host, default: 0]
-            let data = try await client.get(url, headers: headers)
-            if throttleEpoch[host, default: 0] == epoch {
-                backoffUntil[host] = nil
-                backoffStrikes[host] = nil
-            }
-            await cache.store(data, for: key)
-            return Fetched(data: data, storedAt: now(), isFallback: false)
-        } catch {
-            if case HTTPError.throttled(_, _, let retryAfter) = error { noteThrottled(host, retryAfter: retryAfter) }
+        // Non-force traffic never sleeps through a back-off; the stale copy (or the error) is enough.
+        if !force, let until = backoffUntil[host], until > now() {
             if let stale = await cache.entry(key, maxAge: maxStale) {
                 return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true)
             }
-            throw error
+            throw HTTPError.backingOff(host: host, until: until)
+        }
+        // A short window is waited out, then fetched once. A long one throws so the UI can schedule
+        // "retrying at h:mm" without holding `loadingIDs` for the rest of Retry-After.
+        if force { try await prepareForceFetch(host) }
+
+        func network() async throws -> Fetched {
+            do {
+                // Re-read after the wait and after queueing behind another city. A sibling 429 may
+                // have pushed the deadline out; don't hit the network on a stale "clear" decision.
+                if let until = backoffUntil[host], until > now() {
+                    throw HTTPError.backingOff(host: host, until: until)
+                }
+                let epoch = throttleEpoch[host, default: 0]
+                let data = try await client.get(url, headers: headers)
+                if throttleEpoch[host, default: 0] == epoch {
+                    backoffUntil[host] = nil
+                    backoffStrikes[host] = nil
+                }
+                await cache.store(data, for: key)
+                return Fetched(data: data, storedAt: now(), isFallback: false)
+            } catch {
+                if force, case HTTPError.backingOff = error { throw error }
+                if case HTTPError.throttled(_, _, let retryAfter) = error { noteThrottled(host, retryAfter: retryAfter) }
+                if let stale = await cache.entry(key, maxAge: maxStale) {
+                    return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true)
+                }
+                throw error
+            }
+        }
+
+        do {
+            return try await withOpenMeteoTurn(host, network)
+        } catch let error as HTTPError {
+            // The city ahead of us in line was throttled. Wait only if the new window still fits.
+            guard force, case .backingOff = error else { throw error }
+            try await prepareForceFetch(host)
+            return try await withOpenMeteoTurn(host, network)
         }
     }
 
-    /// Sleeps until `until` on the service clock, then the caller fetches once.
+    /// Sleeps out a back-off only while the remaining time fits in `forceWaitCap` (total, across
+    /// re-checks). Each sleep is followed by another read of `backoffUntil`.
+    private func prepareForceFetch(_ host: String) async throws {
+        var budget = Self.forceWaitCap
+        while let until = backoffUntil[host], until > now() {
+            let remaining = until.timeIntervalSince(now())
+            if remaining > budget {
+                throw HTTPError.backingOff(host: host, until: until)
+            }
+            try await waitOutBackoff(until)
+            budget -= remaining
+        }
+    }
+
+    /// Sleeps until `until` on the service clock.
     private func waitOutBackoff(_ until: Date) async throws {
         let delay = until.timeIntervalSince(now())
         guard delay > 0 else { return }
         try Task.checkCancellation()
         try await backoffSleep(delay)
+    }
+
+    /// Serializes `api.open-meteo.com` GETs. Other hosts run straight through.
+    private func withOpenMeteoTurn<T>(_ host: String, _ body: () async throws -> T) async throws -> T {
+        let gate = host == RefreshBookkeeping.openMeteoHost
+        if gate { await acquireOpenMeteo() }
+        do {
+            let value = try await body()
+            if gate { releaseOpenMeteo() }
+            return value
+        } catch {
+            if gate { releaseOpenMeteo() }
+            throw error
+        }
+    }
+
+    private func acquireOpenMeteo() async {
+        if !openMeteoBusy {
+            openMeteoBusy = true
+            return
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            openMeteoWaiters.append(cont)
+        }
+    }
+
+    private func releaseOpenMeteo() {
+        if !openMeteoWaiters.isEmpty {
+            openMeteoWaiters.removeFirst().resume()
+        } else {
+            openMeteoBusy = false
+        }
     }
 
     /// A host said "slow down": honour its Retry-After (5 s – 1 h), else back off 1, 2, 4 … 30 min.
@@ -400,9 +473,14 @@ public actor WeatherService {
         return until
     }
 
-    /// Replaces the pause a forced refresh uses to wait out Retry-After.
+    /// Replaces the pause a forced refresh uses to wait out a short Retry-After.
     func setBackoffSleep(_ sleep: @escaping @Sendable (TimeInterval) async throws -> Void) {
         backoffSleep = sleep
+    }
+
+    /// Test seam: move a host's back-off deadline, including extending it while a wait is in progress.
+    func setBackoffForTesting(_ host: String, until: Date) {
+        backoffUntil[host] = until
     }
 
     /// Drops download-cache entries older than `maxAge` (memory and disk). Called once at launch.

@@ -166,6 +166,44 @@ final class Batch2Tests: XCTestCase {
                        "Weather service is busy. Skyline will try again in 5 min.")
         XCTAssertFalse(HTTPError.invalidResponse.localizedDescription.contains("HTTPError"))
         XCTAssertFalse(HTTPError.status(500, url).localizedDescription.contains("SkylineCore"))
+        let until = Date(timeIntervalSince1970: 1_800_000_180)
+        let tz = TimeZone(secondsFromGMT: -5 * 3600)!
+        XCTAssertEqual(UserFacingError.message(HTTPError.backingOff(host: "api.open-meteo.com", until: until),
+                                                now: Date(timeIntervalSince1970: 1_800_000_000), timeZone: tz),
+                       "Open-Meteo busy, retrying at 3:03 AM")
+    }
+
+    /// The store seam: a back-off fallback remembers `notBefore` and the banner copy; a later success
+    /// clears `errors[id]` and `isOfflineFallback`, so `isOffline` is false.
+    func testOfflineFallbackSchedulesThenSuccessClearsError() {
+        let id = "nyc"
+        var errors: [String: String] = [:]
+        var isOfflineFallback = true
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let until = now.addingTimeInterval(180)
+        let tz = TimeZone(secondsFromGMT: -5 * 3600)!
+        let saved = RefreshBookkeeping.afterReport(isOfflineFallback: true, backoffUntil: until, now: now, timeZone: tz)
+        errors[id] = saved.message
+        XCTAssertEqual(saved.notBefore, until)
+        XCTAssertFalse(saved.clearError)
+        XCTAssertEqual(saved.message, "Open-Meteo busy, retrying at 3:03 AM")
+        XCTAssertEqual(RefreshBookkeeping.bannerLine(offline: true, error: errors[id], dataTime: "2:10 PM"),
+                       "Open-Meteo busy, retrying at 3:03 AM")
+        XCTAssertTrue(RefreshBookkeeping.isOffline(isOfflineFallback: isOfflineFallback, error: errors[id]))
+
+        let thrown = RefreshBookkeeping.afterFailure(
+            HTTPError.backingOff(host: RefreshBookkeeping.openMeteoHost, until: until), now: now, timeZone: tz)
+        XCTAssertEqual(thrown.notBefore, until)
+        XCTAssertEqual(thrown.message, saved.message)
+
+        isOfflineFallback = false
+        let ok = RefreshBookkeeping.afterReport(isOfflineFallback: false, backoffUntil: nil, now: until, timeZone: tz)
+        XCTAssertTrue(ok.clearError)
+        XCTAssertNil(ok.notBefore)
+        if ok.clearError { errors[id] = nil }
+        XCTAssertNil(errors[id])
+        XCTAssertFalse(isOfflineFallback)
+        XCTAssertFalse(RefreshBookkeeping.isOffline(isOfflineFallback: isOfflineFallback, error: errors[id]))
     }
 
     func testRetryAfterParsing() {
@@ -176,24 +214,31 @@ final class Batch2Tests: XCTestCase {
         XCTAssertNil(HTTPError.retryAfter("soon"))
     }
 
-    /// Answers 429 (Retry-After 120 s) for Open-Meteo forecasts while `throttled`; fixtures otherwise.
+    /// Answers 429 for Open-Meteo forecasts while `throttled`; fixtures otherwise.
+    /// `retryAfter` nil means the header was missing (exponential back-off). Default is 120 s.
     final class ThrottlingClient: HTTPClient, @unchecked Sendable {
         let inner = MockHTTPClient()
         private let lock = NSLock()
         private var _throttled = false, _hits = 0
+        private var _retryAfter: TimeInterval? = 120
         var throttled: Bool {
             get { lock.lock(); defer { lock.unlock() }; return _throttled }
             set { lock.lock(); _throttled = newValue; lock.unlock() }
         }
+        var retryAfter: TimeInterval? {
+            get { lock.lock(); defer { lock.unlock() }; return _retryAfter }
+            set { lock.lock(); _retryAfter = newValue; lock.unlock() }
+        }
         var forecastHits: Int { lock.lock(); defer { lock.unlock() }; return _hits }
-        private func note(_ url: URL) -> Bool {
+        private func note(_ url: URL) -> (Bool, TimeInterval?) {
             lock.lock(); defer { lock.unlock() }
             let isForecast = url.host == "api.open-meteo.com"
             if isForecast { _hits += 1 }
-            return isForecast && _throttled
+            return (isForecast && _throttled, _retryAfter)
         }
         func get(_ url: URL, headers: [String: String]) async throws -> Data {
-            if note(url) { throw HTTPError.throttled(429, url, retryAfter: 120) }
+            let (throttle, after) = note(url)
+            if throttle { throw HTTPError.throttled(429, url, retryAfter: after) }
             return try await inner.get(url, headers: headers)
         }
     }
@@ -215,7 +260,7 @@ final class Batch2Tests: XCTestCase {
         XCTAssertEqual(windowEnd.timeIntervalSince(clock.now), 120, accuracy: 1)
 
         // Non-force traffic still honours the window (no network, stale copy, retry time intact).
-        clock.now = clock.now.addingTimeInterval(60)
+        clock.now = clock.now.addingTimeInterval(60) // 60s left — longer than the force-wait cap
         let held = try await service.report(for: nyc)
         XCTAssertTrue(held.isOfflineFallback)
         XCTAssertEqual(held.dataAsOf, r1.dataAsOf)
@@ -223,16 +268,123 @@ final class Batch2Tests: XCTestCase {
         let still = await service.backoff(for: "api.open-meteo.com")
         XCTAssertEqual(still, windowEnd)
 
-        // Force (banner Retry / toolbar Refresh) waits out the window, then fetches once.
-        // Open-Meteo has recovered; the report must not stay an offline fallback at the old cache time.
+        // A long remainder must not sleep on the force path. The store schedules from this error.
         client.throttled = false
+        let beforeForce = clock.now
+        do {
+            _ = try await service.report(for: nyc, forceRefresh: true)
+            XCTFail("force during a long back-off should throw, not fetch")
+        } catch let error as HTTPError {
+            guard case .backingOff(_, let until) = error else { return XCTFail("\(error)") }
+            XCTAssertEqual(until, windowEnd)
+        }
+        XCTAssertEqual(clock.now, beforeForce, "no sleep longer than the 30s cap")
+        XCTAssertEqual(client.forecastHits, hits, "long back-off does not hit the network")
+
+        // ≤ 30s left: wait once, then a healthy Open-Meteo response clears the offline flag.
+        clock.now = windowEnd.addingTimeInterval(-20)
         let r3 = try await service.report(for: nyc, forceRefresh: true)
-        XCTAssertGreaterThanOrEqual(clock.now, windowEnd, "force waits out Retry-After instead of skipping it")
+        XCTAssertGreaterThanOrEqual(clock.now, windowEnd, "short remainder is waited out")
         XCTAssertEqual(client.forecastHits, hits + 1)
         XCTAssertFalse(r3.isOfflineFallback)
         XCTAssertGreaterThan(r3.dataAsOf, r1.dataAsOf, "fresh download, not the pre-429 cache time")
         let cleared = await service.backoff(for: "api.open-meteo.com")
         XCTAssertNil(cleared)
+    }
+
+    /// A sibling request that extends the deadline during the short wait must be noticed. Don't GET.
+    func testForceRechecksBackoffAfterWaiting() async throws {
+        let client = ThrottlingClient()
+        let clock = TestClock(fixtureTime)
+        let service = WeatherService(client: client, cache: ResponseCache(directory: nil, now: { clock.now }), now: { clock.now })
+        let nyc = WeatherLocation(name: "New York", coordinate: Coordinate(latitude: 40.71, longitude: -74.01))
+        _ = try await service.report(for: nyc)
+        client.throttled = true
+        client.retryAfter = 10
+        clock.now = fixtureTime.addingTimeInterval(15 * 60)
+        _ = try await service.report(for: nyc)
+        let hits = client.forecastHits
+        client.throttled = false
+        await service.setBackoffSleep { _ in
+            await service.setBackoffForTesting("api.open-meteo.com", until: clock.now.addingTimeInterval(90))
+            clock.now = clock.now.addingTimeInterval(1)
+        }
+        do {
+            _ = try await service.report(for: nyc, forceRefresh: true)
+            XCTFail("extended back-off should not be fetched")
+        } catch is HTTPError {
+        } catch { XCTFail("\(error)") }
+        XCTAssertEqual(client.forecastHits, hits)
+        let until = await service.backoff(for: "api.open-meteo.com")
+        XCTAssertEqual(until?.timeIntervalSince(clock.now) ?? 0, 89, accuracy: 1)
+    }
+
+    func testRetryAfterClampAndExponentialBackoff() async throws {
+        let nyc = WeatherLocation(name: "New York", coordinate: Coordinate(latitude: 40.71, longitude: -74.01))
+        let clock = TestClock(fixtureTime)
+        let client = ThrottlingClient()
+        let service = WeatherService(client: client, cache: ResponseCache(directory: nil, now: { clock.now }), now: { clock.now })
+        _ = try await service.report(for: nyc)
+        client.throttled = true
+        for (header, delay) in [(1.0, 5.0), (120.0, 120.0), (10_000.0, 3600.0)] {
+            client.retryAfter = header
+            clock.now = clock.now.addingTimeInterval(11 * 60)
+            _ = try await service.report(for: nyc)
+            let raw = await service.backoff(for: "api.open-meteo.com")
+            let until = try XCTUnwrap(raw)
+            XCTAssertEqual(until.timeIntervalSince(clock.now), delay, accuracy: 1, "Retry-After \(header)")
+            clock.now = until
+        }
+
+        let expClock = TestClock(fixtureTime)
+        let expClient = ThrottlingClient()
+        expClient.retryAfter = nil
+        let exp = WeatherService(client: expClient, cache: ResponseCache(directory: nil, now: { expClock.now }), now: { expClock.now })
+        _ = try await exp.report(for: nyc)
+        expClient.throttled = true
+        for delay in [60.0, 120, 240, 480, 960, 1800, 1800] {
+            expClock.now = expClock.now.addingTimeInterval(11 * 60)
+            _ = try await exp.report(for: nyc)
+            let raw = await exp.backoff(for: "api.open-meteo.com")
+            let until = try XCTUnwrap(raw)
+            XCTAssertEqual(until.timeIntervalSince(expClock.now), delay, accuracy: 1, "strike backoff \(delay)")
+            expClock.now = until
+        }
+    }
+
+    func testOpenMeteoFetchesAreSerializedAcrossCities() async throws {
+        final class Overlap: HTTPClient, @unchecked Sendable {
+            let inner = MockHTTPClient()
+            private let lock = NSLock()
+            private var inFlight = 0
+            private var _max = 0
+            var maxInFlight: Int { lock.lock(); defer { lock.unlock() }; return _max }
+            /// Returns whether this call should pause, and records the overlap. Sync so the lock stays out of the await.
+            private func begin(_ url: URL) -> Bool {
+                guard url.host == "api.open-meteo.com" else { return false }
+                lock.lock(); inFlight += 1; _max = max(_max, inFlight); lock.unlock()
+                return true
+            }
+            private func end() {
+                lock.lock(); inFlight -= 1; lock.unlock()
+            }
+            func get(_ url: URL, headers: [String: String]) async throws -> Data {
+                let forecast = begin(url)
+                if forecast {
+                    try await Task.sleep(for: .milliseconds(60))
+                    end()
+                }
+                return try await inner.get(url, headers: headers)
+            }
+        }
+        let client = Overlap()
+        let service = WeatherService(client: client, cache: ResponseCache(directory: nil))
+        let a = WeatherLocation(name: "New York", coordinate: Coordinate(latitude: 40.71, longitude: -74.01))
+        let b = WeatherLocation(name: "Cleveland", coordinate: Coordinate(latitude: 41.50, longitude: -81.69))
+        async let r1 = service.report(for: a, forceRefresh: true)
+        async let r2 = service.report(for: b, forceRefresh: true)
+        _ = try await (r1, r2)
+        XCTAssertEqual(client.maxInFlight, 1, "shared back-off ending must not fire concurrent Open-Meteo GETs")
     }
 
     // MARK: L8 cache clean-up

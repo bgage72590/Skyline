@@ -567,7 +567,8 @@ struct StaleDataBanner: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: offline ? "wifi.slash" : "clock.arrow.circlepath")
-            Text((offline ? "Offline · showing data from " : "Showing data from ") + Fmt.dataTime(report.dataAsOf))
+            Text(RefreshBookkeeping.bannerLine(offline: offline, error: error,
+                                                dataTime: Fmt.dataTime(report.dataAsOf)))
                 .lineLimit(1)
             if isLoading {
                 ProgressView().controlSize(.mini)

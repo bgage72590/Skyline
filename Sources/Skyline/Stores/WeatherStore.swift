@@ -302,7 +302,7 @@ final class WeatherStore {
 
     /// True when the last refresh for this report's location failed (network or service error).
     func isOffline(_ report: WeatherReport) -> Bool {
-        report.isOfflineFallback || errors[report.location.id] != nil
+        RefreshBookkeeping.isOffline(isOfflineFallback: report.isOfflineFallback, error: errors[report.location.id])
     }
 
     // MARK: Loading
@@ -325,48 +325,38 @@ final class WeatherStore {
             if defaults.bool(forKey: "SkylineDemoRain") { report.minutely = Self.demoRain(from: report.current.time) }
             reports[location.id] = report
             publishWidget()
-            if report.isOfflineFallback {
-                // Old data is better than none, but it must say so, and we try again soon.
-                // A 429 left api.open-meteo.com in back-off; retrying before that just returns this
-                // same stale copy and the offline banner never clears.
-                setError("Couldn’t reach the weather service; showing saved data.", for: location.id)
-                scheduleRetry(location, notBefore: await service.backoff(for: "api.open-meteo.com"))
-            } else {
+            let until = report.isOfflineFallback
+                ? await service.backoff(for: RefreshBookkeeping.openMeteoHost) : nil
+            let follow = RefreshBookkeeping.afterReport(isOfflineFallback: report.isOfflineFallback, backoffUntil: until)
+            if follow.clearError {
                 if errors[location.id] != nil { errors[location.id] = nil }
                 retryTasks.removeValue(forKey: location.id)?.cancel()
                 retryAttempts[location.id] = nil
+            } else {
+                // Saved data stays up. A live back-off retries at `until` ("Open-Meteo busy, retrying at h:mm")
+                // instead of hammering the host and keeping the spinner on.
+                setError(follow.message, for: location.id)
+                scheduleRetry(location, notBefore: follow.notBefore)
             }
             scheduleHousekeeping()
             if !report.isOfflineFallback { considerNotifications(report, for: location) }
             await refreshAccuracy(for: location)
         } catch is CancellationError {
         } catch {
-            // Keep the error visible even when older data is on screen (shown as the offline banner),
-            // withdraw data that is too old to pass for weather, and retry soon.
-            setError(Self.describe(error), for: location.id)
+            // Force during a long back-off throws `backingOff` immediately (no multi-minute sleep, so
+            // `loadingIDs` clears and Refresh stays usable). The banner keeps the saved report.
+            let follow = RefreshBookkeeping.afterFailure(error)
+            setError(follow.message, for: location.id)
             if let existing = reports[location.id], existing.dataAge() > DataAge.maxDisplayAge {
                 reports[location.id] = nil
             }
-            scheduleRetry(location, notBefore: Self.retryNotBefore(error))
+            scheduleRetry(location, notBefore: follow.notBefore)
             scheduleHousekeeping()
         }
     }
 
     private func setError(_ message: String, for id: String) {
         if errors[id] != message { errors[id] = message }
-    }
-
-    /// Short readable text for a refresh failure.
-    static func describe(_ error: Error) -> String { UserFacingError.message(error) }
-
-    /// When the service asked us to slow down (429/503 Retry-After, or a back-off in progress), the
-    /// retry waits at least that long.
-    static func retryNotBefore(_ error: Error) -> Date? {
-        switch error {
-        case HTTPError.throttled(_, _, let after): return after.map { Date().addingTimeInterval($0) }
-        case HTTPError.backingOff(_, let until): return until
-        default: return nil
-        }
     }
 
     /// After a failure, try again in about a minute instead of waiting for the next refresh cycle
