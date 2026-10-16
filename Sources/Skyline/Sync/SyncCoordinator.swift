@@ -46,25 +46,18 @@ final class SyncCoordinator {
     /// `-SkylineSyncFile` override); no environment means no sync.
     static func start(store: WeatherStore, defaults: UserDefaults, env: SyncEnvironment) {
         shared = SyncCoordinator(store: store, defaults: defaults, fileURL: env.fileURL, stateURL: env.stateURL,
-                                 deletions: DeletionLog(url: env.deletionsURL),
-                                 additions: DeletionLog(url: env.deletionsURL.deletingLastPathComponent()
-                                     .appendingPathComponent(env.deletionsURL.deletingPathExtension().lastPathComponent + "-additions.json")),
-                                 isOverride: env.isOverride)
+                                 deletions: DeletionLog(url: env.deletionsURL), isOverride: env.isOverride)
         shared?.begin()
     }
 
     /// The user's deletes (item 1), the only source of tombstones.
     let deletions: DeletionLog
-    /// When this Mac's user added (or undid the delete of) a city: a stale local copy of a city another
-    /// Mac deleted is dropped unless it was re-added here after that delete (Sint Maarten fix).
-    let additions: DeletionLog
     private let isOverride: Bool
 
     private init(store: WeatherStore, defaults: UserDefaults, fileURL: URL?, stateURL: URL,
-                 deletions: DeletionLog, additions: DeletionLog, isOverride: Bool) {
+                 deletions: DeletionLog, isOverride: Bool) {
         self.store = store
         self.deletions = deletions
-        self.additions = additions
         self.isOverride = isOverride
         self.defaults = defaults
         self.fileURL = fileURL
@@ -109,7 +102,7 @@ final class SyncCoordinator {
         // The legacy "Skyline" domain (unbundled runs) only supplies names; never in override (QA) runs.
         let legacy = isOverride ? [] : UserDefaults(suiteName: "Skyline")?.data(forKey: "savedLocations.v1")
             .flatMap { try? JSONDecoder().decode([WeatherLocation].self, from: $0) } ?? []
-        let plan = LaunchSync.plan(local: store.savedLocations, last: previous, deletions: deletions.entries, additions: additions.entries,
+        let plan = LaunchSync.plan(local: store.savedLocations, last: previous, deletions: deletions.entries,
                                    legacy: legacy, defaults: defaults)
         if plan.cities != store.savedLocations { store.applySyncedLocations(plan.cities) }
         if !plan.recovered.isEmpty { store.nameRecoveredLocations(plan.recovered) }
@@ -118,7 +111,7 @@ final class SyncCoordinator {
     /// Called by the delete action before anything else: written to disk synchronously.
     func recordDeletion(_ id: String) { deletions.record(id) }
     /// A re-add (search, undo) cancels this Mac's delete.
-    func forgetDeletion(_ id: String) { deletions.forget(id); additions.record(id) }
+    func forgetDeletion(_ id: String) { deletions.forget(id) }
 
     func currentSettings() -> [String: String] {
         var out: [String: String] = [:]
@@ -131,7 +124,7 @@ final class SyncCoordinator {
     /// Local change: write soon (coalesces bursts, e.g. a reorder or several settings).
     private func schedulePush() {
         guard fileURL != nil, let last else { return }
-        let changed = SyncDocument.noting(locations: store.savedLocations, settings: currentSettings(), previous: last, now: Date(), deletions: deletions.entries, additions: additions.entries)
+        let changed = SyncDocument.noting(locations: store.savedLocations, settings: currentSettings(), previous: last, now: Date(), deletions: deletions.entries)
         guard !changed.sameContent(as: last) else { return }
         pushTask?.cancel()
         pushTask = Task { [weak self] in
@@ -146,7 +139,7 @@ final class SyncCoordinator {
     func pushNow() {
         guard let fileURL, let previous = last else { return }
         if pushing { pushAgain = true; return }
-        var local = SyncDocument.noting(locations: store.savedLocations, settings: currentSettings(), previous: previous, now: Date(), deletions: deletions.entries, additions: additions.entries)
+        var local = SyncDocument.noting(locations: store.savedLocations, settings: currentSettings(), previous: previous, now: Date(), deletions: deletions.entries)
         local.writtenBy = device
         pushing = true
         inFlight = local
@@ -172,7 +165,7 @@ final class SyncCoordinator {
             let snapshot = inFlight ?? doc
             let current = SyncDocument.rebasing(locations: store.savedLocations, settings: currentSettings(),
                                                 snapshot: snapshot, onto: doc, now: Date(),
-                                                deletions: deletions.entries, additions: additions.entries)
+                                                deletions: deletions.entries)
             if current.sameContent(as: doc) {
                 apply(doc)
             } else {
@@ -207,7 +200,7 @@ final class SyncCoordinator {
     /// Cities or settings differ from what was last written or applied (cheap: cities and settings only).
     private func hasUnsentLocalChanges() -> Bool {
         guard let last, !pushing else { return false }
-        return !SyncDocument.noting(locations: store.savedLocations, settings: currentSettings(), previous: last, now: Date(), deletions: deletions.entries, additions: additions.entries)
+        return !SyncDocument.noting(locations: store.savedLocations, settings: currentSettings(), previous: last, now: Date(), deletions: deletions.entries)
             .sameContent(as: last)
     }
 

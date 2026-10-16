@@ -125,7 +125,7 @@ public struct QuietRetryTracker: Equatable, Sendable {
     public init() {}
 
     /// Returns the decision; `quiet` marks the city updating.
-    public mutating func failed(_ id: String, error: Error, attempt: Int, hasReport: Bool, backoffUntil: Date?,
+    public mutating func failed(_ id: String, error: Error, hasReport: Bool, backoffUntil: Date?,
                                 refreshInterval: TimeInterval, now: Date = Date()) -> FetchRetryPolicy.Decision {
         let d = FetchRetryPolicy.decide(error: error, attempt: quietAttempts[id, default: 0], backoffUntil: backoffUntil,
                                         refreshInterval: refreshInterval, hasReport: hasReport,

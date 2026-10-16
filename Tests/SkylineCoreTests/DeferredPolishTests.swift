@@ -26,16 +26,34 @@ struct DeferredPolishTests {
         #expect(UserFacingError.busyLine(host: "api.open-meteo.com", until: mid, timeZone: tz, locale: us)
             .hasSuffix("3:06 PM"))
         #expect(UserFacingError.clockTime(t, timeZone: tz, locale: us, roundUp: true).hasPrefix("3:05"))
-        for s in Swift.stride(from: 0.0, to: 600, by: 7) {
-            let until = t.addingTimeInterval(s)
-            let line = UserFacingError.clockTime(until.addingTimeInterval(UserFacingError.retrySlack),
-                                                 timeZone: tz, locale: Locale(identifier: "en_GB"), roundUp: true)
-            let parts = line.split(separator: ":").compactMap { Int($0) }
-            var c = Calendar(identifier: .gregorian); c.timeZone = tz
-            let d = c.dateComponents([.year, .month, .day], from: until)
-            let shown = c.date(from: DateComponents(year: d.year, month: d.month, day: d.day, hour: parts[0], minute: parts[1]))!
-            #expect(shown >= until.addingTimeInterval(UserFacingError.retrySlack))
+        // Every second across an hour boundary and midnight: the minute shown is the first whole minute at
+        // or after the latest retry moment (until + slack), compared as minutes of the day (mod 1440).
+        let gb = Locale(identifier: "en_GB")
+        let midnight = Date(timeIntervalSince1970: 1_800_000_000 - 8 * 3600 + 24 * 3600)
+        for base in [t.addingTimeInterval(54 * 60), midnight.addingTimeInterval(-5 * 60)] {
+            for s in Swift.stride(from: 0.0, to: 600, by: 1) {
+                let until = base.addingTimeInterval(s)
+                let line = UserFacingError.clockTime(until.addingTimeInterval(UserFacingError.retrySlack),
+                                                     timeZone: tz, locale: gb, roundUp: true)
+                let p = line.split(separator: ":").compactMap { Int($0) }
+                let shown = p[0] * 60 + p[1]
+                let secOfDay = (until.timeIntervalSince1970 + UserFacingError.retrySlack).truncatingRemainder(dividingBy: 86400)
+                let expected = Int((secOfDay / 60).rounded(.up)) % 1440
+                #expect(shown == expected, "\(until) → \(line)")
+            }
         }
+    }
+
+    @Test func roundUpRollsOverAtFiftyNineAndMidnight() {
+        let gb = Locale(identifier: "en_GB"), us = Locale(identifier: "en_US")
+        let midnight = Date(timeIntervalSince1970: 1_800_000_000 - 8 * 3600 + 24 * 3600)
+        #expect(UserFacingError.clockTime(t.addingTimeInterval(54 * 60 + 40), timeZone: tz, locale: gb, roundUp: true) == "16:00") // 15:59:40
+        #expect(UserFacingError.clockTime(midnight.addingTimeInterval(-30), timeZone: tz, locale: gb, roundUp: true) == "00:00")
+        #expect(UserFacingError.clockTime(midnight, timeZone: tz, locale: gb, roundUp: true) == "00:00") // exact minute stays
+        #expect(UserFacingError.clockTime(midnight.addingTimeInterval(-30), timeZone: tz, locale: us, roundUp: true) == "12:00 AM")
+        // 23:59:50 + 12 s slack = 00:00:02 → 00:01.
+        #expect(UserFacingError.busyLine(host: "api.open-meteo.com", until: midnight.addingTimeInterval(-10), timeZone: tz, locale: gb)
+            .hasSuffix("00:01"))
     }
 
     @Test func provisionalRetriesStopAfterTheCap() {
@@ -87,57 +105,8 @@ struct DeferredPolishTests {
     }
 }
 
-/// Sint Maarten: deleted on the iMac at 12:38 PM ET (in `deletedByUser`), back at 1:15 PM ET with a
-/// fresh stamp written by this MacBook. A Mac whose local list still had the city (its last-synced state
-/// already had the tombstone) noted it as a brand-new add, and the newer stamp beat the delete.
-struct StaleCopyResurrectionTests {
-    let sm = WeatherLocation(id: "52.7725,4.7458", name: "Sint Maarten", coordinate: Coordinate(latitude: 52.7725, longitude: 4.7458))
-    let ny = WeatherLocation(id: "40.7128,-74.0060", name: "New York", coordinate: Coordinate(latitude: 40.7128, longitude: -74.006))
-    let deletedAt = Date(timeIntervalSince1970: 1_800_000_000)
-
-    /// Last-synced state after the other Mac's delete was merged in.
-    func lastSynced() -> SyncDocument {
-        var d = SyncDocument()
-        d.locations = [ny]
-        d.locationStamps = [ny.id: deletedAt.addingTimeInterval(-3600)]
-        d.removed = [sm.id: deletedAt]
-        d.deletedByUser = [sm.id: deletedAt]
-        return d
-    }
-
-    @Test func staleLocalCopyIsNotResurrected() {
-        let now = deletedAt.addingTimeInterval(37 * 60)
-        let local = SyncDocument.noting(locations: [ny, sm], settings: [:], previous: lastSynced(), now: now, deletions: [:])
-        #expect(!local.locations.contains { $0.id == sm.id })
-        #expect(local.locationStamps[sm.id] == nil)
-        #expect(local.removed[sm.id] == deletedAt && local.deletedByUser[sm.id] == deletedAt)
-        // And merging with the file keeps it deleted.
-        let merged = SyncDocument.merge(local: local, remote: lastSynced(), now: now)
-        #expect(!merged.locations.contains { $0.id == sm.id })
-    }
-
-    @Test func reAddAfterTheDeleteIsKept() {
-        let now = deletedAt.addingTimeInterval(600)
-        let local = SyncDocument.noting(locations: [ny, sm], settings: [:], previous: lastSynced(), now: now, deletions: [:],
-                                        additions: [sm.id: deletedAt.addingTimeInterval(300)])
-        #expect(local.locations.contains { $0.id == sm.id })
-        let merged = SyncDocument.merge(local: local, remote: lastSynced(), now: now)
-        #expect(merged.locations.contains { $0.id == sm.id })
-        // An add from before the delete doesn't count.
-        let old = SyncDocument.noting(locations: [ny, sm], settings: [:], previous: lastSynced(), now: now, deletions: [:],
-                                      additions: [sm.id: deletedAt.addingTimeInterval(-60)])
-        #expect(!old.locations.contains { $0.id == sm.id })
-    }
-
-    @Test func launchDropsAStaleCopyButKeepsNewCities() {
-        let paris = WeatherLocation(id: "48.8566,2.3522", name: "Paris", coordinate: Coordinate(latitude: 48.8566, longitude: 2.3522))
-        let out = LocationPersistence.launchLocations(local: [ny, sm, paris], lastSynced: [ny], removed: lastSynced().removed)
-        #expect(out.map(\.id) == [ny.id, paris.id])
-        let kept = LocationPersistence.launchLocations(local: [ny, sm], lastSynced: [ny], removed: lastSynced().removed,
-                                                       added: [sm.id: deletedAt.addingTimeInterval(1)])
-        #expect(kept.map(\.id) == [ny.id, sm.id])
-    }
-
+/// "Nearest (K…)" radar site label.
+struct NearestSiteLabelTests {
     @Test func nearestLabelNamesTheCurrentSite() {
         #expect(RadarSiteChoice.nearestLabel(nil) == "Nearest")
         let fairfield = Coordinate(latitude: 41.1408, longitude: -73.2613)

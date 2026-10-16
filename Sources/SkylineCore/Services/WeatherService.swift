@@ -414,6 +414,7 @@ public actor WeatherService {
         if waits { try await prepareForceFetch(host) }
         // Same URL already on the wire (not forced): share its answer, no second GET or queue slot.
         if !force, let shared = inFlightGets[key] {
+            joinedGets += 1
             if priority == .interactive { promote(key) }
             return try await shared.value
         }
@@ -509,6 +510,9 @@ public actor WeatherService {
 
     /// Test seam: how many GETs are queued for the Open-Meteo lock (ordering tests wait on this, not sleeps).
     func openMeteoQueueDepth() -> Int { openMeteoWaiters.count }
+    /// Tests: how many callers joined an in-flight GET (deterministic instead of a sleep, CR #8 low).
+    private(set) var joinedGets = 0
+    func joinedGetCount() -> Int { joinedGets }
 
     private func acquireOpenMeteo(_ priority: FetchPriority, key: String? = nil) async {
         if !openMeteoBusy {

@@ -71,7 +71,7 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     /// become tombstones. A city that is merely missing from `locations` is kept, never inferred removed.
     public static func noting(locations: [WeatherLocation], settings: [String: String],
                               previous: SyncDocument, now wallClock: Date,
-                              deletions: [String: Date], additions: [String: Date] = [:]) -> SyncDocument {
+                              deletions: [String: Date]) -> SyncDocument {
         // A delete applies unless the last-synced state already has it, or saw a re-add newer than it.
         let prevIDs = Set(previous.locations.map(\.id))
         let applied = deletions.filter { id, at in
@@ -79,14 +79,7 @@ public struct SyncDocument: Codable, Equatable, Sendable {
                 && (previous.locationStamps[id].map { $0 <= at } ?? true)
         }
         let localIDs = Set(locations.map(\.id))
-        // Sint Maarten fix: a city this Mac still has but the last-synced state already tombstoned (deleted
-        // on another Mac) is a stale copy, not a new add. Without this it got a fresh stamp and the next
-        // merge resurrected it. Only user deletes count (inferred tombstones are what the one-time
-        // recovery brings back). Only a re-add here after that removal (search / undo, `additions`) keeps it.
-        let stale = Set(locations.map(\.id).filter { id in
-            !prevIDs.contains(id) && previous.deletedByUser[id] != nil && previous.removed[id].map { removedAt in (additions[id] ?? .distantPast) <= removedAt } == true
-        })
-        var effective = locations.filter { applied[$0.id] == nil && !stale.contains($0.id) }
+        var effective = locations.filter { applied[$0.id] == nil }
         // Missing without a recorded delete: never inferred removed, put back.
         for l in previous.locations where !localIDs.contains(l.id) && deletions[l.id] == nil { effective.append(l) }
         // Deleted here but re-added on another Mac after the delete: keep the city.
@@ -219,8 +212,8 @@ public struct SyncDocument: Codable, Equatable, Sendable {
     /// never reverts them. Returns `merged` unchanged when nothing changed locally in the meantime.
     public static func rebasing(locations: [WeatherLocation], settings: [String: String],
                                 snapshot: SyncDocument, onto merged: SyncDocument, now: Date,
-                                deletions: [String: Date]? = nil, additions: [String: Date] = [:]) -> SyncDocument {
-        let edits = deletions.map { noting(locations: locations, settings: settings, previous: snapshot, now: now, deletions: $0, additions: additions) }
+                                deletions: [String: Date]? = nil) -> SyncDocument {
+        let edits = deletions.map { noting(locations: locations, settings: settings, previous: snapshot, now: now, deletions: $0) }
             ?? noting(locations: locations, settings: settings, previous: snapshot, now: now)
         guard !edits.sameContent(as: snapshot) else { return merged }
         var out = merge(local: edits, remote: merged, now: now)

@@ -517,7 +517,8 @@ final class RangeRingsOverlay: NSView {
                 let p = map.convert(CLLocationCoordinate2D(latitude: ne.latitude, longitude: ne.longitude), toPointTo: self)
                 labels[i].contentsScale = scale
                 labels[i].string = "\(Int(ring.miles)) mi"
-                labels[i].frame = CGRect(x: p.x + 3, y: p.y + 2, width: 44, height: 14)
+                // CR #8 low: room for "250 mi" at 10 pt (≈ 34 pt) with margin; height matches the 10 pt line.
+                labels[i].frame = CGRect(x: p.x + 3, y: p.y + 2, width: 56, height: 14)
             }
         }
         CATransaction.commit()
