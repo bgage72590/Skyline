@@ -145,4 +145,14 @@ final class RadarFeaturesTests: XCTestCase {
         XCTAssertNil(StormMotion.etaMinutes(cell: away, to: loc))
         XCTAssertFalse(StormMotion.callout(cell: away, location: loc).contains("~"))
     }
+
+    // MARK: Feature 5 — playback speed
+
+    func testPlaybackSpeedScalesFrameInterval() {
+        XCTAssertEqual(RadarPlaybackSpeed.one.frameMilliseconds(baseMs: 550), 550, accuracy: 0.01)
+        XCTAssertEqual(RadarPlaybackSpeed.two.frameMilliseconds(baseMs: 550), 275, accuracy: 0.01)
+        XCTAssertEqual(RadarPlaybackSpeed.four.frameMilliseconds(baseMs: 550), 137.5, accuracy: 0.01)
+        XCTAssertEqual(RadarPlaybackSpeed.half.frameMilliseconds(baseMs: 550), 1100, accuracy: 0.01)
+        XCTAssertEqual(RadarPlaybackSpeed.allCases.map(\.label), ["½×", "1×", "2×", "4×"])
+    }
 }

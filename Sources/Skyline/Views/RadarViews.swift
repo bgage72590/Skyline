@@ -421,6 +421,28 @@ struct RadarTimeline: View {
     var body: some View {
         HStack(spacing: 14) {
             RadarPlayButton(radar: radar)
+            Button {
+                radar.jumpToNow()
+            } label: {
+                Text("Now")
+                    .font(.caption.weight(.bold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(.white.opacity(0.18)))
+            }
+            .buttonStyle(.plain)
+            .disabled(radar.frames.isEmpty || radar.index == radar.nowIndex)
+            .help("Jump to the newest scan")
+            .accessibilityLabel("Jump to now")
+
+            Picker("Speed", selection: Binding(get: { radar.playbackSpeed },
+                                               set: { radar.setPlaybackSpeed($0) })) {
+                ForEach(RadarPlaybackSpeed.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 150)
+            .help("Playback speed")
 
             VStack(spacing: 4) {
                 Slider(value: Binding(get: { Double(radar.index) },

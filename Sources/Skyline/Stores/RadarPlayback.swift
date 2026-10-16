@@ -22,6 +22,11 @@ final class RadarPlayback {
     /// Future radar (T12): HRRR forecast frames after "now" (NEXRAD only). Persisted; off by default
     /// (radar-features §4) so a first launch stays on observed scans until the user opts in.
     private(set) var showsFuture: Bool = UserDefaults.standard.object(forKey: "radarFuture") as? Bool ?? false
+    /// Loop playback speed (½×…4×). Persisted.
+    private(set) var playbackSpeed: RadarPlaybackSpeed = {
+        let raw = UserDefaults.standard.double(forKey: "radarPlaybackSpeed")
+        return RadarPlaybackSpeed(rawValue: raw) ?? .one
+    }()
     /// Reflectivity loop, or a rainfall-total overlay (L21, NEXRAD/US only). Not persisted: each launch
     /// starts on the radar.
     private(set) var layer: RadarLayer = .reflectivity
@@ -81,6 +86,7 @@ final class RadarPlayback {
     @ObservationIgnored private var loadedAt: Date?
     @ObservationIgnored private var generation = RequestGeneration()
 
+    static let baseFrameMs: Double = 550
     static let frameInterval: Duration = .milliseconds(550)
     static let holdOnLatest: Duration = .milliseconds(1600)
     /// A short pause on "now" before the forecast frames, so the hand-off is visible.
@@ -312,6 +318,22 @@ final class RadarPlayback {
         if next != index { index = next }
     }
 
+    /// Jump the scrubber to the newest observed scan ("Now").
+    func jumpToNow() {
+        scrub(to: nowIndex)
+    }
+
+    func setPlaybackSpeed(_ speed: RadarPlaybackSpeed) {
+        guard speed != playbackSpeed else { return }
+        playbackSpeed = speed
+        UserDefaults.standard.set(speed.rawValue, forKey: "radarPlaybackSpeed")
+        // Restart the clock so the new interval applies immediately.
+        if clock.isOccupied {
+            clock.cancel()
+            updateClock()
+        }
+    }
+
     private func updateClock() {
         let shouldRun = isPlaying && isVisible && isReady && frames.count > 1
         if shouldRun == clock.isOccupied { return }
@@ -360,8 +382,9 @@ final class RadarPlayback {
         }
     }
 
-    // MARK: Playback speed (feature 5 hooks live here too when added)
-
-    /// Effective frame interval (respects playback speed once feature 5 lands).
-    private var frameInterval: Duration { Self.frameInterval }
+    /// Effective frame interval at the current playback speed.
+    private var frameInterval: Duration {
+        let ms = playbackSpeed.frameMilliseconds(baseMs: Self.baseFrameMs)
+        return .milliseconds(Int(ms.rounded()))
+    }
 }

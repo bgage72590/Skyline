@@ -490,7 +490,7 @@ final class Batch4Tests: XCTestCase {
         let blended = ForecastBlender.blendHourly(openMeteo: om, nwsHourly: [], now: blendNow)
         let h = try XCTUnwrap(blended.first)
         // best_match 15×2 + GFS 15×1 + ECMWF 10×1.5 + ICON 10×1
-        let expected: Double = 75.0 / 5.5
+        let expected: Double = 70.0 / 5.5
         XCTAssertEqual(h.temperature, expected, accuracy: 1e-9, "GFS keeps its own vote")
     }
 
