@@ -47,8 +47,11 @@ final class ReviewBatch7Tests: XCTestCase {
     func testLocationGuard() {
         let a = Coordinate(latitude: 40.7, longitude: -74.0), b = Coordinate(latitude: 41.0, longitude: -74.0)
         XCTAssertTrue(CurrentLocationGuard.isCurrent(a, current: a))
-        XCTAssertFalse(CurrentLocationGuard.isCurrent(a, current: b))
+        XCTAssertFalse(CurrentLocationGuard.isCurrent(a, current: b), "a different place is still rejected")
         XCTAssertFalse(CurrentLocationGuard.isCurrent(a, current: nil))
+        let jitter = Coordinate(latitude: 40.704, longitude: -74.003)
+        XCTAssertNotEqual(jitter, a)
+        XCTAssertTrue(CurrentLocationGuard.isCurrent(a, current: jitter), "same ~1 km cell")
     }
 
     /// MF2 still holds with ISO codes: the 11 towns with "US" are in NWS coverage; Windsor "CA" isn't.

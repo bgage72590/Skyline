@@ -31,7 +31,7 @@ extension HTTPError: LocalizedError {
 
 /// Plain-English wording for errors shown in the UI (instead of "…HTTPError error 0.").
 public enum UserFacingError {
-    public static func message(_ error: Error, now: Date = Date()) -> String {
+    public static func message(_ error: Error, now: Date = Date(), timeZone: TimeZone = .current) -> String {
         if let u = error as? URLError {
             switch u.code {
             case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed, .internationalRoamingOff:
@@ -47,8 +47,8 @@ public enum UserFacingError {
             switch h {
             case .throttled(_, _, let after):
                 return "Weather service is busy. Skyline will try again" + wait(after) + "."
-            case .backingOff(_, let until):
-                return "Weather service is busy. Skyline will try again" + wait(until.timeIntervalSince(now)) + "."
+            case .backingOff(let host, let until):
+                return busyLine(host: host, until: until, timeZone: timeZone)
             case .status(let code, _) where code >= 500:
                 return "Weather service didn’t respond (error \(code))."
             case .status(404, _): return "No weather data for this place."
@@ -58,6 +58,20 @@ public enum UserFacingError {
         }
         if error is DecodingError { return "Weather service sent data Skyline couldn’t read." }
         return "Something went wrong loading the weather."
+    }
+
+    /// "Open-Meteo busy, retrying at 3:05 PM" — local clock time, not a duration.
+    public static func busyLine(host: String, until: Date, timeZone: TimeZone = .current) -> String {
+        let who = host == "api.open-meteo.com" ? "Open-Meteo" : "Weather service"
+        return "\(who) busy, retrying at \(clockTime(until, timeZone: timeZone))"
+    }
+
+    public static func clockTime(_ date: Date, timeZone: TimeZone = .current) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = timeZone
+        f.dateFormat = "h:mm a"
+        return f.string(from: date)
     }
 
     private static func wait(_ seconds: TimeInterval?) -> String {
