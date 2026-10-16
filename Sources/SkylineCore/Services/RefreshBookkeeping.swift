@@ -83,11 +83,23 @@ public enum FetchRetryPolicy {
     }
 
     /// `attempt` = failures so far for this city (0 for the first). `jitterSeed` spreads cities apart.
+    /// Follow-up L1: 0 to `maxJitter` s, spread over 1000 steps from a stable hash of the city id.
+    public static let maxJitter: TimeInterval = 5
+
+    public static func jitter(for id: String) -> TimeInterval {
+        var h: UInt64 = 0xcbf29ce484222325 // FNV-1a
+        for b in id.utf8 { h = (h ^ UInt64(b)) &* 0x100000001b3 }
+        return Double(h % 1000) / 1000 * maxJitter
+    }
+
+    /// `hasReport` (follow-up M3): a city with saved data on screen gets no quick retries, only the
+    /// PR #2 ladder; the quiet ladder is for cities that have nothing to show yet.
     public static func decide(error: Error, attempt: Int, backoffUntil: Date?, refreshInterval: TimeInterval,
-                              jitterSeed: Int = 0, now: Date = Date()) -> Decision {
-        let jitter = Double(abs(jitterSeed) % 4) // 0–3 s, so retries after one back-off don't line up
+                              jitterSeed: Int = 0, hasReport: Bool = false, jitter fixedJitter: TimeInterval? = nil,
+                              now: Date = Date()) -> Decision {
+        let jitter = fixedJitter ?? Double(abs(jitterSeed) % 1000) / 1000 * maxJitter
         let wait = max(0, (backoffUntil ?? RefreshBookkeeping.notBefore(error, now: now) ?? now).timeIntervalSince(now))
-        if isTransient(error), attempt < quickRetries.count {
+        if !hasReport, isTransient(error), attempt < quickRetries.count {
             return Decision(quiet: true, retryAfter: max(quickRetries[attempt], wait + 1) + jitter)
         }
         let slow = attempt - quickRetries.count
@@ -99,4 +111,42 @@ public enum FetchRetryPolicy {
     public static func priority(force: Bool, hasReport: Bool) -> FetchPriority {
         force || !hasReport ? .interactive : .background
     }
+}
+
+
+/// Follow-up (LOW L3 + "Updating… clears" test): the store's quiet-retry bookkeeping, pure so it is
+/// testable. A city is "updating" from a quiet failure until a success, a non-quiet failure, an
+/// abandoned retry (not visible), or a dropped answer (My Location moved).
+public struct QuietRetryTracker: Equatable, Sendable {
+    public private(set) var updating: Set<String> = []
+    /// Quiet attempts used per city, so the PR #2 ladder after them starts at 1 min.
+    public private(set) var quietAttempts: [String: Int] = [:]
+
+    public init() {}
+
+    /// Returns the decision; `quiet` marks the city updating.
+    public mutating func failed(_ id: String, error: Error, attempt: Int, hasReport: Bool, backoffUntil: Date?,
+                                refreshInterval: TimeInterval, now: Date = Date()) -> FetchRetryPolicy.Decision {
+        let d = FetchRetryPolicy.decide(error: error, attempt: quietAttempts[id, default: 0], backoffUntil: backoffUntil,
+                                        refreshInterval: refreshInterval, hasReport: hasReport,
+                                        jitter: FetchRetryPolicy.jitter(for: id), now: now)
+        if d.quiet {
+            updating.insert(id)
+            quietAttempts[id, default: 0] += 1
+        } else {
+            updating.remove(id)
+        }
+        return d
+    }
+
+    public mutating func succeeded(_ id: String) {
+        updating.remove(id)
+        quietAttempts[id] = nil
+    }
+
+    /// The retry won't run (city not visible) or the answer was dropped: stop showing "Updating…".
+    public mutating func abandoned(_ id: String) { updating.remove(id) }
+
+    /// Index into the PR #2 exponential ladder for the next non-quiet retry.
+    public func ladderIndex(_ id: String, attempt: Int) -> Int { max(0, attempt - quietAttempts[id, default: 0]) }
 }

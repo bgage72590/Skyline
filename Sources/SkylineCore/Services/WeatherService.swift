@@ -64,7 +64,9 @@ public actor WeatherService {
     private var openMeteoBusy = false
     /// Item 2: interactive turns (a city with nothing on screen yet, a forced Retry) go ahead of
     /// queued background refreshes; FIFO within each class. Still one GET at a time.
-    private var openMeteoWaiters: [(priority: FetchPriority, cont: CheckedContinuation<Void, Never>)] = []
+    private var openMeteoWaiters: [(priority: FetchPriority, key: String?, cont: CheckedContinuation<Void, Never>)] = []
+    /// Follow-up M1: priority of each shared GET, so a new city joining a background one promotes it.
+    private var inFlightPriority: [String: FetchPriority] = [:]
     /// Item 2: one network GET per URL; a second caller (add + sync apply + refresh) joins it.
     private var inFlightGets: [String: Task<Fetched, Error>] = [:]
     /// Forecast verification + adaptive weights (nil = fixed weights, nothing recorded; used by tests).
@@ -384,7 +386,10 @@ public actor WeatherService {
         // "retrying at h:mm" without holding `loadingIDs` for the rest of Retry-After.
         if waits { try await prepareForceFetch(host) }
         // Same URL already on the wire (not forced): share its answer, no second GET or queue slot.
-        if !force, let shared = inFlightGets[key] { return try await shared.value }
+        if !force, let shared = inFlightGets[key] {
+            if priority == .interactive { promote(key) }
+            return try await shared.value
+        }
 
         func network() async throws -> Fetched {
             do {
@@ -413,18 +418,19 @@ public actor WeatherService {
 
         func attempt() async throws -> Fetched {
             do {
-                return try await withOpenMeteoTurn(host, priority: priority, network)
+                return try await withOpenMeteoTurn(host, priority: inFlightPriority[key] ?? priority, key: key, network)
             } catch let error as HTTPError {
                 // The city ahead of us in line was throttled. Wait only if the new window still fits.
                 guard waits, case .backingOff = error else { throw error }
                 try await prepareForceFetch(host)
-                return try await withOpenMeteoTurn(host, priority: priority, network)
+                return try await withOpenMeteoTurn(host, priority: inFlightPriority[key] ?? priority, key: key, network)
             }
         }
         if force { return try await attempt() }
         let task = Task { try await attempt() }
         inFlightGets[key] = task
-        defer { inFlightGets[key] = nil }
+        inFlightPriority[key] = priority
+        defer { inFlightGets[key] = nil; inFlightPriority[key] = nil }
         return try await task.value
     }
 
@@ -451,10 +457,10 @@ public actor WeatherService {
     }
 
     /// Serializes `api.open-meteo.com` GETs. Other hosts run straight through.
-    private func withOpenMeteoTurn<T>(_ host: String, priority: FetchPriority = .background,
+    private func withOpenMeteoTurn<T>(_ host: String, priority: FetchPriority = .background, key: String? = nil,
                                       _ body: () async throws -> T) async throws -> T {
         let gate = host == RefreshBookkeeping.openMeteoHost
-        if gate { await acquireOpenMeteo(priority) }
+        if gate { await acquireOpenMeteo(priority, key: key) }
         do {
             let value = try await body()
             if gate { releaseOpenMeteo() }
@@ -465,13 +471,22 @@ public actor WeatherService {
         }
     }
 
-    private func acquireOpenMeteo(_ priority: FetchPriority) async {
+    /// Follow-up M1: an interactive caller joined this shared GET; if it is still queued, move it up.
+    private func promote(_ key: String) {
+        inFlightPriority[key] = .interactive
+        for i in openMeteoWaiters.indices where openMeteoWaiters[i].key == key { openMeteoWaiters[i].priority = .interactive }
+    }
+
+    /// Test seam: how many GETs are queued for the Open-Meteo lock (ordering tests wait on this, not sleeps).
+    func openMeteoQueueDepth() -> Int { openMeteoWaiters.count }
+
+    private func acquireOpenMeteo(_ priority: FetchPriority, key: String? = nil) async {
         if !openMeteoBusy {
             openMeteoBusy = true
             return
         }
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            openMeteoWaiters.append((priority, cont))
+            openMeteoWaiters.append((priority, key, cont))
         }
     }
 
