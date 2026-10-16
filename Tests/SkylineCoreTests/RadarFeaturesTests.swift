@@ -55,4 +55,49 @@ final class RadarFeaturesTests: XCTestCase {
         let showsFuture = stored ?? false
         XCTAssertFalse(showsFuture)
     }
+
+    // MARK: Feature 3 — alert hit testing + range rings
+
+    func testAlertHitTestingOnlyInsidePolygon() {
+        // Unit square around NYC-ish coords (lat/lon as a flat polygon for the ray cast).
+        let ring = [
+            Coordinate(latitude: 40.0, longitude: -74.5),
+            Coordinate(latitude: 41.0, longitude: -74.5),
+            Coordinate(latitude: 41.0, longitude: -73.5),
+            Coordinate(latitude: 40.0, longitude: -73.5),
+            Coordinate(latitude: 40.0, longitude: -74.5),
+        ]
+        let shapes = [(id: "warn-1", rings: [ring])]
+        XCTAssertEqual(AlertHitTesting.alertID(at: Coordinate(latitude: 40.5, longitude: -74.0), shapes: shapes), "warn-1")
+        XCTAssertNil(AlertHitTesting.alertID(at: Coordinate(latitude: 42.0, longitude: -74.0), shapes: shapes))
+        XCTAssertFalse(AlertHitTesting.contains(Coordinate(latitude: 39.0, longitude: -74.0), shapes: shapes))
+    }
+
+    func testAlertHitTestingPrefersLaterOverlappingShape() {
+        let a = [
+            Coordinate(latitude: 0, longitude: 0), Coordinate(latitude: 2, longitude: 0),
+            Coordinate(latitude: 2, longitude: 2), Coordinate(latitude: 0, longitude: 2),
+            Coordinate(latitude: 0, longitude: 0),
+        ]
+        let b = [
+            Coordinate(latitude: 1, longitude: 1), Coordinate(latitude: 3, longitude: 1),
+            Coordinate(latitude: 3, longitude: 3), Coordinate(latitude: 1, longitude: 3),
+            Coordinate(latitude: 1, longitude: 1),
+        ]
+        let shapes = [(id: "a", rings: [a]), (id: "b", rings: [b])]
+        XCTAssertEqual(AlertHitTesting.alertID(at: Coordinate(latitude: 1.5, longitude: 1.5), shapes: shapes), "b")
+        XCTAssertEqual(AlertHitTesting.alertID(at: Coordinate(latitude: 0.5, longitude: 0.5), shapes: shapes), "a")
+    }
+
+    func testRangeRingsMilesAndDestination() {
+        XCTAssertEqual(RangeRings.miles, [10, 25, 50])
+        XCTAssertEqual(RangeRings.meters(10), 16093.44, accuracy: 0.01)
+        let origin = Coordinate(latitude: 40.0, longitude: -75.0)
+        let north = RangeRings.destination(from: origin, meters: 1609.344, bearingDegrees: 0)
+        XCTAssertGreaterThan(north.latitude, origin.latitude)
+        XCTAssertEqual(north.longitude, origin.longitude, accuracy: 0.01)
+        let ring = RangeRings.ring(center: origin, miles: 10)
+        XCTAssertEqual(ring.first, ring.last)
+        XCTAssertEqual(ring.count, 73)
+    }
 }

@@ -83,6 +83,8 @@ struct ExpandedRadarView: View {
     var mapOverscan: CGFloat = 0
     @Environment(WeatherStore.self) private var store
     @AppStorage(RadarOpacity.key) private var opacity = RadarOpacity.defaultValue
+    @State private var selectedAlert: WeatherAlert?
+    @State private var recenterToken = 0
 
     var body: some View {
         let radar = store.radar
@@ -101,6 +103,9 @@ struct ExpandedRadarView: View {
                     } else {
                         CircleButton(systemImage: "arrow.down.right.and.arrow.up.left", help: "Collapse map (Esc)") { collapse() }
                             .keyboardShortcut(.cancelAction)
+                    }
+                    CircleButton(systemImage: "location.fill", help: "Center on \(location.isCurrentLocation ? "me" : location.name)") {
+                        recenterToken += 1
                     }
                     VStack(alignment: .leading, spacing: 2) {
                         Text(location.isCurrentLocation ? "My Location" : location.name).font(.headline)
@@ -156,7 +161,13 @@ struct ExpandedRadarView: View {
                          spanDegrees: radar.provider == .nexrad ? 5 : 9, opacity: opacity,
                          pinText: pinText, followsPlayback: true, reportsProgress: true,
                          alerts: alerts, focusedAlertID: store.focusedAlertID,
-                         horizontalOverscan: mapOverscan)
+                         horizontalOverscan: mapOverscan,
+                         onAlertSelect: { id in
+                             if let alert = alerts.first(where: { $0.id == id }) {
+                                 selectedAlert = alert
+                             }
+                         },
+                         recenterToken: recenterToken)
                 .padding(.horizontal, -mapOverscan)
         }
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -167,6 +178,11 @@ struct ExpandedRadarView: View {
         // (a render transform, no re-layout of the map).
         .modifier(MatchedIfExpanded(enabled: false, namespace: namespace, isSource: store.radarExpanded))
         .foregroundStyle(.white)
+        .sheet(item: $selectedAlert) { alert in
+            AlertDetailView(alert: alert, timeZone: location.timeZone) {
+                store.showAlertOnMap(alert, wideLayout: true)
+            }
+        }
         .task(id: location.id) {
             // One index load (L7): configure doesn't start its own when we await one here.
             radar.configure(for: location, load: false)
