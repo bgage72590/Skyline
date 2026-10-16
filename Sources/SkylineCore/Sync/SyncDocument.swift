@@ -92,11 +92,13 @@ public struct SyncDocument: Codable, Equatable, Sendable {
             return (previous.removed[id].map { $0 < at } ?? true) && (previous.locationStamps[id].map { $0 <= at } ?? true)
         }
         let localIDs = Set(locations.map(\.id))
-        // Sint Maarten (CR H2): a city the last-synced state shows as removed, still in this Mac's list
-        // without a logged re-add (search or undo), is a stale copy the UI never dropped. It is not a new
+        // Sint Maarten (CR H2): a city the last-synced state shows as deleted by the user, still in this Mac's list
+        // without a logged re-add (search or undo), is a stale copy the UI never dropped. Tombstones an old
+        // build inferred (not in `deletedByUser`) never purge (CR #10 M1): the city stays, as before. It is not a new
         // add: drop it (the store is then purged by applying the result) instead of stamping it fresh.
         var effective = locations.filter { l in
-            applied[l.id] == nil && !(!prevIDs.contains(l.id) && previous.removed[l.id] != nil && additions[l.id] == nil)
+            applied[l.id] == nil && !(!prevIDs.contains(l.id) && previous.removed[l.id] != nil
+                && previous.deletedByUser[l.id] != nil && additions[l.id] == nil)
         }
         // Missing without a recorded delete: never inferred removed, put back.
         for l in previous.locations where !localIDs.contains(l.id) && deletions[l.id] == nil { effective.append(l) }

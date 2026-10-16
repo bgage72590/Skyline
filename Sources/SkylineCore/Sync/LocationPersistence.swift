@@ -92,8 +92,10 @@ public final class DeletionLog: @unchecked Sendable {
         let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601; enc.outputFormatting = .sortedKeys
         guard let data = try? enc.encode(entries) else { return }
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: url, options: .atomic)
+        // Versions first (CR #10 L4): a crash between the two atomic writes never leaves a delete without its
+        // seen version; at worst a stale version for an entry that wasn't written, which `init` ignores.
         if let v = try? enc.encode(seenVersions) { try? v.write(to: versionsURL, options: .atomic) }
+        try? data.write(to: url, options: .atomic)
     }
 }
 

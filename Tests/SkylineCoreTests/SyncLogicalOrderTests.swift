@@ -154,6 +154,38 @@ final class SyncLogicalOrderTests: XCTestCase {
         XCTAssertEqual(ids(d), [ny.id, sx.id])
     }
 
+    /// CR #10 M1: a tombstone an old build inferred (not a user delete) never purges the city here.
+    func testInferredTombstoneDoesNotPurge() {
+        var last = shared()
+        last.locations = [ny]; last.locationStamps[sx.id] = nil; last.removed[sx.id] = t0 + 60   // no deletedByUser
+        let noted = SyncDocument.noting(locations: [ny, sx], settings: [:], previous: last, now: t0 + 120, deletions: [:])
+        XCTAssertEqual(ids(noted), [ny.id, sx.id], "kept and re-stamped, as before this PR")
+        XCTAssertNil(noted.removed[sx.id])
+        // The same tombstone marked as a user delete does purge.
+        last.deletedByUser[sx.id] = t0 + 60
+        XCTAssertEqual(ids(SyncDocument.noting(locations: [ny, sx], settings: [:], previous: last, now: t0 + 120, deletions: [:])), [ny.id])
+    }
+
+    /// CR #10 L4: the delete log and its version file round-trip together; a stray version without an entry is ignored.
+    func testDeletionLogVersionsRoundTrip() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("deletions.json")
+        let log = DeletionLog(url: url, now: t0)
+        log.record(sx.id, at: t0, seenVersion: 4)
+        log.record(ny.id, at: t0)
+        let again = DeletionLog(url: url, now: t0)
+        XCTAssertEqual(again.seenVersions, [sx.id: 4])
+        XCTAssertEqual(Set(again.entries.keys), [sx.id, ny.id])
+        again.forget(sx.id)
+        let third = DeletionLog(url: url, now: t0)
+        XCTAssertTrue(third.seenVersions.isEmpty)
+        // Version written but entry missing (crash between writes): ignored.
+        try JSONEncoder().encode(["x": 9]).write(to: url.deletingPathExtension().appendingPathExtension("versions.json"))
+        XCTAssertTrue(DeletionLog(url: url, now: t0).seenVersions.isEmpty)
+    }
+
     /// A brand-new city (never removed) needs no log entry.
     func testNewCityNeedsNoLog() {
         let d = SyncDocument.noting(locations: [ny], settings: [:], previous: SyncDocument(), now: t0, deletions: [:])
