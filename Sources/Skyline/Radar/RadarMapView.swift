@@ -804,6 +804,8 @@ final class RadarLayerView: NSView {
         var tiles: [[TileKey: RadarTile]]
         var requested: [Set<TileKey>]
         var missing: [Set<TileKey>]
+        /// Shown unmasked while their QC mask was unavailable (CR #6.3); re-requested after back-off.
+        var provisional: [Set<TileKey>]
 
         deinit { RadarLayerView.liveTiles -= tiles.reduce(0) { $0 + $1.count } }
 
@@ -812,6 +814,7 @@ final class RadarLayerView: NSView {
             tiles = Array(repeating: [:], count: frames.count)
             requested = Array(repeating: [], count: frames.count)
             missing = Array(repeating: [], count: frames.count)
+            provisional = Array(repeating: [], count: frames.count)
         }
 
         func isComplete(_ i: Int, desired: [TileKey]) -> Bool {
@@ -883,6 +886,12 @@ final class RadarLayerView: NSView {
                     return RadarImageCache.shared.recentlyFailed(url)
                 }
                 if g.missing[i].count != before { changed = true }
+            }
+            for i in g.frames.indices where !g.provisional[i].isEmpty {
+                let frame = g.frames[i]
+                if g.provisional[i].contains(where: { key in
+                    frame.url(z: key.z, x: key.x, y: key.y).map { !RadarImageCache.shared.recentlyFailed($0) } ?? false
+                }) { changed = true }
             }
         }
         if changed { updateTiles(allowZoomChange: false) }
@@ -1409,12 +1418,17 @@ final class RadarLayerView: NSView {
         guard let g else { return }
         for i in frames where g.frames.indices.contains(i) {
             let frame = g.frames[i]
-            for key in keys where g.tiles[i][key] == nil && !g.missing[i].contains(key) && !g.requested[i].contains(key) {
+            for key in keys where (g.tiles[i][key] == nil || g.provisional[i].contains(key))
+                && !g.missing[i].contains(key) && !g.requested[i].contains(key) {
                 guard let url = frame.url(z: key.z, x: key.x, y: key.y) else { continue }
+                // A provisional (unmasked) tile stays on screen until its back-off is over.
+                if g.tiles[i][key] != nil, RadarImageCache.shared.recentlyFailed(url) { continue }
                 if let image = RadarImageCache.shared.image(for: url) {
                     addTile(image, key: key, frame: i, in: g)
                 } else if RadarImageCache.shared.recentlyFailed(url) {
-                    g.missing[i].insert(key)
+                    if let unmasked = RadarImageCache.shared.provisionalImage(for: url) {
+                        addTile(unmasked, key: key, frame: i, in: g, provisional: true)
+                    } else { g.missing[i].insert(key) }
                 } else {
                     g.requested[i].insert(key)
                     RadarImageCache.shared.load(url, wanted: { [weak self, weak g] in
@@ -1425,7 +1439,9 @@ final class RadarLayerView: NSView {
                     }) { [weak self, weak g] image in
                         guard let self, let g else { return }
                         g.requested[i].remove(key)
-                        if let image { self.addTile(image, key: key, frame: i, in: g) } else { g.missing[i].insert(key) }
+                        if let image {
+                            self.addTile(image, key: key, frame: i, in: g, provisional: RadarImageCache.shared.isProvisional(url))
+                        } else if g.tiles[i][key] == nil { g.missing[i].insert(key) }
                         self.promotePendingIfReady()
                         // The playback's frame may have become complete: show it now.
                         if g === self.active, i == self.shownIndex(g), self.shownFrame != i { self.showTarget(animated: false) }
@@ -1436,10 +1452,12 @@ final class RadarLayerView: NSView {
         }
     }
 
-    private func addTile(_ image: RadarTile, key: TileKey, frame i: Int, in g: Generation) {
-        guard g.tiles[i][key] == nil, key.z == zoom else { return }
+    private func addTile(_ image: RadarTile, key: TileKey, frame i: Int, in g: Generation, provisional: Bool = false) {
+        let replacing = g.tiles[i][key] != nil
+        guard !replacing || g.provisional[i].contains(key), key.z == zoom else { return }
+        if provisional { g.provisional[i].insert(key) } else { g.provisional[i].remove(key) }
         g.tiles[i][key] = image
-        Self.liveTiles += 1
+        if !replacing { Self.liveTiles += 1 }
         Self.addedTiles += 1
         if g === active, i == shownFrame { refreshShown(key) }
     }
@@ -1454,7 +1472,7 @@ final class RadarLayerView: NSView {
         var removed = 0
         for key in Array(g.tiles[i].keys) {
             let stale = (!needed && !onScreen) || (key.z == zoom ? !keep.contains(key) : complete)
-            if stale { g.tiles[i][key] = nil; removed += 1 }
+            if stale { g.tiles[i][key] = nil; g.provisional[i].remove(key); removed += 1 }
         }
         Self.liveTiles -= removed
         g.missing[i] = g.missing[i].filter { $0.z == zoom }

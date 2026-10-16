@@ -131,7 +131,7 @@ public actor WeatherService {
             return try RainViewerParser.decode(data)
         case .nexrad:
             let latest: Date
-            let past: [RadarFrame]
+            var past: [RadarFrame]
             if let site {
                 // Window on a 5-minute grid so the cached scan list's URL is stable between scans.
                 let end = Date(timeIntervalSince1970: ((now().timeIntervalSince1970 / 300).rounded(.down) + 1) * 300)
@@ -146,6 +146,11 @@ public actor WeatherService {
                 let data = try await fetch(Endpoints.iemLatest, ttl: TTL.radarIndex, force: forceRefresh)
                 latest = try IEMNexrad.latestValidTime(data) ?? now()
                 past = IEMNexrad.frames(latest: latest, range: range)
+            }
+            // False-green fix: mask raw reflectivity with MRMS QC'd echoes. Best effort: no mask, no change.
+            if let qc = await optionalFetch(Endpoints.iemLCRefLatest, ttl: TTL.radarIndex, force: forceRefresh, maxStale: 15 * 60),
+               let maskLatest = try? RadarQC.latestValid(qc) {
+                past = RadarQC.masked(past, latestMask: maskLatest)
             }
             guard future,
                   let run = await optionalFetch(Endpoints.iemHRRRLatest, ttl: TTL.hrrrRun, force: false, maxStale: 6 * 3600),
