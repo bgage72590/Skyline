@@ -374,7 +374,7 @@ final class Batch5Tests: XCTestCase {
                        ["2026-10-12T01:30:00Z", "2026-10-12T01:45:00Z", "2026-10-12T02:00:00Z", "2026-10-12T02:15:00Z",
                         "2026-10-12T02:45:00Z", "2026-10-12T03:15:00Z"])
         XCTAssertTrue(frames.allSatisfy(\.isForecast))
-        XCTAssertEqual(frames.first?.urlTemplate, "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/hrrr::REFD-F0150-202610112300/{z}/{x}/{y}.png")
+        XCTAssertEqual(frames.first?.urlTemplate, "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/hrrr::REFP-F0150-202610112300/{z}/{x}/{y}.png")
         // A run too old to reach (past 18 h) gives nothing rather than wrong frames.
         XCTAssertTrue(IEMHRRR.frames(initTime: initTime.addingTimeInterval(-24 * 3600), after: latest).isEmpty)
         XCTAssertEqual(try IEMHRRR.initTime(Data(#"{"model_init_utc": "2026-10-11T23:00:00Z", "forecast_minute": 0.0}"#.utf8)), initTime)
@@ -383,7 +383,7 @@ final class Batch5Tests: XCTestCase {
     func testServiceAppendsFutureFramesOnlyWhenAsked() async throws {
         final class IEM: HTTPClient, @unchecked Sendable {
             func get(_ url: URL, headers: [String: String]) async throws -> Data {
-                if url.absoluteString.contains("hrrr/refd_0000.json") { return Data(#"{"model_init_utc": "2026-10-11T23:00:00Z"}"#.utf8) }
+                if url.absoluteString.contains("hrrr/refp_0000.json") { return Data(#"{"model_init_utc": "2026-10-11T23:00:00Z"}"#.utf8) }
                 return Data(#"{"meta": {"valid": "2026-10-12T01:25:00Z"}}"#.utf8)
             }
         }

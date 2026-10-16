@@ -298,7 +298,7 @@ final class ReviewBatch5Tests: XCTestCase {
         let f = IEMHRRR.frames(initTime: initT, after: latest)
         XCTAssertEqual(f.count, 6)
         XCTAssertTrue(f.allSatisfy { $0.isForecast && $0.time > latest })
-        XCTAssertEqual(f.first?.urlTemplate, "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/hrrr::REFD-F0120-202610120100/{z}/{x}/{y}.png")
+        XCTAssertEqual(f.first?.urlTemplate, "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/hrrr::REFP-F0120-202610120100/{z}/{x}/{y}.png")
         XCTAssertEqual(f.first?.time, iso.date(from: "2026-10-12T03:00:00Z"))
         // A run 17 h old: frames past F1080 are dropped, not requested (IEM answers 503 for them).
         let old = IEMHRRR.frames(initTime: iso.date(from: "2026-10-11T10:00:00Z")!, after: latest)

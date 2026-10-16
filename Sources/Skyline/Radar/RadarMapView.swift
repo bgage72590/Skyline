@@ -37,6 +37,14 @@ struct RadarMapView: NSViewRepresentable {
     /// Points of the map hidden (clipped) on each side; keeps MapKit's legal label and alert framing
     /// inside the visible part.
     var horizontalOverscan: CGFloat = 0
+    /// Click on an alert polygon → open its detail (id). Nil when the map is non-interactive.
+    var onAlertSelect: ((String) -> Void)? = nil
+    /// Bumped to ask the map to re-centre on `center` (the "center on me" button).
+    var recenterToken: Int = 0
+    /// Storm-motion arrows (empty when the radar is hidden or outside CONUS).
+    var stormCells: [StormCell] = []
+    /// Speed unit for storm callouts (mph by default).
+    var stormSpeedUnit: SpeedUnit = .mph
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -58,13 +66,22 @@ struct RadarMapView: NSViewRepresentable {
         // L1: never move the map inside a SwiftUI update (setRegion → delegate callbacks → layer work and
         // a layout pass). Note the new centre now (no double dispatch), move on the next main-queue turn.
         if c.center != center { c.scheduleRecenter(on: center, span: spanDegrees) }
+        if recenterToken != c.lastRecenterToken {
+            c.lastRecenterToken = recenterToken
+            DispatchQueue.main.async { [weak c] in c?.recenter(on: center, span: spanDegrees) }
+        }
         apply(to: container, coordinator: c)
     }
 
     private func apply(to container: RadarMapContainer, coordinator c: Coordinator) {
         container.pin.text = pinText
         container.setOverscan(horizontalOverscan)
+        container.alertOverlay.onSelect = interactive ? onAlertSelect : nil
         container.alertOverlay.setAlerts(alerts.map { AlertOverlayView.Shape(alert: $0) }, focused: focusedAlertID)
+        container.rangeRings.setCenter(center)
+        if interactive {
+            container.stormOverlay.setCells(stormCells, location: center, speedUnit: stormSpeedUnit)
+        }
         if focusedAlertID != c.lastFocusedAlertID {
             c.lastFocusedAlertID = focusedAlertID
             if let id = focusedAlertID, let alert = alerts.first(where: { $0.id == id }), !alert.polygons.isEmpty {
@@ -103,6 +120,7 @@ struct RadarMapView: NSViewRepresentable {
         weak var container: RadarMapContainer?
         var center: Coordinate?
         var lastFocusedAlertID: String?
+        var lastRecenterToken = 0
 
         /// Zooms the map to fit an alert outline.
         func frame(_ rings: [[Coordinate]]) {
@@ -190,6 +208,8 @@ final class RadarMapContainer: NSView {
     nonisolated(unsafe) static var live = 0
     let map = MKMapView()
     let radar = RadarLayerView()
+    let rangeRings = RangeRingsOverlay()
+    let stormOverlay = StormMotionOverlay()
     let alertOverlay = AlertOverlayView()
     let pin = PinView()
     var pinCoordinate: CLLocationCoordinate2D?
@@ -221,10 +241,17 @@ final class RadarMapContainer: NSView {
         }
         addSubview(map)
         addSubview(radar) // invisible tile manager; the radar itself is drawn by MapKit
+        addSubview(rangeRings)
+        addSubview(stormOverlay)
         addSubview(alertOverlay)
         addSubview(pin)
         radar.map = map
+        rangeRings.map = map
+        stormOverlay.map = map
         alertOverlay.map = map
+        if interactive { alertOverlay.attachClickRecognizer(to: map) }
+        rangeRings.isHidden = !interactive
+        stormOverlay.isHidden = !interactive
     }
 
     @available(*, unavailable)
@@ -263,14 +290,20 @@ final class RadarMapContainer: NSView {
         let resized = radar.frame.size != bounds.size
         radar.frame = bounds
         if resized { radar.sizeDidChange() }
+        rangeRings.frame = bounds
+        stormOverlay.frame = bounds
         alertOverlay.frame = bounds
         radar.updateTiles(allowZoomChange: true)
+        rangeRings.relayout()
+        stormOverlay.relayout()
         alertOverlay.relayout()
         layoutPin()
     }
 
     func regionChanged(settled: Bool) {
         if settled { radar.updateTiles(allowZoomChange: true) } else { radar.gestureMoved() }
+        rangeRings.relayout()
+        stormOverlay.relayout()
         alertOverlay.relayout()
         layoutPin()
     }
@@ -289,6 +322,9 @@ final class RadarMapContainer: NSView {
 
 /// NWS alert outlines (severity-coloured stroke + light fill) drawn above the radar. Pure CA:
 /// paths are recomputed from the map's current projection on layout / region change.
+/// All pointer events pass through (so click-drag still pans the map; overscan hitTest on the
+/// container from 743803a is untouched). Clicks inside a polygon use an NSClickGestureRecognizer
+/// on the map instead of claiming hits.
 final class AlertOverlayView: NSView {
     struct Shape: Equatable {
         let id: String
@@ -309,9 +345,13 @@ final class AlertOverlayView: NSView {
     }
 
     weak var map: MKMapView?
+    /// Fired on a click inside a polygon (the alert id).
+    var onSelect: ((String) -> Void)?
     private var shapes: [Shape] = []
     private var focused: String?
     private var layers: [String: CAShapeLayer] = [:]
+    private var paths: [String: CGPath] = [:]
+    private var clickRecognizer: NSClickGestureRecognizer?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -322,7 +362,33 @@ final class AlertOverlayView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    /// Never claim hits — pans/scrolls reach the map (and the container's overscan gate).
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    /// Install a click recognizer on the map so a tap inside a polygon opens the alert without
+    /// swallowing click-drag pans (NSClickGestureRecognizer fails when the pointer moves).
+    func attachClickRecognizer(to mapView: MKMapView) {
+        guard clickRecognizer == nil else { return }
+        let g = NSClickGestureRecognizer(target: self, action: #selector(handleClick(_:)))
+        mapView.addGestureRecognizer(g)
+        clickRecognizer = g
+    }
+
+    @objc private func handleClick(_ gesture: NSClickGestureRecognizer) {
+        guard onSelect != nil, gesture.state == .ended, let mapView = gesture.view else { return }
+        let inMap = gesture.location(in: mapView)
+        let local = convert(inMap, from: mapView)
+        if let id = alertID(at: local) { onSelect?(id) }
+    }
+
+    private func alertID(at local: CGPoint) -> String? {
+        // Prefer the focused outline, then walk back-to-front through drawn paths.
+        if let focused, let path = paths[focused], path.contains(local) { return focused }
+        for shape in shapes.reversed() {
+            if let path = paths[shape.id], path.contains(local) { return shape.id }
+        }
+        return nil
+    }
 
     func setAlerts(_ new: [Shape], focused newFocus: String?) {
         let withOutlines = new.filter { !$0.rings.isEmpty }
@@ -330,7 +396,7 @@ final class AlertOverlayView: NSView {
         shapes = withOutlines
         focused = newFocus
         let ids = Set(shapes.map(\.id))
-        for (id, l) in layers where !ids.contains(id) { l.removeFromSuperlayer(); layers[id] = nil }
+        for (id, l) in layers where !ids.contains(id) { l.removeFromSuperlayer(); layers[id] = nil; paths[id] = nil }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for shape in shapes {
@@ -368,6 +434,189 @@ final class AlertOverlayView: NSView {
             }
             layers[shape.id]?.frame = bounds
             layers[shape.id]?.path = path
+            paths[shape.id] = path
+        }
+        CATransaction.commit()
+    }
+}
+
+/// 10 / 25 / 50 mile range rings around the forecast pin. Geographic mile spacing projected through
+/// the current map region so rings grow/shrink with zoom; never claims hits (pass-through).
+final class RangeRingsOverlay: NSView {
+    weak var map: MKMapView?
+    private var center: Coordinate?
+    private var ringLayers: [CAShapeLayer] = []
+    private var labels: [CATextLayer] = []
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        for _ in RangeRings.miles {
+            let l = CAShapeLayer()
+            l.fillColor = nil
+            l.strokeColor = NSColor.white.withAlphaComponent(0.35).cgColor
+            l.lineWidth = 1
+            l.lineDashPattern = [4, 4]
+            l.actions = ["path": NSNull()]
+            layer?.addSublayer(l)
+            ringLayers.append(l)
+            let t = CATextLayer()
+            t.fontSize = 10
+            t.foregroundColor = NSColor.white.withAlphaComponent(0.7).cgColor
+            t.actions = ["position": NSNull(), "string": NSNull()]
+            layer?.addSublayer(t)
+            labels.append(t)
+        }
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    private var screenScale: CGFloat {
+        window?.screen?.backingScaleFactor ?? 2
+    }
+
+    func setCenter(_ c: Coordinate) {
+        guard center != c else { return }
+        center = c
+        relayout()
+    }
+
+    func relayout() {
+        guard let map, let center, bounds.width > 0 else { return }
+        let scale = screenScale
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (i, miles) in RangeRings.miles.enumerated() {
+            // Project a true N-mile ring through the current map zoom (samples → screen path).
+            let coords = RangeRings.ring(center: center, miles: miles)
+            let path = CGMutablePath()
+            for (j, c) in coords.enumerated() {
+                let p = map.convert(CLLocationCoordinate2D(latitude: c.latitude, longitude: c.longitude), toPointTo: self)
+                if j == 0 { path.move(to: p) } else { path.addLine(to: p) }
+            }
+            path.closeSubpath()
+            ringLayers[i].frame = bounds
+            ringLayers[i].path = path
+            // Label at due-east point.
+            if let east = coords.dropFirst(coords.count / 4).first {
+                let p = map.convert(CLLocationCoordinate2D(latitude: east.latitude, longitude: east.longitude), toPointTo: self)
+                labels[i].contentsScale = scale
+                labels[i].string = "\(Int(miles)) mi"
+                labels[i].frame = CGRect(x: p.x + 4, y: p.y - 6, width: 40, height: 14)
+            }
+        }
+        CATransaction.commit()
+    }
+}
+
+/// Storm-motion arrows: tip at the cell, shaft along DRCT, coloured by intensity. At most three
+/// cells; only the nearest gets a callout. Never claims hits.
+final class StormMotionOverlay: NSView {
+    weak var map: MKMapView?
+    private var cells: [StormCell] = []
+    private var location: Coordinate?
+    private var speedUnit: SpeedUnit = .mph
+    private var arrows: [String: (shaft: CAShapeLayer, head: CAShapeLayer, label: CATextLayer)] = [:]
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    private var screenScale: CGFloat {
+        window?.screen?.backingScaleFactor ?? 2
+    }
+
+    func setCells(_ new: [StormCell], location loc: Coordinate, speedUnit unit: SpeedUnit) {
+        guard new != cells || loc != location || unit != speedUnit else { return }
+        cells = new
+        location = loc
+        speedUnit = unit
+        let ids = Set(new.map(\.id))
+        for (id, layers) in arrows where !ids.contains(id) {
+            layers.shaft.removeFromSuperlayer()
+            layers.head.removeFromSuperlayer()
+            layers.label.removeFromSuperlayer()
+            arrows[id] = nil
+        }
+        for cell in new where arrows[cell.id] == nil {
+            let shaft = CAShapeLayer()
+            shaft.fillColor = nil
+            shaft.lineWidth = 2.5
+            shaft.lineCap = .round
+            shaft.actions = ["path": NSNull(), "strokeColor": NSNull()]
+            let head = CAShapeLayer()
+            head.strokeColor = nil
+            head.actions = ["path": NSNull(), "fillColor": NSNull()]
+            let label = CATextLayer()
+            label.fontSize = 11
+            label.foregroundColor = NSColor.white.cgColor
+            label.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
+            label.cornerRadius = 4
+            label.actions = ["position": NSNull(), "string": NSNull(), "opacity": NSNull()]
+            layer?.addSublayer(shaft)
+            layer?.addSublayer(head)
+            layer?.addSublayer(label)
+            arrows[cell.id] = (shaft, head, label)
+        }
+        relayout()
+    }
+
+    func relayout() {
+        guard let map, let location, bounds.width > 0 else { return }
+        let nearestID = cells.first?.id // `relevant` already sorts nearest-first
+        let scale = screenScale
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for cell in cells {
+            guard let layers = arrows[cell.id] else { continue }
+            let origin = map.convert(CLLocationCoordinate2D(latitude: cell.coordinate.latitude,
+                                                            longitude: cell.coordinate.longitude),
+                                     toPointTo: self)
+            // Arrow length scales gently with speed (12–36 pt) so slow cells stay readable.
+            let len = min(36.0, max(14.0, cell.speedKnots))
+            let off = StormMotion.arrowTipOffset(directionDegrees: cell.directionDegrees, length: len)
+            let tip = CGPoint(x: origin.x + off.dx, y: origin.y + off.dy)
+            let rgb = StormMotion.arrowColorRGB(maxDBZ: cell.maxDBZ)
+            let color = NSColor(calibratedRed: rgb.r, green: rgb.g, blue: rgb.b, alpha: 1).cgColor
+            let shaft = CGMutablePath()
+            shaft.move(to: origin)
+            shaft.addLine(to: tip)
+            layers.shaft.frame = bounds
+            layers.shaft.path = shaft
+            layers.shaft.strokeColor = color
+            // Arrowhead: tip plus two points back along ±25° from the motion bearing.
+            let headLen = 8.0
+            let leftOff = StormMotion.arrowTipOffset(directionDegrees: cell.directionDegrees - 25, length: headLen)
+            let rightOff = StormMotion.arrowTipOffset(directionDegrees: cell.directionDegrees + 25, length: headLen)
+            let left = CGPoint(x: tip.x - leftOff.dx, y: tip.y - leftOff.dy)
+            let right = CGPoint(x: tip.x - rightOff.dx, y: tip.y - rightOff.dy)
+            let head = CGMutablePath()
+            head.move(to: tip); head.addLine(to: left); head.addLine(to: right); head.closeSubpath()
+            layers.head.frame = bounds
+            layers.head.path = head
+            layers.head.fillColor = color
+            layers.label.contentsScale = scale
+            if cell.id == nearestID {
+                let text = StormMotion.callout(cell: cell, location: location, speedUnit: speedUnit)
+                layers.label.opacity = 1
+                layers.label.string = "  \(text)  "
+                let width = (text as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11)]).width + 12
+                layers.label.frame = CGRect(x: tip.x + 6, y: tip.y - 8, width: width, height: 18)
+            } else {
+                layers.label.opacity = 0
+                layers.label.string = nil
+            }
         }
         CATransaction.commit()
     }
@@ -401,7 +650,6 @@ final class PinView: NSView {
         label.fontSize = 13
         label.foregroundColor = NSColor.white.cgColor
         label.alignmentMode = .center
-        label.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
         label.actions = noActions
         dot.backgroundColor = NSColor.white.cgColor
         dot.cornerRadius = 3.5
@@ -417,6 +665,15 @@ final class PinView: NSView {
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        relayoutLayers()
+    }
+
+    private var screenScale: CGFloat {
+        window?.screen?.backingScaleFactor ?? 2
+    }
+
     private func relayoutLayers() {
         let string = text ?? "•"
         let textWidth = ceil((string as NSString).size(withAttributes: [.font: Self.font]).width)
@@ -424,6 +681,7 @@ final class PinView: NSView {
         preferredSize = CGSize(width: bubbleSize.width, height: bubbleSize.height + 10)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        label.contentsScale = screenScale
         dot.frame = CGRect(x: bubbleSize.width / 2 - 3.5, y: 0, width: 7, height: 7)
         bubble.frame = CGRect(x: 0, y: 10, width: bubbleSize.width, height: bubbleSize.height)
         bubble.cornerRadius = bubbleSize.height / 2

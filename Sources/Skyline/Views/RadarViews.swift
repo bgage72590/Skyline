@@ -26,8 +26,10 @@ struct RadarCard: View {
                     .contentShape(Rectangle())
                     .onTapGesture { expand() }
                 VStack {
-                    HStack {
-                        Spacer()
+                    HStack(spacing: 8) {
+                        // Badge on the leading edge so it never sits on top of the expand control.
+                        if radar.currentFrame?.isForecast == true { ForecastHRRRBadge() }
+                        Spacer(minLength: 8)
                         CircleButton(systemImage: "arrow.up.left.and.arrow.down.right", help: "Expand map") { expand() }
                     }
                     Spacer()
@@ -83,6 +85,8 @@ struct ExpandedRadarView: View {
     var mapOverscan: CGFloat = 0
     @Environment(WeatherStore.self) private var store
     @AppStorage(RadarOpacity.key) private var opacity = RadarOpacity.defaultValue
+    @State private var selectedAlert: WeatherAlert?
+    @State private var recenterToken = 0
 
     var body: some View {
         let radar = store.radar
@@ -102,10 +106,23 @@ struct ExpandedRadarView: View {
                         CircleButton(systemImage: "arrow.down.right.and.arrow.up.left", help: "Collapse map (Esc)") { collapse() }
                             .keyboardShortcut(.cancelAction)
                     }
+                    CircleButton(systemImage: "location.fill", help: "Center on \(location.isCurrentLocation ? "me" : location.name)") {
+                        recenterToken += 1
+                    }
                     VStack(alignment: .leading, spacing: 2) {
                         Text(location.isCurrentLocation ? "My Location" : location.name).font(.headline)
                         Text(alerts.isEmpty ? "Precipitation" : "Precipitation · \(alerts.count) alert\(alerts.count == 1 ? "" : "s") outlined")
                             .font(.caption).foregroundStyle(Glass.secondaryText)
+                        // Same rain-timing string as the menu bar (MenuSummary / nowcast) — not from HRRR tiles.
+                        if let forecast = MenuSummary.radarForecastLine(
+                            store.reports[location.id], now: Date(),
+                            hourLabel: { Fmt.hour($0, location.timeZone) }) {
+                            Text("Forecast · \(forecast)")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Glass.secondaryText)
+                                .accessibilityLabel("Forecast")
+                                .accessibilityValue(forecast)
+                        }
                     }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
@@ -116,10 +133,13 @@ struct ExpandedRadarView: View {
                 .padding(12)
                 Spacer()
                 HStack(alignment: .bottom) {
-                    RadarLegend(provider: radar.provider, layer: radar.layer, showsForecastNote: radar.hasForecastFrames)
+                    RadarLegend(provider: radar.provider, layer: radar.layer,
+                                showsForecastNote: radar.hasForecastFrames,
+                                showingForecastFrame: radar.currentFrame?.isForecast == true)
                         .padding(10)
                         .glassChip(RoundedRectangle(cornerRadius: 10, style: .continuous))
                     Spacer()
+                    if radar.currentFrame?.isForecast == true { ForecastHRRRBadge() }
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 8)
@@ -133,7 +153,15 @@ struct ExpandedRadarView: View {
                          spanDegrees: radar.provider == .nexrad ? 5 : 9, opacity: opacity,
                          pinText: pinText, followsPlayback: true, reportsProgress: true,
                          alerts: alerts, focusedAlertID: store.focusedAlertID,
-                         horizontalOverscan: mapOverscan)
+                         horizontalOverscan: mapOverscan,
+                         onAlertSelect: { id in
+                             if let alert = alerts.first(where: { $0.id == id }) {
+                                 selectedAlert = alert
+                             }
+                         },
+                         recenterToken: recenterToken,
+                         stormCells: radar.stormCells,
+                         stormSpeedUnit: store.units.speed)
                 .padding(.horizontal, -mapOverscan)
         }
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -144,6 +172,11 @@ struct ExpandedRadarView: View {
         // (a render transform, no re-layout of the map).
         .modifier(MatchedIfExpanded(enabled: false, namespace: namespace, isSource: store.radarExpanded))
         .foregroundStyle(.white)
+        .sheet(item: $selectedAlert) { alert in
+            AlertDetailView(alert: alert, timeZone: location.timeZone) {
+                store.showAlertOnMap(alert, wideLayout: true)
+            }
+        }
         .task(id: location.id) {
             // One index load (L7): configure doesn't start its own when we await one here.
             radar.configure(for: location, load: false)
@@ -185,6 +218,21 @@ struct CircleButton: View {
         }
         .buttonStyle(.plain)
         .help(help)
+    }
+}
+
+/// Shown on both the inline card and the expanded map while a model forecast frame is on screen.
+struct ForecastHRRRBadge: View {
+    var body: some View {
+        Text("FORECAST · HRRR")
+            .font(.caption2.weight(.bold))
+            .tracking(0.6)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .foregroundStyle(Color(red: 0.92, green: 0.86, blue: 1.0))
+            .background(Capsule().fill(Color(red: 0.35, green: 0.22, blue: 0.55).opacity(0.85)))
+            .overlay(Capsule().stroke(Color(red: 0.78, green: 0.62, blue: 1.0), lineWidth: 1))
+            .accessibilityLabel("Forecast, HRRR model")
     }
 }
 
@@ -380,7 +428,33 @@ struct RadarTimeline: View {
     var body: some View {
         HStack(spacing: 14) {
             RadarPlayButton(radar: radar)
+            Button {
+                radar.jumpToNow()
+            } label: {
+                Text("Now")
+                    .font(.caption.weight(.bold))
+                    .lineLimit(1)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(.white.opacity(0.18)))
+            }
+            .buttonStyle(.plain)
+            .fixedSize()
+            .disabled(radar.frames.isEmpty || radar.index == radar.nowIndex)
+            .help("Jump to the newest scan")
+            .accessibilityLabel("Jump to now")
 
+            Picker("Speed", selection: Binding(get: { radar.playbackSpeed },
+                                               set: { radar.setPlaybackSpeed($0) })) {
+                ForEach(RadarPlaybackSpeed.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 150)
+            .fixedSize()
+            .help("Playback speed")
+
+            // Scrubber takes remaining width so end labels / hint aren't crushed into a 1-pt column.
             VStack(spacing: 4) {
                 Slider(value: Binding(get: { Double(radar.index) },
                                       set: { radar.crossfade = false; radar.scrub(to: Int($0.rounded())) }),
@@ -406,13 +480,18 @@ struct RadarTimeline: View {
                         }
                     }
                     .overlay(alignment: .topLeading) {
-                        // "Now" tick between the observed scans and the model forecast frames (T12).
+                        // Hatched forecast segment + "Now" tick (T12 / radar-features §4).
                         if radar.hasForecastFrames, radar.frames.count > 1 {
                             GeometryReader { geo in
-                                let f = Double(radar.nowIndex) / Double(radar.frames.count - 1)
+                                let track = geo.size.width - 16
+                                let nowFrac = Double(radar.nowIndex) / Double(radar.frames.count - 1)
+                                let x0 = 8 + track * nowFrac
+                                ForecastHatch(width: max(0, geo.size.width - 8 - x0), height: 8)
+                                    .position(x: x0 + max(0, geo.size.width - 8 - x0) / 2,
+                                              y: geo.size.height / 2)
                                 Rectangle().fill(.white.opacity(0.85))
                                     .frame(width: 2, height: 14)
-                                    .position(x: 8 + (geo.size.width - 16) * f, y: geo.size.height / 2)
+                                    .position(x: x0, y: geo.size.height / 2)
                             }
                             .allowsHitTesting(false)
                         }
@@ -430,23 +509,39 @@ struct RadarTimeline: View {
                     }
                     .onKeyPress(.leftArrow) { radar.crossfade = false; radar.scrub(to: radar.index - 1); radar.crossfade = true; return .handled }
                     .onKeyPress(.rightArrow) { radar.crossfade = false; radar.scrub(to: radar.index + 1); radar.crossfade = true; return .handled }
-                HStack {
+                HStack(spacing: 6) {
                     Text(radar.frames.first.map { Fmt.time($0.time, timeZone) } ?? "")
-                    Spacer()
-                    Text("← → step · Space play").opacity(0.8)
-                    Spacer()
-                    if radar.hasForecastFrames, let last = radar.frames.last {
-                        Text("Forecast to \(Fmt.time(last.time, timeZone))")
-                            .foregroundStyle(Color(red: 0.78, green: 0.62, blue: 1.0))
-                    } else {
-                        Text("Now")
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                    Spacer(minLength: 4)
+                    // Drop the keyboard hint when the scrubber row is too narrow to keep it on one line.
+                    ViewThatFits(in: .horizontal) {
+                        Text("← → step · Space play")
+                            .opacity(0.8)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                        Color.clear.frame(width: 0, height: 0)
                     }
+                    Spacer(minLength: 4)
+                    Group {
+                        if radar.hasForecastFrames, let last = radar.frames.last {
+                            Text("Forecast to \(Fmt.time(last.time, timeZone))")
+                                .foregroundStyle(Color(red: 0.78, green: 0.62, blue: 1.0))
+                        } else {
+                            Text("Now")
+                        }
+                    }
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                 }
                 .font(.caption2)
                 .opacity(0.75)
             }
+            .frame(minWidth: 120, maxWidth: .infinity)
+            .layoutPriority(1)
             RadarTimeLabel(radar: radar, timeZone: timeZone)
                 .frame(minWidth: 150, alignment: .trailing)
+                .fixedSize(horizontal: true, vertical: false)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -454,12 +549,39 @@ struct RadarTimeline: View {
     }
 }
 
+/// Diagonal hatch over the forecast half of the timeline scrubber.
+private struct ForecastHatch: View {
+    var width: CGFloat
+    var height: CGFloat
+    var body: some View {
+        Canvas { ctx, size in
+            let color = Color(red: 0.78, green: 0.62, blue: 1.0).opacity(0.55)
+            var path = Path()
+            let step: CGFloat = 5
+            var x: CGFloat = -size.height
+            while x < size.width + size.height {
+                path.move(to: CGPoint(x: x, y: size.height))
+                path.addLine(to: CGPoint(x: x + size.height, y: 0))
+                x += step
+            }
+            ctx.stroke(path, with: .color(color), lineWidth: 1.2)
+            ctx.fill(Path(CGRect(origin: .zero, size: size)),
+                     with: .color(Color(red: 0.78, green: 0.62, blue: 1.0).opacity(0.12)))
+        }
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 2))
+        .allowsHitTesting(false)
+    }
+}
+
 /// Legend. NEXRAD uses the standard NWS reflectivity scale (what the IEM N0Q tiles are coloured with),
-/// labelled in dBZ with plain-English intensity.
+/// labelled in dBZ with plain-English intensity. Forecast frames switch to the HRRR REFP precip-type ramp.
 struct RadarLegend: View {
     let provider: RadarProvider
     var layer: RadarLayer = .reflectivity
     var showsForecastNote = false
+    /// When true, show REFP rain/snow/mix colours instead of the dBZ ramp.
+    var showingForecastFrame = false
     @Environment(WeatherStore.self) private var store
 
     static let nexradStops: [(dbz: Int, color: Color)] = [
@@ -473,7 +595,30 @@ struct RadarLegend: View {
     ]
 
     var body: some View {
-        if layer.isRainfallTotal { rainfallLegend } else { reflectivityLegend }
+        if layer.isRainfallTotal { rainfallLegend }
+        else if showingForecastFrame && provider == .nexrad { forecastLegend }
+        else { reflectivityLegend }
+    }
+
+    private var forecastLegend: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("FORECAST · PRECIP TYPE")
+                .font(.caption2.weight(.semibold)).foregroundStyle(Glass.secondaryText)
+            HStack(spacing: 8) {
+                ForEach(IEMHRRR.legendTypes, id: \.name) { stop in
+                    HStack(spacing: 4) {
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Color(red: Double((stop.hex >> 16) & 0xFF) / 255,
+                                        green: Double((stop.hex >> 8) & 0xFF) / 255,
+                                        blue: Double(stop.hex & 0xFF) / 255))
+                            .frame(width: 12, height: 8)
+                        Text(stop.name).font(.system(size: 10, weight: .medium))
+                    }
+                }
+            }
+            Text("NOAA HRRR precip type via Iowa Environmental Mesonet")
+                .font(.system(size: 10)).foregroundStyle(Glass.secondaryText)
+        }
     }
 
     /// IEM's MRMS ramp, labelled in the user's precipitation unit (L21).
@@ -535,8 +680,8 @@ struct RadarLegend: View {
                     .font(.caption2).frame(width: 196).foregroundStyle(Glass.secondaryText)
             }
             Text(provider.attribution).font(.system(size: 10)).foregroundStyle(Glass.secondaryText)
-            if showsForecastNote {
-                Text(provider == .nexrad ? "After “Now”: NOAA HRRR model forecast via IEM" : "After “Now”: RainViewer nowcast")
+            if showsForecastNote, provider == .nexrad {
+                Text("After “Now”: NOAA HRRR precip-type forecast via IEM")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Color(red: 0.78, green: 0.62, blue: 1.0))
             }

@@ -161,7 +161,7 @@ A new set of scans (every ~5 min) is built hidden and swapped in only once loade
 * **Future radar.** In the US (NEXRAD), the loop continues past "Now" with up to 2 h of NOAA HRRR
   simulated reflectivity from the Iowa Environmental Mesonet. Those frames are labelled "+N min ·
   Forecast", outlined in purple, and marked on the timeline; the legend says they're a model. Toggle:
-  "Future radar (model)" in the radar options (saved as `radarFuture`, default on).
+  "Future radar (model)" in the radar options (saved as `radarFuture`, default off; HRRR REFP precip type).
 * **Rainfall totals.** The expanded radar's Layer picker (US only) swaps the loop for MRMS 1-hour or
   24-hour rainfall totals (radar + gauges, IEM tiles), with a legend in your precipitation unit.
 * **Outside the US** (decided by a border outline and the saved country, so Toronto, Windsor or Juárez

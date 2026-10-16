@@ -486,8 +486,12 @@ final class Batch4Tests: XCTestCase {
                    "temperature_2m_ecmwf_ifs025":[10.0,10,10,10],"temperature_2m_icon_seamless":[10.0,10,10,10]}}
         """
         let om = try OpenMeteoResponse.decode(Data(json.utf8))
-        let h = try XCTUnwrap(ForecastBlender.blendHourly(openMeteo: om, nwsHourly: [], now: Date(timeIntervalSince1970: t - 48 * 3600)).first)
-        XCTAssertEqual(h.temperature, (15 * 2.0 + 15 * 1.0 + 10 * 1.5 + 10 * 1.0) / 5.5, accuracy: 1e-9, "GFS keeps its own vote")
+        let blendNow = Date(timeIntervalSince1970: t - 48 * 3600)
+        let blended = ForecastBlender.blendHourly(openMeteo: om, nwsHourly: [], now: blendNow)
+        let h = try XCTUnwrap(blended.first)
+        // best_match 15×2 + GFS 15×1 + ECMWF 10×1.5 + ICON 10×1
+        let expected: Double = 70.0 / 5.5
+        XCTAssertEqual(h.temperature, expected, accuracy: 1e-9, "GFS keeps its own vote")
     }
 
     func testBestMatchCopyDetection() {
