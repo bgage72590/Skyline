@@ -242,6 +242,29 @@ final class RadarImageCache {
     }
 
     nonisolated private static func fetchDecoded(session: URLSession, url: URL) async -> Outcome {
+        // False-green fix: a NEXRAD tile may carry an MRMS QC mask in its fragment (RadarQC).
+        let (imageURL, maskURL) = RadarQC.split(url)
+        let outcome = await fetchRaw(session: session, url: imageURL)
+        guard let maskURL, case .image(let decoded, _) = outcome else { return outcome.decodedOutcome }
+        // A missing or failed mask never hides radar: the tile is shown as IEM drew it.
+        guard case .image(let mask, _) = await fetchRaw(session: session, url: maskURL),
+              let masked = RadarQC.masked(decoded, mask: mask) else { return outcome.decodedOutcome }
+        return .image(pack(masked, encoded: nil))
+    }
+
+    /// Download outcome before packing.
+    enum RawOutcome: Sendable {
+        case image(CGImage, Data), missing, transientFailure
+        var decodedOutcome: Outcome {
+            switch self {
+            case .image(let img, let data): .image(RadarImageCache.pack(img, encoded: data))
+            case .missing: .missing
+            case .transientFailure: .transientFailure
+            }
+        }
+    }
+
+    nonisolated private static func fetchRaw(session: URLSession, url: URL) async -> RawOutcome {
         // Tile hosts come from responses (RainViewer's `host`): known servers only (L28).
         guard KnownHosts.isAllowed(url) else { return .missing }
         RequestStats.shared.note() // includes tiles served from the disk cache
@@ -256,10 +279,10 @@ final class RadarImageCache {
         }
         // Decode inside an autorelease pool so ImageIO's temporaries are freed per tile, not per burst
         // (less heap growth/fragmentation while a loop of ~100 tiles decodes).
-        let image: RadarTile? = await withCheckedContinuation { done in
+        let image: CGImage? = await withCheckedContinuation { done in
             decodeQueue.addOperation { done.resume(returning: decode(data)) }
         }
-        return image.map(Outcome.image) ?? .missing
+        return image.map { .image($0, data) } ?? .missing
     }
 
     /// Review M2 (build 47): at most two PNG decodes at once. Downloads still run 6 wide; the peak
@@ -272,13 +295,18 @@ final class RadarImageCache {
         return q
     }()
 
-    nonisolated private static func decode(_ data: Data) -> RadarTile? {
+    nonisolated private static func decode(_ data: Data) -> CGImage? {
         autoreleasepool {
             guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
             let options = [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
-            guard let decoded = CGImageSourceCreateImageAtIndex(source, 0, options) else { return nil }
+            return CGImageSourceCreateImageAtIndex(source, 0, options)
+        }
+    }
+
+    nonisolated static func pack(_ decoded: CGImage, encoded: Data?) -> RadarTile {
+        autoreleasepool {
             // Build 42: 8-bit palette indices, pixel-identical, ~4× smaller (RadarTilePacker).
-            let tile = RadarTilePacker.pack(decoded, encoded: data)
+            let tile = RadarTilePacker.pack(decoded, encoded: encoded)
             RequestStats.shared.notePacked(tile.isPacked, compressed: tile.isCompressed)
             return tile
         }
