@@ -425,6 +425,13 @@ struct RadarTimeline: View {
     @Environment(WeatherStore.self) private var store
     @State private var showCallout = false
 
+    private var speedPicker: some View {
+        Picker("Speed", selection: Binding(get: { radar.playbackSpeed }, set: { radar.setPlaybackSpeed($0) })) {
+            ForEach(RadarPlaybackSpeed.allCases) { Text($0.label).tag($0) }
+        }
+        .labelsHidden()
+    }
+
     var body: some View {
         HStack(spacing: 14) {
             RadarPlayButton(radar: radar)
@@ -444,14 +451,13 @@ struct RadarTimeline: View {
             .help("Jump to the newest scan")
             .accessibilityLabel("Jump to now")
 
-            Picker("Speed", selection: Binding(get: { radar.playbackSpeed },
-                                               set: { radar.setPlaybackSpeed($0) })) {
-                ForEach(RadarPlaybackSpeed.allCases) { Text($0.label).tag($0) }
+            // Deferred polish: in a narrow window the segmented picker squeezed the scrubber; it
+            // collapses to a compact menu instead so the scrubber keeps a usable width.
+            ViewThatFits(in: .horizontal) {
+                speedPicker.pickerStyle(.segmented).frame(width: 150)
+                speedPicker.pickerStyle(.menu).frame(width: 64)
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 150)
-            .fixedSize()
+            .layoutPriority(0)
             .help("Playback speed")
 
             // Scrubber takes remaining width so end labels / hint aren't crushed into a 1-pt column.
@@ -537,7 +543,7 @@ struct RadarTimeline: View {
                 .font(.caption2)
                 .opacity(0.75)
             }
-            .frame(minWidth: 120, maxWidth: .infinity)
+            .frame(minWidth: 200, maxWidth: .infinity) // deferred polish: the scrubber keeps a usable track
             .layoutPriority(1)
             RadarTimeLabel(radar: radar, timeZone: timeZone)
                 .frame(minWidth: 150, alignment: .trailing)
@@ -704,13 +710,15 @@ struct RadarSitePicker: View {
             HStack(spacing: 6) {
                 Text("Site").font(.caption2.weight(.semibold)).foregroundStyle(Glass.secondaryText)
                 Picker("Radar site", selection: Binding(get: { radar.siteChoice }, set: { radar.setSiteChoice($0) })) {
-                    Text(radar.nearestStation.map { "Nearest (\($0.icao))" } ?? "Nearest").tag(RadarSiteChoice.auto)
+                    Text(RadarSiteChoice.nearestLabel(radar.nearestStation)).tag(RadarSiteChoice.auto)
                     Text("National composite").tag(RadarSiteChoice.composite)
                     Divider()
                     ForEach(NexradStation.conus) { Text($0.label).tag(RadarSiteChoice.site($0.id)) }
                 }
                 .labelsHidden()
                 .frame(width: 230)
+                // The menu's item titles are built once; rebuild it when the nearest site changes.
+                .id(radar.nearestStation?.id)
             }
             .help("Single-site NEXRAD (sharper, updates every 4–6 min) or the national mosaic")
             if let note = radar.siteNote {

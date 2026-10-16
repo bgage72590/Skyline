@@ -90,6 +90,13 @@ public enum RadarQCMask {
 /// for a tile outside coverage, or nil on any failure (IEM answers a missing MRMS slot with 503, not a
 /// blank tile, checked Oct 16, 2026). Any failure in a neighbourhood makes the whole mask unavailable, so
 /// the caller fails open for now and asks again later; failures are never cached.
+/// Deferred #6 note: provisional (unmasked) tiles retried forever. After this many tries (5 s doubling
+/// to 60 s ≈ 2.5 min) they stay as shown until the network returns, the Mac wakes or Retry is pressed.
+public enum RadarProvisionalRetry {
+    public static let maxAttempts = 6
+    public static func shouldRetry(attempts: Int) -> Bool { attempts < maxAttempts }
+}
+
 public actor RadarQCMaskStore {
     public typealias Fetch = @Sendable (URL) async -> [UInt8]?
 
@@ -99,6 +106,7 @@ public actor RadarQCMaskStore {
     private var raw: [String: [UInt8]] = [:]
     private var rawOrder: [String] = []
     private var inFlight: [String: Task<[UInt8]?, Never>] = [:]
+    private var rawInFlight: [String: Task<[UInt8]?, Never>] = [:]
     private let maxMasks: Int, maxRaw: Int
     public private(set) var fetches = 0
 
@@ -121,10 +129,21 @@ public actor RadarQCMaskStore {
     }
 
     private func build(template: String, tile t: RadarQCMask.TileID) async -> [UInt8]? {
+        // Deferred #6 note: the 3×3 neighbours are fetched concurrently, not one after another.
+        let hood = RadarQCMask.neighbourhood(of: t)
+        let results = await withTaskGroup(of: (Int, [UInt8]?).self) { group in
+            for (i, n) in hood.enumerated() {
+                guard let n else { continue }
+                group.addTask { (i, await self.alpha(template: template, tile: n)) }
+            }
+            var out = [Int: [UInt8]?]()
+            for await (i, a) in group { out[i] = a }
+            return out
+        }
         var block: [[UInt8]?] = []
-        for n in RadarQCMask.neighbourhood(of: t) {
-            guard let n else { block.append(nil); continue }
-            guard let a = await alpha(template: template, tile: n) else { return nil }
+        for i in hood.indices {
+            guard hood[i] != nil else { block.append(nil); continue }
+            guard let a = results[i] ?? nil else { return nil }
             block.append(a.isEmpty ? nil : a)
         }
         let r = RadarQCMask.radiusPixels(maskZoom: t.z, tileY: t.y)
@@ -136,8 +155,15 @@ public actor RadarQCMaskStore {
             .replacingOccurrences(of: "{x}", with: "\(t.x)").replacingOccurrences(of: "{y}", with: "\(t.y)")
         if let a = raw[s] { return a }
         guard let url = URL(string: s) else { return nil }
+        // Adjacent masks share neighbours; concurrent builds join one request per raw tile.
+        if let task = rawInFlight[s] { return await task.value }
         fetches += 1
-        guard let a = await fetchAlpha(url) else { return nil }
+        let fetch = fetchAlpha
+        let task = Task { await fetch(url) }
+        rawInFlight[s] = task
+        let a = await task.value
+        rawInFlight[s] = nil
+        guard let a else { return nil }
         remember(&raw, &rawOrder, s, a, limit: maxRaw)
         return a
     }

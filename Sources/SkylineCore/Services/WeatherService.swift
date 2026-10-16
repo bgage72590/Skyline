@@ -443,14 +443,17 @@ public actor WeatherService {
             }
         }
 
+        // A forced fetch runs on its own (not joined), so it keeps its own priority rather than inheriting
+        // whatever a background GET for the same key had registered (deferred #5 note).
+        func turnPriority() -> FetchPriority { force ? priority : (inFlightPriority[key] ?? priority) }
         func attempt() async throws -> Fetched {
             do {
-                return try await withOpenMeteoTurn(host, priority: inFlightPriority[key] ?? priority, key: key, network)
+                return try await withOpenMeteoTurn(host, priority: turnPriority(), key: key, network)
             } catch let error as HTTPError {
                 // The city ahead of us in line was throttled. Wait only if the new window still fits.
                 guard waits, case .backingOff = error else { throw error }
                 try await prepareForceFetch(host)
-                return try await withOpenMeteoTurn(host, priority: inFlightPriority[key] ?? priority, key: key, network)
+                return try await withOpenMeteoTurn(host, priority: turnPriority(), key: key, network)
             }
         }
         if force { return try await attempt() }

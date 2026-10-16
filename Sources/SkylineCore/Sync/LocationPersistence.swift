@@ -8,9 +8,16 @@ public enum LocationPersistence {
     /// Local cities first (their order), then any city from the last-synced state this process lacks,
     /// unless this Mac recorded deleting it (a delete just before a quit or crash stays deleted).
     public static func launchLocations(local: [WeatherLocation], lastSynced: [WeatherLocation],
-                                       deleted: [String: Date] = [:]) -> [WeatherLocation] {
+                                       deleted: [String: Date] = [:], removed: [String: Date] = [:],
+                                       added: [String: Date] = [:]) -> [WeatherLocation] {
         var ids = Set(local.map(\.id))
-        var out = local.filter { deleted[$0.id] == nil }
+        let synced = Set(lastSynced.map(\.id))
+        // A local copy of a city another Mac deleted (`removed`: user-delete tombstones in the last-synced state) isn't kept,
+        // unless this Mac re-added it after that removal.
+        var out = local.filter { l in
+            deleted[l.id] == nil && !(l.isCurrentLocation == false && !synced.contains(l.id)
+                && removed[l.id].map { (added[l.id] ?? .distantPast) <= $0 } == true)
+        }
         for l in lastSynced where !l.isCurrentLocation && deleted[l.id] == nil && ids.insert(l.id).inserted { out.append(l) }
         return out
     }
@@ -132,8 +139,10 @@ public enum LaunchSync {
     /// Reconcile (missing ≠ deleted, recorded deletes stay deleted), then, once per Mac (flag in
     /// `defaults`), add back the cities a pre-fix build tombstoned without a delete action.
     public static func plan(local: [WeatherLocation], last: SyncDocument, deletions: [String: Date],
+                            additions: [String: Date] = [:],
                             legacy: [WeatherLocation], defaults: UserDefaults, now: Date = Date()) -> Plan {
-        var cities = LocationPersistence.launchLocations(local: local, lastSynced: last.locations, deleted: deletions)
+        var cities = LocationPersistence.launchLocations(local: local, lastSynced: last.locations, deleted: deletions,
+                                                         removed: last.removed.filter { last.deletedByUser[$0.key] != nil }, added: additions)
         var recovered: [WeatherLocation] = []
         if !defaults.bool(forKey: recoveryFlagKey) {
             recovered = LocationRecovery.recover(current: cities, legacy: legacy, removed: last.removed,

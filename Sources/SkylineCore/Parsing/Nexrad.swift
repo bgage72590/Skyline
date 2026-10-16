@@ -46,6 +46,11 @@ public struct NexradStation: Hashable, Sendable, Identifiable, Codable {
 
 /// Which NEXRAD view to show. Persisted as a string under "radarSite": "auto", "composite" or a site id.
 public enum RadarSiteChoice: Hashable, Sendable {
+    /// Picker title for the automatic choice: "Nearest (KOKX)".
+    public static func nearestLabel(_ station: NexradStation?) -> String {
+        station.map { "Nearest (\($0.icao))" } ?? "Nearest"
+    }
+
     /// The site nearest the selected city (the default).
     case auto
     /// IEM's national N0Q mosaic.

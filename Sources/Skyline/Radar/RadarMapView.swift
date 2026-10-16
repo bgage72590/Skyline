@@ -452,7 +452,7 @@ final class RangeRingsOverlay: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.masksToBounds = true
-        for _ in RangeRings.miles {
+        for _ in 0..<(RangeRings.sets.map(\.count).max() ?? 3) {
             let l = CAShapeLayer()
             l.fillColor = nil
             l.strokeColor = NSColor.white.withAlphaComponent(0.35).cgColor
@@ -490,23 +490,34 @@ final class RangeRingsOverlay: NSView {
         let scale = screenScale
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for (i, miles) in RangeRings.miles.enumerated() {
+        // Points per mile at the pin, measured along the 10-mile east radius.
+        let c0 = map.convert(CLLocationCoordinate2D(latitude: center.latitude, longitude: center.longitude), toPointTo: self)
+        let e10 = RangeRings.destination(from: center, meters: RangeRings.meters(10), bearingDegrees: 90)
+        let p10 = map.convert(CLLocationCoordinate2D(latitude: e10.latitude, longitude: e10.longitude), toPointTo: self)
+        let rings = RangeRings.visible(pointsPerMile: hypot(p10.x - c0.x, p10.y - c0.y) / 10,
+                                       minDimension: min(bounds.width, bounds.height))
+        for i in ringLayers.indices {
+            guard i < rings.count else { ringLayers[i].isHidden = true; labels[i].isHidden = true; continue }
+            let ring = rings[i]
             // Project a true N-mile ring through the current map zoom (samples → screen path).
-            let coords = RangeRings.ring(center: center, miles: miles)
+            let coords = RangeRings.ring(center: center, miles: ring.miles)
             let path = CGMutablePath()
             for (j, c) in coords.enumerated() {
                 let p = map.convert(CLLocationCoordinate2D(latitude: c.latitude, longitude: c.longitude), toPointTo: self)
                 if j == 0 { path.move(to: p) } else { path.addLine(to: p) }
             }
             path.closeSubpath()
+            ringLayers[i].isHidden = false
             ringLayers[i].frame = bounds
             ringLayers[i].path = path
-            // Label at due-east point.
-            if let east = coords.dropFirst(coords.count / 4).first {
-                let p = map.convert(CLLocationCoordinate2D(latitude: east.latitude, longitude: east.longitude), toPointTo: self)
+            // Label on the NE diagonal (72 samples: index 9 = 45°), clear of the east/west axis.
+            labels[i].isHidden = !ring.showLabel
+            if ring.showLabel, coords.count > 9 {
+                let ne = coords[9]
+                let p = map.convert(CLLocationCoordinate2D(latitude: ne.latitude, longitude: ne.longitude), toPointTo: self)
                 labels[i].contentsScale = scale
-                labels[i].string = "\(Int(miles)) mi"
-                labels[i].frame = CGRect(x: p.x + 4, y: p.y - 6, width: 40, height: 14)
+                labels[i].string = "\(Int(ring.miles)) mi"
+                labels[i].frame = CGRect(x: p.x + 3, y: p.y + 2, width: 44, height: 14)
             }
         }
         CATransaction.commit()

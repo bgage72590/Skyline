@@ -371,6 +371,8 @@ final class WeatherStore {
             if !report.isOfflineFallback { considerNotifications(report, for: location) }
             await refreshAccuracy(for: location)
         } catch is CancellationError {
+            // Deferred #5 note: a cancelled load must not leave "Updating…" up unless a retry is pending.
+            if retryTasks[location.id] == nil { quietRetries.abandoned(location.id) }
         } catch {
             // Force during a long back-off throws `backingOff` immediately (no multi-minute sleep, so
             // `loadingIDs` clears and Refresh stays usable). The banner keeps the saved report.
