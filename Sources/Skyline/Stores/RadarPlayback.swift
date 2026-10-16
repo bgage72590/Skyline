@@ -206,6 +206,27 @@ final class RadarPlayback {
         Task { await loadFrames(force: true) }
     }
 
+    @ObservationIgnored private var rasterWatch: Task<Void, Never>?
+
+    /// CR #7: while the newest scan is blocky (raster not archived yet), check every 15 s (up to 10 min)
+    /// and reload as soon as it is, so the swap to smooth follows the archive with no lag.
+    private func watchNewestRaster(site: String?) {
+        rasterWatch?.cancel(); rasterWatch = nil
+        guard let site, IEMRidge.isPendingSmooth(frames), let newest = frames.last(where: { !$0.isForecast }) else { return }
+        rasterWatch = Task { [weak self, service] in
+            for _ in 0..<40 {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled else { return }
+                if await service.rasterArchived(site: site, time: newest.time) {
+                    guard let self, !Task.isCancelled else { return }
+                    self.rasterWatch = nil
+                    await self.loadFrames(force: true)
+                    return
+                }
+            }
+        }
+    }
+
     func loadFrames(force: Bool = false) async {
         if !force, let loadedAt, Date().timeIntervalSince(loadedAt) < Self.indexMaxAge, !frames.isEmpty { return }
         // L7: a newer request supersedes this one; a slower, older answer is dropped, not applied.
@@ -235,7 +256,11 @@ final class RadarPlayback {
                   requestedStation == station else { return }
             loadedAt = Date()
             errorMessage = new.isEmpty ? "No radar frames available." : nil
-            if new.map(\.id) != frames.map(\.id) {
+            if IEMRidge.isNewestUpgrade(from: frames, to: new) {
+                // CR #7: the newest scan's raster arrived; swap that one frame to smooth in place. The
+                // map keeps the blocky tiles up until the smooth ones are drawn (replace-on-reload).
+                frames = new
+            } else if new.map(\.id) != frames.map(\.id) {
                 let wasAtNow = index >= nowIndex
                 frames = new
                 // Start on "now" (the newest scan), not the end of the forecast.
@@ -244,6 +269,7 @@ final class RadarPlayback {
                 progress = 0
                 progressGate.reset()
             }
+            watchNewestRaster(site: site) // after `frames` is updated
         } catch {
             guard generation.isCurrent(token) else { return }
             errorMessage = "Radar unavailable: \(UserFacingError.message(error))"

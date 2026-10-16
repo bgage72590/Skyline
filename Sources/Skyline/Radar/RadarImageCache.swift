@@ -52,6 +52,8 @@ final class RadarImageCache {
     func provisionalImage(for url: URL) -> RadarTile? { provisionalImages.object(forKey: url.absoluteString as NSString) }
     /// MRMS QC masks, cached per (time, mask tile) and shared by every display tile under them (CR #6.4).
     nonisolated let maskStore: RadarQCMaskStore
+    /// Item 4: one N0B scan raster per frame, shared by every local-site tile and zoom.
+    nonisolated let rasterStore: RadarRasterStoreBox
 
     private init() {
         let config = URLSessionConfiguration.default
@@ -72,6 +74,7 @@ final class RadarImageCache {
         provisionalImages.totalCostLimit = 8 << 20
         let s = session
         maskStore = RadarQCMaskStore { url in await Self.fetchMaskAlpha(session: s, url: url) }
+        rasterStore = RadarRasterStoreBox(RidgeRasterStore { url in await Self.fetchData(session: s, url: url) })
         // Decoded RGBA bytes; live tiles are held by the radar view anyway, so this bridges tiles pruned
         // after a pan and re-requested on pan-back without a network trip (24 MB ≈ 96 tiles; restored
         // from 8 MB in build 35, radar-pan-diagnosis fix 3). `-SkylineDecodedCacheMB N` is a measurement hook.
@@ -165,6 +168,9 @@ final class RadarImageCache {
         // screen changes; only re-attach-without-network after a pan-back gets slower.
         images.totalCostLimit = critical ? 1 << 20 : Self.normalCacheBytes / 4
         if critical { images.removeAllObjects() }
+        // CR #7.5: scan rasters (~1 MB each) shrink too; the shown loop re-fetches what it needs.
+        let rasters = rasterStore.store
+        Task { await rasters.trim(keep: critical ? 2 : 12) }
         urlCache.memoryCapacity = 0
         urlCache.memoryCapacity = 1 << 20
         restoreTask?.cancel()
@@ -173,6 +179,7 @@ final class RadarImageCache {
             guard !Task.isCancelled, let self else { return }
             self.images.totalCostLimit = Self.normalCacheBytes
             self.urlCache.memoryCapacity = 4 << 20
+            await self.rasterStore.store.restore()
         }
     }
 
@@ -234,7 +241,7 @@ final class RadarImageCache {
         let key = url.absoluteString
         let session = self.session
         Task {
-            let outcome = await Self.fetchDecoded(session: session, url: url, masks: maskStore)
+            let outcome = await Self.fetchDecoded(session: session, url: url, masks: maskStore, rasters: rasterStore.store)
             inFlight -= 1
             defer { pump() }
             var image: RadarTile?
@@ -267,9 +274,30 @@ final class RadarImageCache {
         }
     }
 
-    nonisolated private static func fetchDecoded(session: URLSession, url: URL, masks: RadarQCMaskStore) async -> Outcome {
+    nonisolated private static func fetchDecoded(session: URLSession, url: URL, masks: RadarQCMaskStore,
+                                                 rasters: RidgeRasterStore) async -> Outcome {
         // False-green fix: a NEXRAD tile may carry an MRMS QC mask in its fragment (RadarQC).
-        let (imageURL, maskTemplate, tile) = RadarQC.split(url)
+        let (imageURL, maskTemplate, tile, rasterBase) = RadarQC.split(url)
+        // Item 4: local-site frames render smoothly from the scan raster; IEM's tile is the fallback.
+        if let rasterBase, let tile {
+            // CR #7.6: a frame that renders smooth never falls back to blocky tiles (no mixed loop): if
+            // its raster isn't available, the tile is retried with back-off and the frame is held.
+            guard let raster = await rasters.raster(base: rasterBase) else { return .transientFailure }
+            let mask: [UInt8]? = if let maskTemplate {
+                await masks.mask(template: maskTemplate, tile: RadarQCMask.maskTile(for: tile).tile)
+            } else { nil }
+            let wantsMask = maskTemplate != nil
+            let rendered: RadarTile? = await onDecodeQueue {
+                var px = raster.renderTile(z: tile.z, x: tile.x, y: tile.y)
+                if let mask { RadarQCMask.apply(rgba: &px, tile: tile, mask: mask) }
+                guard px.contains(where: { $0 != 0 }) else { return nil }
+                guard let img = RadarQC.image(rgba: px), let png = RadarQC.png(img) else { return nil }
+                return pack(img, encoded: png)
+            }
+            // An empty render is "nothing here", like IEM's blank tile.
+            guard let rendered else { return .missing }
+            return wantsMask && mask == nil ? .provisional(rendered) : .image(rendered)
+        }
         let outcome = await fetchRaw(session: session, url: imageURL)
         guard let maskTemplate, let tile, case .image(let decoded, let data) = outcome else { return outcome.decodedOutcome }
         let m = RadarQCMask.maskTile(for: tile)
@@ -305,6 +333,24 @@ final class RadarImageCache {
             case .transientFailure: .transientFailure
             }
         }
+    }
+
+    /// Body of a 200 response from a known host, nil otherwise (raster and world files). Streams and
+    /// gives up past `maxBytes` (CR #7.1: capped download).
+    nonisolated private static func fetchData(session: URLSession, url: URL, maxBytes: Int = PalettePNG.maxFileBytes) async -> Data? {
+        guard KnownHosts.isAllowed(url) else { return nil }
+        RequestStats.shared.note()
+        guard let (bytes, response) = try? await session.bytes(from: url), let http = response as? HTTPURLResponse,
+              KnownHosts.isAllowed(http.url ?? url), http.statusCode == 200 else { return nil }
+        if http.expectedContentLength > Int64(maxBytes) { bytes.task.cancel(); return nil }
+        var data = Data()
+        do {
+            for try await chunk in bytes {
+                data.append(chunk)
+                if data.count > maxBytes { bytes.task.cancel(); return nil }
+            }
+        } catch { return nil }
+        return data.isEmpty ? nil : data
     }
 
     nonisolated private static func fetchRaw(session: URLSession, url: URL) async -> RawOutcome {
@@ -354,4 +400,10 @@ final class RadarImageCache {
             return tile
         }
     }
+}
+
+/// Holds the raster actor for the main-actor cache.
+final class RadarRasterStoreBox: Sendable {
+    let store: RidgeRasterStore
+    init(_ store: RidgeRasterStore) { self.store = store }
 }

@@ -52,21 +52,32 @@ public enum RadarQC {
     /// Adds the QC mask to observed IEM NEXRAD frames (forecast and already-masked frames untouched).
     public static func masked(_ frames: [RadarFrame], latestMask: Date) -> [RadarFrame] {
         frames.map { f in
-            guard !f.isForecast, !f.urlTemplate.contains("#"),
+            guard !f.isForecast, !f.urlTemplate.contains(fragmentKey),
                   f.urlTemplate.contains("ridge::"),
                   let t = maskTime(for: f.time, latestMask: latestMask) else { return f }
             var g = f
-            g.urlTemplate = f.urlTemplate + "#" + fragmentKey + maskTemplate(at: t)
+            g.urlTemplate = f.urlTemplate + (f.urlTemplate.contains("#") ? "&" : "#") + fragmentKey + maskTemplate(at: t)
             return g
         }
     }
 
-    /// Splits a tile URL into the image to download, its QC mask template (`…/{z}/{x}/{y}.png`, the
-    /// fragment had the display tile's numbers substituted in) and the display tile.
-    public static func split(_ url: URL) -> (image: URL, maskTemplate: String?, tile: RadarQCMask.TileID?) {
+    /// Fragment parameters (`#raw=…&qc=…`): never sent to the server. Our URLs contain no `&`.
+    public static func fragment(_ url: URL) -> (base: String, params: [String: String]) {
         let s = url.absoluteString
-        guard let r = s.range(of: "#" + fragmentKey) else { return (url, nil, nil) }
-        let base = String(s[..<r.lowerBound])
+        guard let h = s.firstIndex(of: "#") else { return (s, [:]) }
+        var params: [String: String] = [:]
+        for part in s[s.index(after: h)...].split(separator: "&") {
+            guard let eq = part.firstIndex(of: "=") else { continue }
+            params[String(part[..<eq])] = String(part[part.index(after: eq)...])
+        }
+        return (String(s[..<h]), params)
+    }
+
+    /// Splits a tile URL into the image to download, its QC mask template (`…/{z}/{x}/{y}.png`, the
+    /// fragment had the display tile's numbers substituted in), the display tile and the scan raster
+    /// base (local single-site frames, RidgeRaster).
+    public static func split(_ url: URL) -> (image: URL, maskTemplate: String?, tile: RadarQCMask.TileID?, raster: String?) {
+        let (base, params) = fragment(url)
         let image = URL(string: base) ?? url
         func zxy(_ u: String) -> (prefix: Substring, tile: RadarQCMask.TileID)? {
             let parts = u.split(separator: "/", omittingEmptySubsequences: false)
@@ -74,8 +85,9 @@ public enum RadarQC {
                   let y = Int(parts[parts.count - 1].split(separator: ".").first ?? "") else { return nil }
             return (u.dropLast(parts.suffix(3).joined(separator: "/").count), .init(z: z, x: x, y: y))
         }
-        guard let img = zxy(base), let mask = zxy(String(s[r.upperBound...])) else { return (image, nil, nil) }
-        return (image, mask.prefix + "{z}/{x}/{y}.png", img.tile)
+        let tile = zxy(base)?.tile
+        let mask = params[String(fragmentKey.dropLast())].flatMap(zxy).map { String($0.prefix) + "{z}/{x}/{y}.png" }
+        return (image, mask, tile, params["raw"])
     }
 
 }
@@ -91,6 +103,23 @@ extension RadarQC {
         let px = RadarTilePacker.render(mask, space: CGColorSpaceCreateDeviceRGB())
         let a = (0..<(tileSize * tileSize)).map { px[$0 * 4 + 3] }
         return a.contains { $0 > 0 } ? a : []
+    }
+
+    /// A 256² premultiplied RGBA buffer as a CGImage (sRGB).
+    public static func image(rgba px: [UInt8], size: Int = tileSize) -> CGImage? {
+        guard px.count == size * size * 4, let provider = CGDataProvider(data: Data(px) as CFData),
+              let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        return CGImage(width: size, height: size, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: size * 4, space: space,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+
+    /// PNG bytes of `image` (tiles are stored compressed).
+    public static func png(_ image: CGImage) -> Data? {
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, image, nil)
+        return CGImageDestinationFinalize(dest) ? data as Data : nil
     }
 
     /// Display tile `image` with pixels outside the dilated `mask` cleared, plus its PNG encoding (so it

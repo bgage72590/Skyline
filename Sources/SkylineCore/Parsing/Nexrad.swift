@@ -113,9 +113,41 @@ public enum IEMRidge {
         "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/ridge::\(site)-\(product)-\(utcFormatter("yyyyMMddHHmm").string(from: time))/{z}/{x}/{y}.png"
     }
 
+    /// IEM's archived scan raster, without extension (`.png` palette image, `.wld` world file).
+    public static func rasterBase(site: String, time: Date) -> String {
+        let d = utcFormatter("yyyy/MM/dd").string(from: time), t = utcFormatter("yyyyMMddHHmm").string(from: time)
+        return "https://mesonet.agron.iastate.edu/archive/data/\(d)/GIS/ridge/\(site)/\(product)/\(site)_\(product)_\(t)"
+    }
+
     /// Picks scans for the loop: the newest, then walking back, each at least `stepMinutes − 1` earlier
     /// than the last kept one, within the range. Same frame budget as the composite loop.
-    public static func frames(site: String, scans: [Date], range: RadarRange) -> [RadarFrame] {
+    /// The same frames with only the newest drawn from IEM's tile (its raster isn't archived yet).
+    public static func newestBlocky(_ frames: [RadarFrame], site: String) -> [RadarFrame] {
+        guard let last = frames.last else { return frames }
+        var out = frames
+        out[out.count - 1] = RadarFrame(time: last.time, urlTemplate: tileTemplate(site: site, time: last.time))
+        return out
+    }
+
+    /// The newest frame is a site scan waiting for its raster while older ones are smooth: poll and swap.
+    public static func isPendingSmooth(_ frames: [RadarFrame]) -> Bool {
+        let observed = frames.filter { !$0.isForecast }
+        guard let last = observed.last, observed.count > 1, last.urlTemplate.contains("ridge::"),
+              !last.urlTemplate.contains("#raw=") else { return false }
+        return observed[observed.count - 2].urlTemplate.contains("#raw=")
+    }
+
+    /// Only the newest observed frame changed, blocky → smooth (same times otherwise): swap in place,
+    /// without restarting the loop's loading progress.
+    public static func isNewestUpgrade(from old: [RadarFrame], to new: [RadarFrame]) -> Bool {
+        guard old.count == new.count, !old.isEmpty, zip(old, new).allSatisfy({ $0.time == $1.time }) else { return false }
+        let changed = old.indices.filter { old[$0] != new[$0] }
+        guard changed.count == 1, let i = changed.first, !new[i].isForecast else { return false }
+        return !old[i].urlTemplate.contains("#raw=") && new[i].urlTemplate.contains("#raw=")
+            && new[i].urlTemplate.hasPrefix(old[i].urlTemplate)
+    }
+
+    public static func frames(site: String, scans: [Date], range: RadarRange, smooth: Bool = true) -> [RadarFrame] {
         guard let latest = scans.last else { return [] }
         let earliest = latest.addingTimeInterval(-Double(range.totalMinutes * 60))
         let minGap = Double((range.stepMinutes - 1) * 60)
@@ -124,6 +156,9 @@ public enum IEMRidge {
             if let last = kept.last, last.timeIntervalSince(t) < minGap { continue }
             kept.append(t)
         }
-        return kept.reversed().map { RadarFrame(time: $0, urlTemplate: tileTemplate(site: site, time: $0)) }
+        // Item 4: render from the scan's raster (smooth); IEM's tile stays the fallback.
+        return kept.reversed().map {
+            RadarFrame(time: $0, urlTemplate: tileTemplate(site: site, time: $0) + (smooth ? "#raw=" + rasterBase(site: site, time: $0) : ""))
+        }
     }
 }
