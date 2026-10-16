@@ -12,13 +12,15 @@ import Foundation
 /// the frame URL's fragment (`#qc=<mask template>`), which is never sent to the server, so tile caching
 /// and coalescing keep working off one string.
 public enum RadarQC {
+    public static let tileSize = 256
     public static let fragmentKey = "qc="
     /// MRMS publishes `lcref` every 2 minutes, ~5–8 minutes behind real time.
     public static let stepMinutes = 2
     /// Frames newer than the newest mask reuse it only within this gap; beyond it they go unmasked.
     public static let maxMaskLag: TimeInterval = 15 * 60
-    /// Mask growth in pixels: covers mask/frame timing (≤ 8 min), MRMS 1 km cells and edge smoothing.
-    public static let dilation = 3
+    /// Mask growth on the ground (CR #6.1): a 60 km/h storm moves 8 km in the ≤ 8 min a mask can lag
+    /// its frame, plus 1 km for MRMS cells. Converted to pixels per mask zoom and latitude.
+    public static let marginMeters = 9_000.0
 
     struct Raw: Decodable { struct Meta: Decodable { var end_valid: String }; var meta: Meta }
 
@@ -59,67 +61,56 @@ public enum RadarQC {
         }
     }
 
-    /// Splits a tile URL into the image to download and its optional QC mask.
-    public static func split(_ url: URL) -> (image: URL, mask: URL?) {
+    /// Splits a tile URL into the image to download, its QC mask template (`…/{z}/{x}/{y}.png`, the
+    /// fragment had the display tile's numbers substituted in) and the display tile.
+    public static func split(_ url: URL) -> (image: URL, maskTemplate: String?, tile: RadarQCMask.TileID?) {
         let s = url.absoluteString
-        guard let r = s.range(of: "#" + fragmentKey) else { return (url, nil) }
-        let base = URL(string: String(s[..<r.lowerBound])) ?? url
-        return (base, URL(string: String(s[r.upperBound...])))
+        guard let r = s.range(of: "#" + fragmentKey) else { return (url, nil, nil) }
+        let base = String(s[..<r.lowerBound])
+        let image = URL(string: base) ?? url
+        func zxy(_ u: String) -> (prefix: Substring, tile: RadarQCMask.TileID)? {
+            let parts = u.split(separator: "/", omittingEmptySubsequences: false)
+            guard parts.count > 4, let z = Int(parts[parts.count - 3]), let x = Int(parts[parts.count - 2]),
+                  let y = Int(parts[parts.count - 1].split(separator: ".").first ?? "") else { return nil }
+            return (u.dropLast(parts.suffix(3).joined(separator: "/").count), .init(z: z, x: x, y: y))
+        }
+        guard let img = zxy(base), let mask = zxy(String(s[r.upperBound...])) else { return (image, nil, nil) }
+        return (image, mask.prefix + "{z}/{x}/{y}.png", img.tile)
     }
 
-    /// Clears (sets to 0) every RGBA pixel with no mask echo within `dilation` pixels. `rgba` is
-    /// width×height×4 bytes; `maskAlpha` is the mask tile's alpha channel at the same size.
-    public static func apply(rgba: inout [UInt8], width: Int, height: Int, maskAlpha: [UInt8], dilation: Int = dilation) {
-        guard width > 0, height > 0, rgba.count == width * height * 4, maskAlpha.count == width * height else { return }
-        let keep = dilate(maskAlpha.map { $0 > 0 }, width: width, height: height, radius: dilation)
-        for p in 0..<(width * height) where !keep[p] {
-            rgba[p * 4] = 0; rgba[p * 4 + 1] = 0; rgba[p * 4 + 2] = 0; rgba[p * 4 + 3] = 0
-        }
-    }
-
-    /// Square (Chebyshev) dilation, separable.
-    static func dilate(_ on: [Bool], width w: Int, height h: Int, radius r: Int) -> [Bool] {
-        guard r > 0 else { return on }
-        var rows = [Bool](repeating: false, count: w * h)
-        for y in 0..<h {
-            for x in 0..<w {
-                var hit = false
-                for dx in max(0, x - r)...min(w - 1, x + r) where on[y * w + dx] { hit = true; break }
-                rows[y * w + x] = hit
-            }
-        }
-        var out = [Bool](repeating: false, count: w * h)
-        for y in 0..<h {
-            for x in 0..<w {
-                var hit = false
-                for dy in max(0, y - r)...min(h - 1, y + r) where rows[dy * w + x] { hit = true; break }
-                out[y * w + x] = hit
-            }
-        }
-        return out
-    }
 }
 
 #if canImport(CoreGraphics)
 import CoreGraphics
+import ImageIO
 
 extension RadarQC {
-    /// `image` with pixels outside the (dilated) `mask` echoes cleared. nil if the sizes differ or drawing
-    /// fails, in which case the caller shows the tile unmasked.
-    public static func masked(_ image: CGImage, mask: CGImage) -> CGImage? {
+    /// Alpha bytes of a 256² mask tile; `[]` if every pixel is transparent (clear sky: nothing to keep).
+    public static func alpha(of mask: CGImage) -> [UInt8]? {
+        guard mask.width == tileSize, mask.height == tileSize else { return nil }
+        let px = RadarTilePacker.render(mask, space: CGColorSpaceCreateDeviceRGB())
+        let a = (0..<(tileSize * tileSize)).map { px[$0 * 4 + 3] }
+        return a.contains { $0 > 0 } ? a : []
+    }
+
+    /// Display tile `image` with pixels outside the dilated `mask` cleared, plus its PNG encoding (so it
+    /// is stored compressed). nil if sizes differ or drawing fails; the caller then fails open.
+    public static func masked(_ image: CGImage, tile: RadarQCMask.TileID, mask: [UInt8]) -> (image: CGImage, png: Data)? {
         let w = image.width, h = image.height
-        guard w > 0, h > 0, mask.width == w, mask.height == h else { return nil }
+        guard w == tileSize, h == tileSize else { return nil }
         // Same space as the tile so the N0Q/N0B colours come through unchanged.
         let space = (image.colorSpace?.model == .rgb ? image.colorSpace : nil) ?? CGColorSpaceCreateDeviceRGB()
         var px = RadarTilePacker.render(image, space: space)
-        let m = RadarTilePacker.render(mask, space: space)
-        guard px.count == w * h * 4, m.count == w * h * 4 else { return nil }
-        let alpha = (0..<(w * h)).map { m[$0 * 4 + 3] }
-        apply(rgba: &px, width: w, height: h, maskAlpha: alpha)
-        guard let provider = CGDataProvider(data: Data(px) as CFData) else { return nil }
-        return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4, space: space,
-                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+        RadarQCMask.apply(rgba: &px, tile: tile, mask: mask)
+        guard let provider = CGDataProvider(data: Data(px) as CFData),
+              let out = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4, space: space,
+                                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                                provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent) else { return nil }
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, out, nil)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return (out, data as Data)
     }
 }
 #endif

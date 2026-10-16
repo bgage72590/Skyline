@@ -37,7 +37,21 @@ final class RadarImageCache {
     private var wakeObserver: NSObjectProtocol?
 
     /// What a download produced.
-    enum Outcome: Sendable { case image(RadarTile), missing, transientFailure }
+    enum Outcome: Sendable {
+        case image(RadarTile), missing, transientFailure
+        /// CR #6.3: drawn unmasked because its QC mask isn't available yet. Never cached; asked again.
+        case provisional(RadarTile)
+    }
+    /// Tiles last delivered as `.provisional`: the radar view keeps showing them and re-requests them
+    /// once their back-off is over, replacing them with the masked tile.
+    private var provisional: Set<String> = []
+    func isProvisional(_ url: URL) -> Bool { provisional.contains(url.absoluteString) }
+    /// The last unmasked copy of a provisional tile, for views that ask during its back-off. Not in
+    /// `images`, so it is never mistaken for the final (masked) tile.
+    private let provisionalImages = NSCache<NSString, RadarTile>()
+    func provisionalImage(for url: URL) -> RadarTile? { provisionalImages.object(forKey: url.absoluteString as NSString) }
+    /// MRMS QC masks, cached per (time, mask tile) and shared by every display tile under them (CR #6.4).
+    nonisolated let maskStore: RadarQCMaskStore
 
     private init() {
         let config = URLSessionConfiguration.default
@@ -55,6 +69,9 @@ final class RadarImageCache {
         config.httpShouldSetCookies = false
         config.httpCookieStorage = nil
         session = URLSession(configuration: config)
+        provisionalImages.totalCostLimit = 8 << 20
+        let s = session
+        maskStore = RadarQCMaskStore { url in await Self.fetchMaskAlpha(session: s, url: url) }
         // Decoded RGBA bytes; live tiles are held by the radar view anyway, so this bridges tiles pruned
         // after a pan and re-requested on pan-back without a network trip (24 MB ≈ 96 tiles; restored
         // from 8 MB in build 35, radar-pan-diagnosis fix 3). `-SkylineDecodedCacheMB N` is a measurement hook.
@@ -217,7 +234,7 @@ final class RadarImageCache {
         let key = url.absoluteString
         let session = self.session
         Task {
-            let outcome = await Self.fetchDecoded(session: session, url: url)
+            let outcome = await Self.fetchDecoded(session: session, url: url, masks: maskStore)
             inFlight -= 1
             defer { pump() }
             var image: RadarTile?
@@ -227,6 +244,15 @@ final class RadarImageCache {
                 images.setObject(decoded, forKey: key as NSString, cost: decoded.heldBytes)
                 failures[key] = nil
                 transient[key] = nil
+                provisional.remove(key)
+                provisionalImages.removeObject(forKey: key as NSString)
+            case .provisional(let unmasked):
+                image = unmasked
+                provisional.insert(key)
+                provisionalImages.setObject(unmasked, forKey: key as NSString, cost: unmasked.heldBytes)
+                let attempts = (transient[key]?.attempts ?? 0) + 1
+                transient[key] = (Date(), attempts)
+                scheduleRetryTick(after: Self.backoff(attempts: attempts))
             case .missing:
                 failures[key] = Date()
             case .transientFailure:
@@ -241,19 +267,36 @@ final class RadarImageCache {
         }
     }
 
-    nonisolated private static func fetchDecoded(session: URLSession, url: URL) async -> Outcome {
+    nonisolated private static func fetchDecoded(session: URLSession, url: URL, masks: RadarQCMaskStore) async -> Outcome {
         // False-green fix: a NEXRAD tile may carry an MRMS QC mask in its fragment (RadarQC).
-        let (imageURL, maskURL) = RadarQC.split(url)
+        let (imageURL, maskTemplate, tile) = RadarQC.split(url)
         let outcome = await fetchRaw(session: session, url: imageURL)
-        guard let maskURL, case .image(let decoded, _) = outcome else { return outcome.decodedOutcome }
-        // A missing or failed mask never hides radar: the tile is shown as IEM drew it.
-        guard case .image(let mask, _) = await fetchRaw(session: session, url: maskURL),
-              let masked = RadarQC.masked(decoded, mask: mask) else { return outcome.decodedOutcome }
-        return .image(pack(masked, encoded: nil))
+        guard let maskTemplate, let tile, case .image(let decoded, let data) = outcome else { return outcome.decodedOutcome }
+        let m = RadarQCMask.maskTile(for: tile)
+        // CR #6.3: no mask (503 for a missing slot, offline…) → show unmasked for now, retry later.
+        guard let mask = await masks.mask(template: maskTemplate, tile: m.tile) else {
+            return .provisional(await onDecodeQueue { pack(decoded, encoded: data) })
+        }
+        // CR #6.4: masking and re-encoding run under the same 2-wide decode cap, and the result is
+        // stored PNG-compressed like any other tile.
+        return await onDecodeQueue {
+            guard let masked = RadarQC.masked(decoded, tile: tile, mask: mask) else { return .provisional(pack(decoded, encoded: data)) }
+            return .image(pack(masked.image, encoded: masked.png))
+        }
+    }
+
+    nonisolated private static func onDecodeQueue<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { done in decodeQueue.addOperation { done.resume(returning: autoreleasepool { work() }) } }
+    }
+
+    /// A mask tile's alpha (256²), `[]` when it has no echoes at all, nil on any failure.
+    nonisolated private static func fetchMaskAlpha(session: URLSession, url: URL) async -> [UInt8]? {
+        guard case .image(let img, _) = await fetchRaw(session: session, url: url) else { return nil }
+        return await onDecodeQueue { RadarQC.alpha(of: img) }
     }
 
     /// Download outcome before packing.
-    enum RawOutcome: Sendable {
+    enum RawOutcome: @unchecked Sendable {
         case image(CGImage, Data), missing, transientFailure
         var decodedOutcome: Outcome {
             switch self {

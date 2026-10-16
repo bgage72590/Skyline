@@ -1,4 +1,5 @@
 import CoreGraphics
+import ImageIO
 import Foundation
 import Testing
 @testable import SkylineCore
@@ -35,37 +36,111 @@ struct RadarQCTests {
         #expect(out.dropLast().allSatisfy { $0.urlTemplate.contains("#qc=") })
         // Idempotent.
         #expect(RadarQC.masked(out, latestMask: latest) == out)
-        // Both halves get the tile coordinates; the fragment never reaches the server.
+        // The image half goes to the server without the fragment; the mask comes back as a template.
         let url = okx.url(z: 8, x: 75, y: 95)!
-        let (image, mask) = RadarQC.split(url)
+        let (image, mask, tile) = RadarQC.split(url)
         #expect(image.absoluteString == "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/ridge::OKX-N0B-202610161719/8/75/95.png")
-        #expect(mask?.absoluteString == "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/mrms::lcref-202610161718/8/75/95.png")
-        #expect(RadarQC.split(image).mask == nil)
+        #expect(mask == "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/mrms::lcref-202610161718/{z}/{x}/{y}.png")
+        #expect(tile == .init(z: 8, x: 75, y: 95))
+        #expect(RadarQC.split(image).maskTemplate == nil)
     }
 
-    @Test func clearsPixelsWithoutNearbyMaskEcho() {
-        let w = 10, h = 1
-        var rgba = [UInt8](repeating: 200, count: w * h * 4)
-        var mask = [UInt8](repeating: 0, count: w * h)
-        mask[2] = 255
-        RadarQC.apply(rgba: &rgba, width: w, height: h, maskAlpha: mask, dilation: 1)
-        let alive = (0..<w).map { rgba[$0 * 4 + 3] > 0 }
-        #expect(alive == [false, true, true, true, false, false, false, false, false, false])
-        // An empty mask (clear sky, IEM's blank 334-byte tile) removes everything: the Fairfield case.
-        var all = [UInt8](repeating: 200, count: w * h * 4)
-        RadarQC.apply(rgba: &all, width: w, height: h, maskAlpha: [UInt8](repeating: 0, count: w * h))
-        #expect(all.allSatisfy { $0 == 0 })
-        // Wrong sizes: untouched.
-        var same = [UInt8](repeating: 9, count: 8)
-        RadarQC.apply(rgba: &same, width: 2, height: 1, maskAlpha: [0])
-        #expect(same == [UInt8](repeating: 9, count: 8))
+    typealias T = RadarQCMask.TileID
+
+    // CR #6.1: the margin is ≥ 9 km on the ground at every display zoom.
+    @Test func marginIsInKilometresAtEveryZoom() {
+        for z in 3...14 {
+            let display = T(z: z, x: Int(Double(1 << z) * 0.2965), y: Int(Double(1 << z) * 0.3714)) // ~Fairfield
+            let m = RadarQCMask.maskTile(for: display).tile
+            #expect(m.z == min(z, 6))
+            let r = RadarQCMask.radiusPixels(maskZoom: m.z, tileY: m.y)
+            let ground = Double(r) * RadarQCMask.metersPerPixel(zoom: m.z, tileY: m.y)
+            #expect(ground >= 9_000 && ground < 9_000 + RadarQCMask.metersPerPixel(zoom: m.z, tileY: m.y) + 1)
+        }
+        #expect(RadarQCMask.radiusPixels(maskZoom: 6, tileY: 23) == 6) // 1.79 km/px at the tile centre, ~43°N
     }
 
-    @Test func dilationIsSquare() {
-        var on = [Bool](repeating: false, count: 25); on[12] = true
-        let d = RadarQC.dilate(on, width: 5, height: 5, radius: 1)
-        #expect(d.filter { $0 }.count == 9)
-        #expect(d[6] && d[18] && !d[0] && !d[24])
+    @Test func displayTilesMapIntoTheMaskTile() {
+        let m = RadarQCMask.maskTile(for: T(z: 8, x: 75, y: 95))
+        #expect(m.tile == T(z: 6, x: 18, y: 23) && m.scale == 4 && m.offsetX == 192 && m.offsetY == 192)
+        let low = RadarQCMask.maskTile(for: T(z: 4, x: 4, y: 5))
+        #expect(low.tile == T(z: 4, x: 4, y: 5) && low.scale == 1 && low.offsetX == 0)
+        // Neighbourhood wraps in x and stops at the poles.
+        let n = RadarQCMask.neighbourhood(of: T(z: 2, x: 0, y: 0))
+        #expect(n[0] == nil && n[1] == nil && n[2] == nil)
+        #expect(n[3] == T(z: 2, x: 3, y: 0) && n[5] == T(z: 2, x: 1, y: 0))
+    }
+
+    static func alpha(_ on: [(Int, Int)]) -> [UInt8] {
+        var a = [UInt8](repeating: 0, count: 256 * 256); for (x, y) in on { a[y * 256 + x] = 255 }; return a
+    }
+
+    // CR #6.2: an echo just across a seam keeps the edge of this tile, in all directions.
+    @Test func dilationCrossesTileSeams() {
+        var block = [[UInt8]?](repeating: nil, count: 9)
+        block[5] = Self.alpha([(0, 100)])     // right neighbour, its first column
+        block[0] = Self.alpha([(255, 255)])   // top-left neighbour corner
+        let m = RadarQCMask.dilatedCentre(block, radius: 3)
+        #expect(m[100 * 256 + 255] == 1 && m[100 * 256 + 253] == 1 && m[100 * 256 + 252] == 0)
+        #expect(m[97 * 256 + 255] == 1 && m[96 * 256 + 255] == 0)
+        #expect(m[0] == 1 && m[2 * 256 + 2] == 1 && m[3 * 256 + 3] == 0)
+        #expect(RadarQCMask.dilatedCentre([[UInt8]?](repeating: nil, count: 9), radius: 5).allSatisfy { $0 == 0 })
+    }
+
+    @Test func applyClearsOutsideTheMaskAtHigherZoom() {
+        var mask = [UInt8](repeating: 0, count: 256 * 256)
+        for y in 192..<256 { for x in 192..<200 { mask[y * 256 + x] = 1 } } // left 8 mask px of tile (3,3)
+        var rgba = [UInt8](repeating: 200, count: 256 * 256 * 4)
+        RadarQCMask.apply(rgba: &rgba, tile: T(z: 8, x: 75, y: 95), mask: mask)
+        #expect(rgba[3] == 200 && rgba[(10 * 256 + 31) * 4 + 3] == 200)  // 8 mask px × 4 = 32 display px
+        #expect(rgba[(10 * 256 + 32) * 4 + 3] == 0 && rgba[(255 * 256 + 255) * 4 + 3] == 0)
+    }
+
+    final class Counter: @unchecked Sendable {
+        let lock = NSLock(); var urls: [String] = []
+        func note(_ u: URL) { lock.lock(); urls.append(u.absoluteString); lock.unlock() }
+        var count: Int { lock.lock(); defer { lock.unlock() }; return urls.count }
+    }
+    static let template = "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/mrms::lcref-202610160134/{z}/{x}/{y}.png"
+
+    // CR #6.4: masks are cached per (time, tile) and neighbours are shared, so extra requests stay small.
+    @Test func masksAreCachedAndNeighboursShared() async {
+        let c = Counter()
+        let store = RadarQCMaskStore { url in c.note(url); return url.absoluteString.hasSuffix("/6/18/23.png") ? Self.alpha([(128, 128)]) : [] }
+        let a = await store.mask(template: Self.template, tile: T(z: 6, x: 18, y: 23))
+        #expect(c.count == 9 && a?[128 * 256 + 128] == 1 && a?[0] == 0)
+        _ = await store.mask(template: Self.template, tile: T(z: 6, x: 18, y: 23))
+        #expect(c.count == 9)
+        _ = await store.mask(template: Self.template, tile: T(z: 6, x: 19, y: 23))
+        #expect(c.count == 12) // 6 of 9 neighbours already held
+        // Every display tile under the mask tile (16 at z8) shares one mask.
+        let under = (72..<76).flatMap { x in (92..<96).map { y in RadarQCMask.maskTile(for: T(z: 8, x: x, y: y)).tile } }
+        #expect(Set(under) == [T(z: 6, x: 18, y: 23)])
+    }
+
+    // Clear sky (all neighbours blank but present) masks everything: the Fairfield case.
+    @Test func blankButPresentMaskRemovesEverything() async {
+        let store = RadarQCMaskStore { _ in [] }
+        let m = await store.mask(template: Self.template, tile: T(z: 6, x: 18, y: 23))
+        #expect(m != nil && m!.allSatisfy { $0 == 0 })
+    }
+
+    // CR #6.3/#6.5: any failed neighbour (IEM answers a missing slot with 503) fails open, and the failure
+    // is not cached: the next ask fetches again and can succeed.
+    @Test func failureFailsOpenAndIsRetried() async {
+        let c = Counter()
+        final class Flag: @unchecked Sendable { var down = true }
+        let flag = Flag()
+        let store = RadarQCMaskStore { url in
+            c.note(url)
+            return flag.down && url.absoluteString.hasSuffix("/6/19/23.png") ? nil : []
+        }
+        #expect(await store.mask(template: Self.template, tile: T(z: 6, x: 18, y: 23)) == nil)
+        flag.down = false
+        let before = c.count
+        let m = await store.mask(template: Self.template, tile: T(z: 6, x: 18, y: 23))
+        #expect(m != nil)
+        #expect(c.count > before)
     }
 
     static func image(_ w: Int, _ h: Int, _ px: (Int, Int) -> (UInt8, UInt8, UInt8, UInt8)) -> CGImage {
@@ -76,18 +151,22 @@ struct RadarQCTests {
         return ctx.makeImage()!
     }
 
-    @Test func masksImageAndKeepsColours() {
-        // N0Q 20 dBZ green everywhere (biological returns + a real cell); MRMS has echo only on the left.
+    @Test func masksImageKeepsColoursAndEncodesPNG() throws {
         let green: (UInt8, UInt8, UInt8, UInt8) = (67, 214, 126, 255)
-        let tile = Self.image(32, 32) { _, _ in green }
-        let mask = Self.image(32, 32) { x, _ in x < 8 ? (45, 90, 179, 255) : (0, 0, 0, 0) }
-        let out = RadarQC.masked(tile, mask: mask)!
-        let px = RadarTilePacker.render(out, space: CGColorSpace(name: CGColorSpace.sRGB))
-        func at(_ x: Int, _ y: Int) -> [UInt8] { Array(px[(y * 32 + x) * 4..<(y * 32 + x) * 4 + 4]) }
-        #expect(at(0, 5) == [67, 214, 126, 255])
-        #expect(at(8 + RadarQC.dilation - 1, 5) == [67, 214, 126, 255])
-        #expect(at(8 + RadarQC.dilation, 5) == [0, 0, 0, 0])
-        #expect(at(31, 31) == [0, 0, 0, 0])
-        #expect(RadarQC.masked(tile, mask: Self.image(16, 16) { _, _ in green }) == nil)
+        let tile = Self.image(256, 256) { _, _ in green }
+        var mask = [UInt8](repeating: 0, count: 256 * 256)
+        for y in 0..<256 { for x in 0..<64 { mask[y * 256 + x] = 1 } }
+        let out = try #require(RadarQC.masked(tile, tile: T(z: 4, x: 1, y: 1), mask: mask))
+        let px = RadarTilePacker.render(out.image, space: CGColorSpace(name: CGColorSpace.sRGB))
+        func at(_ x: Int, _ y: Int) -> [UInt8] { Array(px[(y * 256 + x) * 4..<(y * 256 + x) * 4 + 4]) }
+        #expect(at(0, 5) == [67, 214, 126, 255] && at(63, 5) == [67, 214, 126, 255])
+        #expect(at(64, 5) == [0, 0, 0, 0])
+        // Stored compressed: the PNG is far smaller than RGBA and decodes back to the same pixels.
+        #expect(out.png.count < 256 * 256)
+        let src = try #require(CGImageSourceCreateWithData(out.png as CFData, nil))
+        let back = try #require(CGImageSourceCreateImageAtIndex(src, 0, nil))
+        #expect(RadarTilePacker.render(back, space: CGColorSpace(name: CGColorSpace.sRGB)) == px)
+        #expect(RadarQC.masked(Self.image(16, 16) { _, _ in green }, tile: T(z: 4, x: 1, y: 1), mask: mask) == nil)
+        #expect(RadarQC.alpha(of: Self.image(256, 256) { _, _ in (0, 0, 0, 0) }) == [])
     }
 }
