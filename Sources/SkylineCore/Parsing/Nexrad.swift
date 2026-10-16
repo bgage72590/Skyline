@@ -121,7 +121,7 @@ public enum IEMRidge {
 
     /// Picks scans for the loop: the newest, then walking back, each at least `stepMinutes − 1` earlier
     /// than the last kept one, within the range. Same frame budget as the composite loop.
-    public static func frames(site: String, scans: [Date], range: RadarRange) -> [RadarFrame] {
+    public static func frames(site: String, scans: [Date], range: RadarRange, smooth: Bool = true) -> [RadarFrame] {
         guard let latest = scans.last else { return [] }
         let earliest = latest.addingTimeInterval(-Double(range.totalMinutes * 60))
         let minGap = Double((range.stepMinutes - 1) * 60)
@@ -131,6 +131,8 @@ public enum IEMRidge {
             kept.append(t)
         }
         // Item 4: render from the scan's raster (smooth); IEM's tile stays the fallback.
-        return kept.reversed().map { RadarFrame(time: $0, urlTemplate: tileTemplate(site: site, time: $0) + "#raw=" + rasterBase(site: site, time: $0)) }
+        return kept.reversed().map {
+            RadarFrame(time: $0, urlTemplate: tileTemplate(site: site, time: $0) + (smooth ? "#raw=" + rasterBase(site: site, time: $0) : ""))
+        }
     }
 }

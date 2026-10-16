@@ -168,6 +168,9 @@ final class RadarImageCache {
         // screen changes; only re-attach-without-network after a pan-back gets slower.
         images.totalCostLimit = critical ? 1 << 20 : Self.normalCacheBytes / 4
         if critical { images.removeAllObjects() }
+        // CR #7.5: scan rasters (~1 MB each) shrink too; the shown loop re-fetches what it needs.
+        let rasters = rasterStore.store
+        Task { await rasters.trim(keep: critical ? 2 : 12) }
         urlCache.memoryCapacity = 0
         urlCache.memoryCapacity = 1 << 20
         restoreTask?.cancel()
@@ -176,6 +179,7 @@ final class RadarImageCache {
             guard !Task.isCancelled, let self else { return }
             self.images.totalCostLimit = Self.normalCacheBytes
             self.urlCache.memoryCapacity = 4 << 20
+            await self.rasterStore.store.restore()
         }
     }
 
@@ -275,7 +279,10 @@ final class RadarImageCache {
         // False-green fix: a NEXRAD tile may carry an MRMS QC mask in its fragment (RadarQC).
         let (imageURL, maskTemplate, tile, rasterBase) = RadarQC.split(url)
         // Item 4: local-site frames render smoothly from the scan raster; IEM's tile is the fallback.
-        if let rasterBase, let tile, let raster = await rasters.raster(base: rasterBase) {
+        if let rasterBase, let tile {
+            // CR #7.6: a frame that renders smooth never falls back to blocky tiles (no mixed loop): if
+            // its raster isn't available, the tile is retried with back-off and the frame is held.
+            guard let raster = await rasters.raster(base: rasterBase) else { return .transientFailure }
             let mask: [UInt8]? = if let maskTemplate {
                 await masks.mask(template: maskTemplate, tile: RadarQCMask.maskTile(for: tile).tile)
             } else { nil }
@@ -328,13 +335,22 @@ final class RadarImageCache {
         }
     }
 
-    /// Body of a 200 response from a known host, nil otherwise (raster and world files).
-    nonisolated private static func fetchData(session: URLSession, url: URL) async -> Data? {
+    /// Body of a 200 response from a known host, nil otherwise (raster and world files). Streams and
+    /// gives up past `maxBytes` (CR #7.1: capped download).
+    nonisolated private static func fetchData(session: URLSession, url: URL, maxBytes: Int = PalettePNG.maxFileBytes) async -> Data? {
         guard KnownHosts.isAllowed(url) else { return nil }
         RequestStats.shared.note()
-        guard let (data, response) = try? await session.data(from: url), let http = response as? HTTPURLResponse,
-              KnownHosts.isAllowed(http.url ?? url), http.statusCode == 200, !data.isEmpty else { return nil }
-        return data
+        guard let (bytes, response) = try? await session.bytes(from: url), let http = response as? HTTPURLResponse,
+              KnownHosts.isAllowed(http.url ?? url), http.statusCode == 200 else { return nil }
+        if http.expectedContentLength > Int64(maxBytes) { bytes.task.cancel(); return nil }
+        var data = Data()
+        do {
+            for try await chunk in bytes {
+                data.append(chunk)
+                if data.count > maxBytes { bytes.task.cancel(); return nil }
+            }
+        } catch { return nil }
+        return data.isEmpty ? nil : data
     }
 
     nonisolated private static func fetchRaw(session: URLSession, url: URL) async -> RawOutcome {

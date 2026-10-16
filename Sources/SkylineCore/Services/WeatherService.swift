@@ -130,7 +130,7 @@ public actor WeatherService {
                 // Stale site (down for maintenance): nothing in the last 30 min means no loop.
                 guard let last = scans.last, now().timeIntervalSince(last) < 30 * 60 else { return [] }
                 latest = last
-                past = IEMRidge.frames(site: site, scans: scans, range: range)
+                past = await smoothSiteFrames(site: site, scans: scans, range: range, force: forceRefresh)
             } else {
                 let data = try await fetch(Endpoints.iemLatest, ttl: TTL.radarIndex, force: forceRefresh)
                 latest = try IEMNexrad.latestValidTime(data) ?? now()
@@ -146,6 +146,22 @@ public actor WeatherService {
                   let initTime = try? IEMHRRR.initTime(run) else { return past }
             return past + IEMHRRR.frames(initTime: initTime, after: latest)
         }
+    }
+
+    /// CR #7.6: the whole loop is smooth or none of it is. The newest scan's raster can trail the scan
+    /// list; then that scan is held back (the loop ends one scan earlier, ~5 min) until it's archived.
+    /// If even the previous one isn't there (archive down), the loop uses IEM's tiles throughout.
+    func smoothSiteFrames(site: String, scans: [Date], range: RadarRange, force: Bool) async -> [RadarFrame] {
+        func archived(_ t: Date) async -> Bool {
+            guard let url = URL(string: IEMRidge.rasterBase(site: site, time: t) + ".wld") else { return false }
+            return await optionalFetch(url, ttl: 24 * 3600, force: false).flatMap { String(data: $0, encoding: .ascii) }
+                .flatMap(RidgeRaster.parseWorldFile) != nil
+        }
+        guard let last = scans.last else { return [] }
+        if await archived(last) { return IEMRidge.frames(site: site, scans: scans, range: range) }
+        let held = Array(scans.dropLast())
+        if let prev = held.last, await archived(prev) { return IEMRidge.frames(site: site, scans: held, range: range) }
+        return IEMRidge.frames(site: site, scans: scans, range: range, smooth: false)
     }
 
     /// Latest NEXRAD storm attributes near `location` (strong moving cells only). Cheap GeoJSON; nil on failure.
