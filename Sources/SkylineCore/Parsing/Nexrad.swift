@@ -113,6 +113,12 @@ public enum IEMRidge {
         "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/ridge::\(site)-\(product)-\(utcFormatter("yyyyMMddHHmm").string(from: time))/{z}/{x}/{y}.png"
     }
 
+    /// IEM's archived scan raster, without extension (`.png` palette image, `.wld` world file).
+    public static func rasterBase(site: String, time: Date) -> String {
+        let d = utcFormatter("yyyy/MM/dd").string(from: time), t = utcFormatter("yyyyMMddHHmm").string(from: time)
+        return "https://mesonet.agron.iastate.edu/archive/data/\(d)/GIS/ridge/\(site)/\(product)/\(site)_\(product)_\(t)"
+    }
+
     /// Picks scans for the loop: the newest, then walking back, each at least `stepMinutes − 1` earlier
     /// than the last kept one, within the range. Same frame budget as the composite loop.
     public static func frames(site: String, scans: [Date], range: RadarRange) -> [RadarFrame] {
@@ -124,6 +130,7 @@ public enum IEMRidge {
             if let last = kept.last, last.timeIntervalSince(t) < minGap { continue }
             kept.append(t)
         }
-        return kept.reversed().map { RadarFrame(time: $0, urlTemplate: tileTemplate(site: site, time: $0)) }
+        // Item 4: render from the scan's raster (smooth); IEM's tile stays the fallback.
+        return kept.reversed().map { RadarFrame(time: $0, urlTemplate: tileTemplate(site: site, time: $0) + "#raw=" + rasterBase(site: site, time: $0)) }
     }
 }
