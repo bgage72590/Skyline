@@ -2,6 +2,10 @@ import Foundation
 
 /// Fetches, caches and blends weather for a location. Thread-safe (actor); de-duplicates
 /// concurrent requests for the same location (e.g. menu bar + main window).
+/// Item 2: who is waiting for an Open-Meteo turn. A city with nothing on screen yet and a forced
+/// Retry are interactive; scheduled and background refreshes are not.
+public enum FetchPriority: Sendable, Equatable { case interactive, background }
+
 public actor WeatherService {
     /// Cache lifetimes. Forecast data only changes when models run, so ~10 min is plenty.
     public enum TTL {
@@ -58,7 +62,11 @@ public actor WeatherService {
     private var backoffSleep: @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) }
     /// One Open-Meteo forecast GET at a time, so a shared back-off ending doesn't stampede the host.
     private var openMeteoBusy = false
-    private var openMeteoWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Item 2: interactive turns (a city with nothing on screen yet, a forced Retry) go ahead of
+    /// queued background refreshes; FIFO within each class. Still one GET at a time.
+    private var openMeteoWaiters: [(priority: FetchPriority, cont: CheckedContinuation<Void, Never>)] = []
+    /// Item 2: one network GET per URL; a second caller (add + sync apply + refresh) joins it.
+    private var inFlightGets: [String: Task<Fetched, Error>] = [:]
     /// Forecast verification + adaptive weights (nil = fixed weights, nothing recorded; used by tests).
     public nonisolated let verifier: ForecastVerifier?
     /// Recent daily-forecast snapshots for "why the forecast changed" (nil = none kept; used by tests).
@@ -78,12 +86,13 @@ public actor WeatherService {
 
     // MARK: Public API
 
-    public func report(for location: WeatherLocation, forceRefresh: Bool = false) async throws -> WeatherReport {
+    public func report(for location: WeatherLocation, forceRefresh: Bool = false,
+                       priority: FetchPriority = .background) async throws -> WeatherReport {
         // The coordinate is part of the key: My Location keeps its id while it moves, and a second fix
         // during a slow load must not get the old place's report (QA #13).
         let key = location.id + "@\(location.coordinate.latitude),\(location.coordinate.longitude)" + (forceRefresh ? "!" : "")
         if let existing = inFlight[key] { return try await existing.value }
-        let task = Task { try await self.buildReport(for: location, forceRefresh: forceRefresh) }
+        let task = Task { try await self.buildReport(for: location, forceRefresh: forceRefresh, priority: priority) }
         inFlight[key] = task
         defer { inFlight[key] = nil }
         return try await task.value
@@ -153,14 +162,16 @@ public actor WeatherService {
 
     // MARK: Assembly
 
-    private func buildReport(for location: WeatherLocation, forceRefresh force: Bool) async throws -> WeatherReport {
+    private func buildReport(for location: WeatherLocation, forceRefresh force: Bool,
+                             priority: FetchPriority = .background) async throws -> WeatherReport {
         // "My Location" goes out at ~1 km (the store already coarsens the fix; this is defense in depth).
         let coord = location.isCurrentLocation ? location.coordinate.coarse : location.coordinate.rounded
         // US-only sources (HRRR, NWS) follow the border outlines and the saved city's country (QA 4).
         let models = ForecastModel.models(inCONUS: location.isInCONUS)
 
         async let omFetch = fetchEntry(Endpoints.openMeteoForecast(coord, models: models), ttl: TTL.forecast,
-                                       force: force, maxStale: MaxStale.forecast)
+                                       force: force, maxStale: MaxStale.forecast,
+                                       priority: force ? .interactive : priority)
         async let aqData = optionalFetch(Endpoints.openMeteoAirQuality(coord), ttl: TTL.airQuality, force: force,
                                          maxStale: MaxStale.airQuality)
         // A remembered /points 404 skips only the forecast lookup; warnings are asked for regardless (L2).
@@ -352,22 +363,28 @@ public actor WeatherService {
     /// Fresh cache → network → stale cache no older than `maxStale` (offline fallback) → error.
     /// The result carries the data's real download time, so a cached copy is never passed off as new.
     func fetchEntry(_ url: URL, ttl: TimeInterval, force: Bool = false, headers: [String: String] = [:],
-                    maxStale: TimeInterval = .infinity) async throws -> Fetched {
+                    maxStale: TimeInterval = .infinity, priority: FetchPriority = .background) async throws -> Fetched {
         let key = url.absoluteString
         if !force, let hit = await cache.entry(key, maxAge: ttl), now().timeIntervalSince(hit.storedAt) < ttl {
             return Fetched(data: hit.data, storedAt: hit.storedAt, isFallback: false)
         }
         let host = url.host ?? ""
         // Non-force traffic never sleeps through a back-off; the stale copy (or the error) is enough.
+        // Item 2: a first fetch (nothing cached to show) waits out a short back-off like Retry does,
+        // instead of failing at once with a banner and a retry minutes later.
+        var waits = force
         if !force, let until = backoffUntil[host], until > now() {
             if let stale = await cache.entry(key, maxAge: maxStale) {
                 return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true)
             }
-            throw HTTPError.backingOff(host: host, until: until)
+            guard priority == .interactive else { throw HTTPError.backingOff(host: host, until: until) }
+            waits = true
         }
         // A short window is waited out, then fetched once. A long one throws so the UI can schedule
         // "retrying at h:mm" without holding `loadingIDs` for the rest of Retry-After.
-        if force { try await prepareForceFetch(host) }
+        if waits { try await prepareForceFetch(host) }
+        // Same URL already on the wire (not forced): share its answer, no second GET or queue slot.
+        if !force, let shared = inFlightGets[key] { return try await shared.value }
 
         func network() async throws -> Fetched {
             do {
@@ -385,7 +402,7 @@ public actor WeatherService {
                 await cache.store(data, for: key)
                 return Fetched(data: data, storedAt: now(), isFallback: false)
             } catch {
-                if force, case HTTPError.backingOff = error { throw error }
+                if waits, case HTTPError.backingOff = error { throw error }
                 if case HTTPError.throttled(_, _, let retryAfter) = error { noteThrottled(host, retryAfter: retryAfter) }
                 if let stale = await cache.entry(key, maxAge: maxStale) {
                     return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true)
@@ -394,14 +411,21 @@ public actor WeatherService {
             }
         }
 
-        do {
-            return try await withOpenMeteoTurn(host, network)
-        } catch let error as HTTPError {
-            // The city ahead of us in line was throttled. Wait only if the new window still fits.
-            guard force, case .backingOff = error else { throw error }
-            try await prepareForceFetch(host)
-            return try await withOpenMeteoTurn(host, network)
+        func attempt() async throws -> Fetched {
+            do {
+                return try await withOpenMeteoTurn(host, priority: priority, network)
+            } catch let error as HTTPError {
+                // The city ahead of us in line was throttled. Wait only if the new window still fits.
+                guard waits, case .backingOff = error else { throw error }
+                try await prepareForceFetch(host)
+                return try await withOpenMeteoTurn(host, priority: priority, network)
+            }
         }
+        if force { return try await attempt() }
+        let task = Task { try await attempt() }
+        inFlightGets[key] = task
+        defer { inFlightGets[key] = nil }
+        return try await task.value
     }
 
     /// Sleeps out a back-off only while the remaining time fits in `forceWaitCap` (total, across
@@ -427,9 +451,10 @@ public actor WeatherService {
     }
 
     /// Serializes `api.open-meteo.com` GETs. Other hosts run straight through.
-    private func withOpenMeteoTurn<T>(_ host: String, _ body: () async throws -> T) async throws -> T {
+    private func withOpenMeteoTurn<T>(_ host: String, priority: FetchPriority = .background,
+                                      _ body: () async throws -> T) async throws -> T {
         let gate = host == RefreshBookkeeping.openMeteoHost
-        if gate { await acquireOpenMeteo() }
+        if gate { await acquireOpenMeteo(priority) }
         do {
             let value = try await body()
             if gate { releaseOpenMeteo() }
@@ -440,19 +465,20 @@ public actor WeatherService {
         }
     }
 
-    private func acquireOpenMeteo() async {
+    private func acquireOpenMeteo(_ priority: FetchPriority) async {
         if !openMeteoBusy {
             openMeteoBusy = true
             return
         }
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            openMeteoWaiters.append(cont)
+            openMeteoWaiters.append((priority, cont))
         }
     }
 
     private func releaseOpenMeteo() {
         if !openMeteoWaiters.isEmpty {
-            openMeteoWaiters.removeFirst().resume()
+            let i = openMeteoWaiters.firstIndex { $0.priority == .interactive } ?? 0
+            openMeteoWaiters.remove(at: i).cont.resume()
         } else {
             openMeteoBusy = false
         }
