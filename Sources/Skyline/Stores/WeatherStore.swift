@@ -318,11 +318,18 @@ final class WeatherStore {
     /// Reads `staleTick`, so callers re-render when the report goes stale with no other change.
     func isStale(_ report: WeatherReport, now: Date = Date()) -> Bool {
         _ = staleTick
-        return isOffline(report) || report.dataAge(at: now) > staleDataAge
+        return hasRefreshProblem(report) || report.dataAge(at: now) > staleDataAge
     }
 
     /// True when the last refresh for this report's location failed (network or service error).
+    /// Only a Mac with no network is "Offline"; a failed or throttled refresh says so in other words.
     func isOffline(_ report: WeatherReport) -> Bool {
+        RefreshBookkeeping.isReallyOffline(cause: report.isOfflineFallback ? report.fallbackCause : nil,
+                                           error: errors[report.location.id])
+    }
+
+    /// Saved data after a failed refresh, or a refresh error: the banner shows (with the right words).
+    func hasRefreshProblem(_ report: WeatherReport) -> Bool {
         RefreshBookkeeping.isOffline(isOfflineFallback: report.isOfflineFallback, error: errors[report.location.id])
     }
 
@@ -352,7 +359,8 @@ final class WeatherStore {
             publishWidget()
             let until = report.isOfflineFallback
                 ? await service.backoff(for: RefreshBookkeeping.openMeteoHost) : nil
-            let follow = RefreshBookkeeping.afterReport(isOfflineFallback: report.isOfflineFallback, backoffUntil: until)
+            let follow = RefreshBookkeeping.afterReport(isOfflineFallback: report.isOfflineFallback,
+                                                        cause: report.fallbackCause, backoffUntil: until)
             if follow.clearError {
                 if errors[location.id] != nil { errors[location.id] = nil }
                 quietRetries.succeeded(location.id)
@@ -365,7 +373,11 @@ final class WeatherStore {
                 // Saved data stays up. A live back-off retries at `until` ("Open-Meteo busy, retrying at h:mm")
                 // instead of hammering the host and keeping the spinner on.
                 setError(follow.message, for: location.id)
-                scheduleRetry(location, notBefore: follow.notBefore)
+                // A one-off failure (not offline, not throttled) is retried in 15 s the first time, so a
+                // "Couldn’t update" banner after Refresh clears on its own within seconds.
+                let quick = retryAttempts[location.id, default: 0] == 0 ? follow.quickRetry : nil
+                scheduleRetry(location, notBefore: follow.notBefore,
+                              delay: quick.map { $0 + FetchRetryPolicy.jitter(for: location.id) })
             }
             scheduleHousekeeping()
             if !report.isOfflineFallback { considerNotifications(report, for: location) }
