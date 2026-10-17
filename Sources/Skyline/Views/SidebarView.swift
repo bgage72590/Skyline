@@ -134,17 +134,32 @@ struct SidebarView: View {
     @ViewBuilder
     private var searchResults: some View {
         SidebarSectionHeader(title: "Search Results")
-        if let error = store.searchError, !store.isSearching {
+        // Every outcome says something (Brian, Oct 17: adding a city failed silently).
+        if let status = store.searchStatus {
             VStack(alignment: .leading, spacing: 6) {
-                Label(error, systemImage: "wifi.exclamationmark").font(.callout).foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-                Button("Try Again") { store.retrySearch() }
+                switch status.kind {
+                case .failed:
+                    Label(status.message, systemImage: "wifi.exclamationmark").font(.callout).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .noResults:
+                    Label(status.message, systemImage: "magnifyingglass").font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .searching:
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(status.message).font(.callout).foregroundStyle(Glass.secondaryText)
+                    }
+                case .hint, .chooseOne:
+                    Text(status.message).font(.callout).foregroundStyle(Glass.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let detail = status.detail {
+                    Text(detail).font(.caption).foregroundStyle(Glass.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if status.canRetry { Button("Try Again") { store.retrySearch() } }
             }
             .padding(.horizontal, 6)
-        } else if store.isSearching && store.searchResults.isEmpty {
-            Text("Searching…").font(.callout).foregroundStyle(Glass.secondaryText).padding(.horizontal, 6)
-        } else if store.searchResults.isEmpty {
-            Text("No matches").font(.callout).foregroundStyle(Glass.secondaryText).padding(.horizontal, 6)
         }
         ForEach(store.searchResults) { result in
             Button { store.add(result) } label: {
