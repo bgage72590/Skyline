@@ -31,12 +31,18 @@ extension HTTPError: LocalizedError {
 
 /// Plain-English wording for errors shown in the UI (instead of "…HTTPError error 0.").
 public enum UserFacingError {
+    /// The one message that means the Mac itself has no network.
+    public static let offline = "You’re offline."
+
     public static func message(_ error: Error, now: Date = Date(), timeZone: TimeZone = .current,
                                locale: Locale = .autoupdatingCurrent) -> String {
         if let u = error as? URLError {
             switch u.code {
-            case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed, .internationalRoamingOff:
-                return "You’re offline."
+            case .notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff:
+                return offline
+            // -1005 is a dropped connection (often a reused keep-alive the server had closed), not "no
+            // network": calling it "offline" put a false Offline banner up after Refresh (QA, build 88).
+            case .networkConnectionLost: return "Lost the connection to the weather service."
             case .timedOut: return "Weather service didn’t respond."
             case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed: return "Couldn’t reach the weather service."
             case .secureConnectionFailed, .serverCertificateUntrusted, .serverCertificateHasBadDate:

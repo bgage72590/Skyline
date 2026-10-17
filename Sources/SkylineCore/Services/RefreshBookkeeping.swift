@@ -6,16 +6,24 @@ import Foundation
 public enum RefreshBookkeeping {
     public static let openMeteoHost = "api.open-meteo.com"
     public static let savedDataMessage = "Couldn’t reach the weather service; showing saved data."
+    /// Saved data because the Mac has no network (the only case the banner may call "Offline").
+    public static let offlineSavedMessage = "You’re offline; showing saved data."
+    /// A failed refresh with saved data and no live back-off is retried this soon (once), not after the
+    /// 1-minute ladder step: the usual cause is one dropped request, and the banner should clear fast.
+    public static let quickRetryAfterFallback: TimeInterval = 15
 
     public struct FollowUp: Equatable, Sendable {
         public var message: String
         public var notBefore: Date?
         public var clearError: Bool
+        /// Seconds to the first retry when it should come sooner than the ladder (nil = ladder).
+        public var quickRetry: TimeInterval? = nil
     }
 
     /// Saved data on screen. A live host back-off schedules the retry at `until` and says when.
-    public static func afterReport(isOfflineFallback: Bool, backoffUntil: Date?, now: Date = Date(),
-                                   timeZone: TimeZone = .current, locale: Locale = .autoupdatingCurrent) -> FollowUp {
+    public static func afterReport(isOfflineFallback: Bool, cause: FallbackCause? = nil, backoffUntil: Date?,
+                                   now: Date = Date(), timeZone: TimeZone = .current,
+                                   locale: Locale = .autoupdatingCurrent) -> FollowUp {
         guard isOfflineFallback else {
             return FollowUp(message: "", notBefore: nil, clearError: true)
         }
@@ -24,7 +32,8 @@ public enum RefreshBookkeeping {
                 HTTPError.backingOff(host: openMeteoHost, until: backoffUntil), now: now, timeZone: timeZone, locale: locale)
             return FollowUp(message: message, notBefore: backoffUntil, clearError: false)
         }
-        return FollowUp(message: savedDataMessage, notBefore: nil, clearError: false)
+        if cause == .offline { return FollowUp(message: offlineSavedMessage, notBefore: nil, clearError: false) }
+        return FollowUp(message: savedDataMessage, notBefore: nil, clearError: false, quickRetry: quickRetryAfterFallback)
     }
 
     /// A thrown refresh failure (including force during a long back-off).
@@ -42,14 +51,57 @@ public enum RefreshBookkeeping {
         }
     }
 
+    /// The report isn't current: saved data after a failed refresh, or a refresh error. Shows the banner.
     public static func isOffline(isOfflineFallback: Bool, error: String?) -> Bool {
         isOfflineFallback || error != nil
     }
 
+    /// The Mac really has no network: the only time the banner and the dropdown may say "Offline".
+    /// A dropped request, a timeout, a 5xx or a back-off is not that (QA, build 88: "Offline" after a
+    /// Refresh on a working network).
+    public static func isReallyOffline(cause: FallbackCause?, error: String?) -> Bool {
+        cause == .offline || error == UserFacingError.offline || error == offlineSavedMessage
+    }
+
     /// Banner sentence. A scheduled back-off replaces "showing data from …" with the retry clock time.
+    /// `offline` = `isReallyOffline`; any other failure says the update failed, not that the Mac is offline.
     public static func bannerLine(offline: Bool, error: String?, dataTime: String) -> String {
         if let error, error.contains("retrying at") { return error }
-        return (offline ? "Offline · showing data from " : "Showing data from ") + dataTime
+        if offline { return "Offline · showing data from " + dataTime }
+        if error != nil { return "Couldn’t update · showing data from " + dataTime }
+        return "Showing data from " + dataTime
+    }
+}
+
+/// Why a report is showing saved data (`WeatherReport.fallbackCause`).
+public enum FallbackCause: String, Codable, Sendable, Equatable {
+    /// No network on this Mac.
+    case offline
+    /// The host said slow down, or Skyline is waiting out its Retry-After.
+    case busy
+    /// Anything else: a dropped connection, a timeout, a server error, unreadable data.
+    case unreachable
+
+    public init(_ error: Error) {
+        if let u = error as? URLError, [.notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff].contains(u.code) {
+            self = .offline
+        } else if let h = error as? HTTPError, case .throttled = h {
+            self = .busy
+        } else if let h = error as? HTTPError, case .backingOff = h {
+            self = .busy
+        } else {
+            self = .unreachable
+        }
+    }
+
+    /// One immediate second try is worth it: the request died on the way, not because of the network
+    /// being down or the host refusing us. Covers macOS's -1005 on a reused keep-alive connection.
+    public static func retriesOnce(_ error: Error) -> Bool {
+        if let u = error as? URLError {
+            return [.networkConnectionLost, .badServerResponse, .cannotConnectToHost, .secureConnectionFailed].contains(u.code)
+        }
+        if let h = error as? HTTPError, case .status(let code, _) = h { return code >= 500 }
+        return false
     }
 }
 
