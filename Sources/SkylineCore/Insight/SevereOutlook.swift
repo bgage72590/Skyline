@@ -49,6 +49,12 @@ public struct SevereOutlook: Codable, Hashable, Sendable {
 
     /// "Slight risk of severe storms today (level 2 of 5)".
     public func sentence(now: Date, timeZone: TimeZone) -> String {
+        let level = risk.level.map { " (level \($0) of 5)" } ?? ""
+        return "\(risk.name) of severe storms \(when(now: now, timeZone: timeZone))\(level)"
+    }
+
+    /// "today", "tonight", "tomorrow" or "in N days".
+    public func when(now: Date, timeZone: TimeZone) -> String {
         var cal = Calendar(identifier: .gregorian); cal.timeZone = timeZone
         let when: String
         // From the outlook's own valid times, not its day number: SPC days run 12Z–12Z and the 06Z
@@ -61,8 +67,7 @@ public struct SevereOutlook: Codable, Hashable, Sendable {
             let startedToday = cal.isDate(validFrom, inSameDayAs: now)
             when = !startedToday || cal.component(.hour, from: now) >= 17 ? "tonight" : "today"
         }
-        let level = risk.level.map { " (level \($0) of 5)" } ?? ""
-        return "\(risk.name) of severe storms \(when)\(level)"
+        return when
     }
 }
 

@@ -2,26 +2,10 @@ import Foundation
 
 /// Plain-language bits for the menu-bar dropdown (polish 3), kept here so they're testable.
 public enum MenuSummary {
-    /// When rain is next expected: the 15-minute nowcast first ("Rain starting in 20 min"), else the
-    /// first hour in the next 12 with a 40 %+ chance ("Rain likely around 3 PM · 70%"), else
-    /// "No rain expected in the next 12 hours". Nil when there's no hourly data at all.
+    /// The rain card's line: the shared `RainTiming` sentence (the headline and radar header use the same
+    /// one). Nil when there's no nowcast line and no hourly data at all.
     public static func rainTiming(_ report: WeatherReport, now: Date, hourLabel: (Date) -> String) -> String? {
-        if let s = report.nowcastSummary(at: now) { return s }
-        let next = report.hourly.filter { $0.time > now.addingTimeInterval(-1800) && $0.time <= now.addingTimeInterval(12 * 3600) }
-        guard !next.isEmpty else { return nil }
-        if report.current.condition.isPrecipitation {
-            if let dry = next.first(where: { !$0.condition.isPrecipitation && ($0.precipitationProbability ?? 0) < 30 && $0.time > now }) {
-                return "\(report.current.condition.description) easing around \(hourLabel(dry.time))"
-            }
-            return "\(report.current.condition.description) for the next several hours"
-        }
-        if let wet = next.first(where: { $0.time > now && ($0.precipitationProbability ?? 0) >= 40 }) {
-            let kind = wet.condition.isPrecipitation ? wet.condition.description : "Rain"
-            return "\(kind) likely around \(hourLabel(wet.time)) · \(Int((wet.precipitationProbability ?? 0).rounded()))%"
-        }
-        let peak = next.compactMap(\.precipitationProbability).max() ?? 0
-        return peak >= 20 ? "Small chance of rain (\(Int(peak.rounded()))%) in the next 12 hours"
-                          : "No rain expected in the next 12 hours"
+        RainTiming.text(report, now: now, hourLabel: hourLabel)
     }
 
     /// Radar-header "Forecast" line: the exact same string as the menu bar. Never derived from HRRR tiles.
@@ -47,5 +31,42 @@ public enum MenuSummary {
         case ..<20: return "Sticky"
         default: return "Muggy"
         }
+    }
+
+    /// "Feels like 72°" only when it differs from the air temperature by at least 3° in the units shown,
+    /// compared before rounding (67.4 vs 67.6 °F printed "67°" and "Feels like 68°"). nil otherwise.
+    public static let feelsLikeMinDifference = 3.0
+    public static func feelsLikeText(temperature: Double, apparent: Double, units: DisplayUnits) -> String? {
+        abs(units.temperatureDelta(apparent - temperature)) >= feelsLikeMinDifference
+            ? "Feels like \(units.temperatureString(apparent))" : nil
+    }
+
+    /// The wind tile's gust: the highest gust in the next 24 hours, labelled as such (it read as now).
+    public static func gustCaption(_ peakGust: String) -> String { "24-h peak gust \(peakGust)" }
+
+    /// The dropdown's amber row: SPC's Day-1 outlook at level 2 (Slight) or higher, still in force.
+    /// "Severe storms possible tonight · level 2 of 5".
+    public static let severeRowMinLevel = 2
+    public static func severeRow(_ report: WeatherReport, now: Date) -> String? {
+        guard let o = report.severeOutlooks
+                .filter({ $0.day == 1 && $0.validUntil > now && ($0.risk.level ?? 0) >= severeRowMinLevel })
+                .max(by: { $0.risk < $1.risk }),
+              let level = o.risk.level else { return nil }
+        return "Severe storms possible \(o.when(now: now, timeZone: report.timeZone)) · level \(level) of 5"
+    }
+
+    /// How old another city's row is, shown once it's stale ("45 min", "2 h"); nil while fresh.
+    public static func rowAge(_ report: WeatherReport, now: Date, staleAfter: TimeInterval) -> String? {
+        let age = report.dataAge(at: now)
+        guard age >= staleAfter else { return nil }
+        return age < 3600 ? "\(Int(age / 60)) min" : (age < 86400 ? "\(Int(age / 3600)) h" : "\(Int(age / 86400)) d")
+    }
+
+    /// Opening the dropdown refreshes (bypassing the 10-minute guard and the HTTP cache) when it's raining
+    /// or rain is due within 2 hours and the data is at least `rainingRefreshAge` old: the nowcast changes fast.
+    public static let rainingRefreshAge: TimeInterval = 5 * 60
+    public static func refreshOnOpen(_ report: WeatherReport, now: Date) -> Bool {
+        let raining = report.current.condition.isPrecipitation || Briefing.rainDueSoon(report, now: now)
+        return raining && report.dataAge(at: now) >= rainingRefreshAge
     }
 }

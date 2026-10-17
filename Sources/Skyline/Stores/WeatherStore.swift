@@ -481,6 +481,26 @@ final class WeatherStore {
         }
     }
 
+    private var lastDropdownOpen: Date?
+
+    /// The dropdown (or hotkey panel) opened. While it's raining or rain is due and the data is a few
+    /// minutes old, refetch now (forced: past the 10-minute guard and the HTTP cache), otherwise the
+    /// usual guarded load. Other cities' rows that went stale are brought up to date too (at most 5).
+    func dropdownOpened() async {
+        let now = Date()
+        if let last = lastDropdownOpen, now.timeIntervalSince(last) < 2 { return } // `.task` + became-key on one open
+        lastDropdownOpen = now
+        guard let location = menuBarLocation else { return }
+        if let report = reports[location.id], MenuSummary.refreshOnOpen(report, now: now), !isLoading(location) {
+            await load(location, force: true)
+        } else {
+            await load(location)
+        }
+        let stale = allLocations.filter { $0.id != location.id }.prefix(5)
+            .filter { reports[$0.id].map { $0.dataAge(at: now) >= staleDataAge } ?? true }
+        if !stale.isEmpty { await refresh(locations: Array(stale), force: false) }
+    }
+
     func refreshAll(force: Bool) async {
         locationProvider.refresh()
         await refresh(locations: allLocations, force: force)

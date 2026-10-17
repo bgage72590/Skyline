@@ -240,6 +240,9 @@ public actor WeatherService {
             current.apparentTemperature += blended.temperature - current.temperature
             current.temperature = blended.temperature
         }
+        // The header's "Rain" agrees with the 15-minute nowcast (dropdown review S3).
+        current.weatherCode = Nowcast.reconcileCurrent(code: current.weatherCode, minutely: minutely, now: now(),
+                                                       temperature: current.temperature)
 
         // "Why the forecast changed": compare with the outlook from ~12 h ago, then save this one.
         var earlier: ForecastSnapshot?

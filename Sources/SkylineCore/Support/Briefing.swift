@@ -6,11 +6,15 @@ public enum Briefing {
     /// - Parameters:
     ///   - hourLabel: formats a time as e.g. "4 PM" in the report's time zone.
     ///   - delta: converts a °C difference to display units (°F or °C), already rounded.
+    ///   - includeRain: false where the rain card already shows the `RainTiming` line (the dropdown), so
+    ///     the same sentence isn't printed twice. The sky-change sentence still shows when there's no rain.
+    ///   - includeSevere: false where the severe risk has its own row (the dropdown's amber row).
     public static func headline(_ report: WeatherReport, now: Date = Date(),
-                                hourLabel: (Date) -> String, delta: (Double) -> Int) -> String {
+                                hourLabel: (Date) -> String, delta: (Double) -> Int,
+                                includeRain: Bool = true, includeSevere: Bool = true) -> String {
         var parts: [String] = []
-        if let nowcast = report.nowcastSummary(at: now) {
-            parts.append(nowcast + ".")
+        if let rain = RainTiming.next(report, now: now), rain.isRain {
+            if includeRain { parts.append(RainTiming.sentence(rain, hourLabel: hourLabel) + ".") }
         } else {
             parts.append(nextChange(report, now: now, hourLabel: hourLabel))
         }
@@ -19,45 +23,36 @@ public enum Briefing {
             let shown = delta(abs(d))
             if shown >= 3 { parts.append("Tomorrow is \(shown)° \(d > 0 ? "warmer" : "cooler").") }
         }
-        if let outlook = report.severeOutlooks.first(where: { $0.day == 1 && $0.isSevere && $0.validUntil > now }) {
+        if includeSevere, let outlook = activeSevere(report, now: now) {
             parts.append(outlook.sentence(now: now, timeZone: report.timeZone) + ".")
         }
         return parts.joined(separator: " ")
     }
 
-    /// "Rain likely from 4 PM (70%)." / "Clearing by 3 PM." / "Cloudy for the next 12 hours."
-    /// An hourly value at T covers the hour *ending* at T, so times are labelled by the hour's start
-    /// ("from 3 PM" for the 3–4 PM hour), the same as the confidence card (QA batch 4). The first hour is the
-    /// one under way, never one that already ended.
+    static func activeSevere(_ report: WeatherReport, now: Date) -> SevereOutlook? {
+        report.severeOutlooks.first(where: { $0.day == 1 && $0.isSevere && $0.validUntil > now })
+    }
+
+    /// The sky-change sentence for when no rain is expected: "Cloudy now, clear by 3 PM." /
+    /// "Cloudy for the next 12 hours." Rain wording comes from `RainTiming`. Hours are named by their END
+    /// time, like the hourly row (Brian, Oct 17); the first hour is the one under way, never one that ended.
     static func nextChange(_ report: WeatherReport, now: Date, hourLabel: (Date) -> String) -> String {
         let hours = Array(report.hourly.filter { $0.time > now }.prefix(12))
-        func start(_ h: HourlyForecast) -> Date { h.time.addingTimeInterval(-3600) }
-        func label(_ h: HourlyForecast) -> String { hourLabel(max(start(h), now)) }
         guard let first = hours.first else { return report.current.condition.description + "." }
-        let wetNow = report.current.condition.isPrecipitation
-        if wetNow {
-            if let dry = hours.first(where: { !$0.condition.isPrecipitation && ($0.precipitationProbability ?? 0) < 40 }) {
-                return "\(report.current.condition.description) ending around \(label(dry))."
-            }
-            return "\(report.current.condition.description) for the next 12 hours."
-        }
-        if let wet = hours.first(where: { ($0.precipitationProbability ?? 0) >= 50 && $0.condition.isPrecipitation }) {
-            let kind = wet.condition.category == .snow ? "Snow" : (wet.condition.category == .thunderstorm ? "Storms" : "Rain")
-            let pct = Int((wet.precipitationProbability ?? 0).rounded())
-            if start(wet) <= now { return "\(kind) likely now (\(pct)%)." }
-            return "\(kind) likely from \(label(wet)) (\(pct)%)."
-        }
         let category = first.condition.category
         if let change = hours.first(where: { $0.condition.category != category }) {
-            return "\(first.condition.description) now, \(change.condition.description.lowercased()) by \(label(change))."
+            return "\(first.condition.description) now, \(change.condition.description.lowercased()) by \(hourLabel(change.time))."
         }
         return "\(first.condition.description) for the next 12 hours."
     }
 
-    /// True when the 15-minute nowcast shows any precipitation in the next two hours.
+    /// True when the next-2-hours chart has something to draw: the quarters AHEAD of now are wet (the one
+    /// under way, or rain the nowcast says starts). A quarter that already ended, or a single light blip,
+    /// no longer shows an empty-looking chart (dropdown review: "Rain easing" over a flat axis).
     public static func rainDueSoon(_ report: WeatherReport, now: Date = Date()) -> Bool {
-        report.minutely.contains { $0.time >= now.addingTimeInterval(-15 * 60) && $0.time <= now.addingTimeInterval(2 * 3600)
-                                   && $0.precipitation >= Nowcast.threshold }
+        let ahead = Nowcast.quarters(report.minutely, now: now).filter { $0.time <= now.addingTimeInterval(2 * 3600 + 900) }
+        guard let first = ahead.first else { return false }
+        return Nowcast.isWet(first) || Nowcast.rainStart(report.minutely, now: now).map { $0 < now.addingTimeInterval(2 * 3600) } == true
     }
 
     /// Time and value of the highest value in the next `hours` hours of a series.

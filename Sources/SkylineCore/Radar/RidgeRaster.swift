@@ -1,4 +1,6 @@
+#if canImport(Compression)
 import Compression
+#endif
 import Foundation
 
 /// Item 4: smooth local radar. IEM's single-site N0B tiles are drawn from a 1000×1000 lat/lon raster at
@@ -226,6 +228,9 @@ public enum PalettePNG {
     /// Raw-deflate stream inflate that fails if the output would exceed `exactly` bytes (zip bombs) or
     /// ends short. Memory stays at `exactly` + a 64 KB window.
     public static func inflate(_ input: ArraySlice<UInt8>, exactly expected: Int) -> [UInt8]? {
+        #if !canImport(Compression)
+        return nil // no Compression framework (Linux CI/box): rasters fall back to IEM tiles
+        #else
         guard expected > 0 else { return nil }
         var out = [UInt8](repeating: 0, count: expected)
         let src = Array(input)
@@ -266,6 +271,7 @@ public enum PalettePNG {
         }
         guard ok, !overflow, produced == expected else { return nil }
         return out
+        #endif
     }
 }
 

@@ -67,6 +67,8 @@ struct MenuBarLabel: View {
 
 struct MenuBarContentView: View {
     @Environment(WeatherStore.self) private var store
+    /// The other-cities list starts collapsed (Brian, Oct 17: keep it, but collapsed).
+    @AppStorage("menuCitiesExpanded") private var citiesExpanded = false
 
     var body: some View {
         let report = store.menuBarReport
@@ -96,12 +98,26 @@ struct MenuBarContentView: View {
                     .buttonStyle(.plain)
                     .help("Read the full alert")
                 }
-                Text(Briefing.headline(report, now: Date(),
-                                       hourLabel: { Fmt.hour($0, report.timeZone) },
-                                       delta: { Int(store.units.temperatureDelta($0).rounded()) }))
-                    .font(.callout)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                // SPC level 2+ gets its own amber row instead of a sentence at the end of the headline.
+                if let severe = MenuSummary.severeRow(report, now: Date()) {
+                    Label(severe, systemImage: "exclamationmark.triangle.fill")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(Self.amber)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .help("Storm Prediction Center outlook for this place")
+                }
+                // The rain sentence lives in the rain card (one shared RainTiming line), so the headline
+                // keeps only the rest ("Tomorrow is 13° cooler.").
+                let headline = Briefing.headline(report, now: Date(),
+                                                 hourLabel: { Fmt.hour($0, report.timeZone) },
+                                                 delta: { Int(store.units.temperatureDelta($0).rounded()) },
+                                                 includeRain: false, includeSevere: false)
+                if !headline.isEmpty {
+                    Text(headline)
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
                 if let change = InsightFormat.changes(report, units: store.units).first {
                     // "Tomorrow's high is down 5° since this morning" (T11).
                     Label(change, systemImage: change.contains(" up ") ? "arrow.up.right" : "arrow.down.right")
@@ -196,11 +212,12 @@ struct MenuBarContentView: View {
         .foregroundStyle(.white)
         .dropdownSurface(report: report)
         .environment(\.colorScheme, .dark)
-        .background(DropdownWindowConfigurator(cornerRadius: DropdownShape.radius))
-        .task {
-            if let location = store.menuBarLocation { await store.load(location) }
-        }
+        .background(DropdownWindowConfigurator(cornerRadius: DropdownShape.radius,
+                                                onBecomeKey: { Task { await store.dropdownOpened() } }))
+        .task { await store.dropdownOpened() }
     }
+
+    static let amber = Color(red: 1.0, green: 0.76, blue: 0.24)
 
     /// Tallest the scrolling middle section may get: the screen's usable height minus the header,
     /// alert, briefing and footer.
@@ -234,6 +251,7 @@ struct MenuBarContentView: View {
                     .symbolRenderingMode(.multicolor)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            // Only when the quarters ahead are wet (a quarter that already ended drew an empty axis).
             if soon { MiniNowcast(report: report).frame(height: 46) }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -267,8 +285,11 @@ struct MenuBarContentView: View {
                     Text(report.location.name).font(.caption).opacity(0.85).lineLimit(1)
                 }
                 Text(report.current.condition.description).font(.callout.weight(.medium))
-                Text("Feels like \(store.units.temperatureString(report.current.apparentTemperature))")
-                    .font(.callout).opacity(0.9)
+                // Only when it's at least 3° off (67° "feels like 68°" was noise).
+                if let feels = MenuSummary.feelsLikeText(temperature: report.current.temperature,
+                                                          apparent: report.current.apparentTemperature, units: store.units) {
+                    Text(feels).font(.callout).opacity(0.9)
+                }
                 if let today = report.today {
                     Text("H:\(store.units.temperatureString(today.high))  L:\(store.units.temperatureString(today.low))")
                         .font(.callout.weight(.medium)).monospacedDigit()
@@ -294,10 +315,12 @@ struct MenuBarContentView: View {
                     WeatherSymbol(condition: hour.condition, isDay: hour.isDay, size: 18)
                         .frame(height: 20)
                     Text(store.units.temperatureString(hour.temperature)).font(.callout.weight(.semibold)).monospacedDigit()
-                    let p = Int((hour.precipitationProbability ?? 0).rounded())
-                    Text(p >= 20 ? "\(p)%" : " ").font(.caption2.weight(.semibold))
-                        .foregroundStyle(Color(red: 0.55, green: 0.80, blue: 1.0))
-                        .accessibilityHidden(p < 20)
+                    // Columns are named by the hour's END time (Brian, Oct 17), like the rain line.
+                    // A rain icon always shows its % (one cutoff, `HourlyDisplay`).
+                    let pop = HourlyDisplay.popText(hour)
+                    Text(pop ?? " ").font(.caption2.weight(.semibold))
+                        .foregroundStyle(Self.popBlue)
+                        .accessibilityHidden(pop == nil)
                 }
                 .frame(maxWidth: .infinity)
             }
@@ -305,6 +328,8 @@ struct MenuBarContentView: View {
         .padding(.vertical, 2)
         .menuGlass()
     }
+
+    static let popBlue = Color(red: 0.55, green: 0.80, blue: 1.0)
 
     /// Wind, humidity, UV, air quality, sunrise/sunset and pressure in a 3 × 2 grid of small tiles.
     private func conditionsGrid(_ report: WeatherReport) -> some View {
@@ -314,8 +339,9 @@ struct MenuBarContentView: View {
         let gust = Briefing.peak(report.hourly.compactMap { h in h.windGust.map { (h.time, $0) } }, from: c.time, hours: 24)
         var tiles: [(String, String, String, String)] = []  // symbol, title, value, caption
         tiles.append(("wind", "Wind", store.units.speedString(c.windSpeed),
-                      c.windDirection.map { "from \(Compass.abbreviation($0))" + (gust.map { " · gusts \(store.units.speedString($0.value))" } ?? "") }
-                        ?? (gust.map { "gusts \(store.units.speedString($0.value))" } ?? "")))
+                      // The gust is the highest in the next 24 h, and says so (it read as the current gust).
+                      c.windDirection.map { "from \(Compass.abbreviation($0))" + (gust.map { " · " + MenuSummary.gustCaption(store.units.speedString($0.value)) } ?? "") }
+                        ?? (gust.map { MenuSummary.gustCaption(store.units.speedString($0.value)) } ?? "")))
         tiles.append(("humidity.fill", "Humidity", "\(Int(c.humidity.rounded()))%",
                       MenuSummary.comfort(dewPointC: c.dewPoint).map { "\($0) · dew \(store.units.temperatureString(c.dewPoint))" } ?? ""))
         if let uv = c.uvIndex {
@@ -352,36 +378,70 @@ struct MenuBarContentView: View {
         }
     }
 
-    /// The other saved locations: one tap opens them in the main window.
+    /// The other saved locations, collapsed by default; one tap opens a city in the main window. A row
+    /// whose data is stale is dimmed and says how old it is (they refresh on open when stale).
     @ViewBuilder
     private func otherLocations(_ report: WeatherReport) -> some View {
         let others = store.allLocations.filter { $0.id != report.location.id }.prefix(5)
         if !others.isEmpty {
             VStack(spacing: 2) {
-                ForEach(Array(others)) { location in
-                    let r = store.reports[location.id]
-                    Button {
-                        store.selectedID = location.id
-                        AppExit.showMainWindow(); GlobalHotkey.closePanel()
-                        NSApp.activate()
-                    } label: {
-                        HStack(spacing: 8) {
-                            Text(location.isCurrentLocation ? "My Location" : location.name).lineLimit(1)
-                            Spacer()
-                            if let r { WeatherSymbol(condition: r.current.condition, isDay: r.current.isDay, size: 13) }
-                            Text(store.units.temperatureString(r?.current.temperature)).monospacedDigit()
-                                .frame(width: 38, alignment: .trailing)
-                        }
-                        .font(.callout)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .contentShape(Rectangle())
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { citiesExpanded.toggle() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text("Other cities").font(.callout.weight(.medium))
+                        Text("\(others.count)").font(.caption.weight(.semibold)).opacity(0.7)
+                        Spacer()
+                        Image(systemName: "chevron.right").font(.caption.weight(.bold)).opacity(0.8)
+                            .rotationEffect(.degrees(citiesExpanded ? 90 : 0))
                     }
-                    .buttonStyle(.plain)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(citiesExpanded ? "Hide other cities" : "Show other cities")
+                if citiesExpanded {
+                    TimelineView(.periodic(from: .now, by: 60)) { context in
+                        VStack(spacing: 2) {
+                            ForEach(Array(others)) { location in
+                                cityRow(location, now: context.date)
+                            }
+                        }
+                    }
                 }
             }
             .menuGlass(padding: 4)
         }
+    }
+
+    private func cityRow(_ location: WeatherLocation, now: Date) -> some View {
+        let r = store.reports[location.id]
+        let age = r.flatMap { MenuSummary.rowAge($0, now: now, staleAfter: store.staleDataAge) }
+        return Button {
+            store.selectedID = location.id
+            AppExit.showMainWindow(); GlobalHotkey.closePanel()
+            NSApp.activate()
+        } label: {
+            HStack(spacing: 8) {
+                Text(location.isCurrentLocation ? "My Location" : location.name).lineLimit(1)
+                Spacer()
+                if let age {
+                    Label(age, systemImage: "clock").labelStyle(.titleAndIcon)
+                        .font(.caption2.weight(.medium)).foregroundStyle(.orange)
+                        .help("Data from \(r.map { Fmt.dataTime($0.dataAsOf) } ?? "")")
+                }
+                if let r { WeatherSymbol(condition: r.current.condition, isDay: r.current.isDay, size: 13) }
+                Text(store.units.temperatureString(r?.current.temperature)).monospacedDigit()
+                    .frame(width: 38, alignment: .trailing)
+            }
+            .font(.callout)
+            .opacity(age == nil ? 1 : 0.6)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private func daily(_ report: WeatherReport) -> some View {
@@ -395,6 +455,10 @@ struct MenuBarContentView: View {
                         .frame(width: 46, alignment: .leading)
                     WeatherSymbol(condition: day.condition, isDay: true, size: 14)
                         .frame(width: 22)
+                    // Rain chance on the day's row, same rule as the hourly row.
+                    Text(HourlyDisplay.popText(day) ?? "").font(.caption2.weight(.semibold))
+                        .foregroundStyle(Self.popBlue)
+                        .frame(width: 30, alignment: .leading)
                     Text(store.units.temperatureString(day.low)).opacity(0.8).frame(width: 34, alignment: .trailing)
                     TemperatureRangeBar(rangeLow: low, rangeHigh: high, low: day.low, high: day.high)
                     Text(store.units.temperatureString(day.high)).frame(width: 34, alignment: .trailing)
@@ -439,7 +503,7 @@ struct MiniNowcast: View {
             }
             .font(.caption2.weight(.medium)).opacity(0.9)
         }
-        .accessibilityLabel(report.nowcastSummary(at: Date()) ?? "Rain in the next two hours")
+        .accessibilityLabel(MenuSummary.rainTiming(report, now: Date(), hourLabel: { Fmt.hour($0, report.timeZone) }) ?? "Rain chart")
     }
 }
 
