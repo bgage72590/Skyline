@@ -308,6 +308,8 @@ public struct WeatherReport: Codable, Hashable, Sendable {
     public var dataAsOf: Date
     /// True when the network failed and the forecast came from Skyline's offline cache.
     public var isOfflineFallback: Bool
+    /// When the primary (Open-Meteo) forecast was downloaded; nil in reports saved by older builds.
+    public var forecastAsOf: Date?
     /// NWS forecast office (e.g. "OKX") when the location is in NWS coverage; used for Forecaster's notes.
     public var nwsGridID: String?
     /// The forecast Skyline showed for this place about 12 h earlier (for "why the forecast changed", T11).

@@ -283,6 +283,7 @@ public actor WeatherService {
                              nwsOffice: nws.map { [$0.point.city, $0.point.state].compactMap { $0 }.joined(separator: ", ") },
                              dataAsOf: dataAsOf, isOfflineFallback: omEntry.isFallback)
         report.nwsGridID = nws?.point.gridID
+        report.forecastAsOf = omEntry.storedAt
         report.earlierOutlook = earlier
         report.severeOutlooks = outlooks
         report.modelSeries = ForecastBlender.modelSeries(openMeteo: om, nwsHourly: nws?.hourly ?? [], blended: hourly,

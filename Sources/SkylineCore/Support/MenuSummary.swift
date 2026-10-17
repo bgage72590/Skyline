@@ -65,8 +65,20 @@ public enum MenuSummary {
     /// Opening the dropdown refreshes (bypassing the 10-minute guard and the HTTP cache) when it's raining
     /// or rain is due within 2 hours and the data is at least `rainingRefreshAge` old: the nowcast changes fast.
     public static let rainingRefreshAge: TimeInterval = 5 * 60
-    public static func refreshOnOpen(_ report: WeatherReport, now: Date) -> Bool {
+    /// At most one forced refresh-on-open per this long, whether the last one worked or failed (CR #11
+    /// M1: a source that keeps failing must not turn every open into a full refetch).
+    public static let forcedOpenCooldown: TimeInterval = 3 * 60
+
+    /// - Parameter lastForcedAttempt: when the last forced refresh-on-open for this place started.
+    public static func refreshOnOpen(_ report: WeatherReport, now: Date, lastForcedAttempt: Date? = nil) -> Bool {
+        if let last = lastForcedAttempt, now.timeIntervalSince(last) < forcedOpenCooldown { return false }
         let raining = report.current.condition.isPrecipitation || Briefing.rainDueSoon(report, now: now)
-        return raining && report.dataAge(at: now) >= rainingRefreshAge
+        return raining && primaryForecastAge(report, now: now) >= rainingRefreshAge
+    }
+
+    /// Age of the Open-Meteo forecast (the primary source), not the oldest input: an NWS copy kept from
+    /// cache after a failure would otherwise make the report look old forever (CR #11 M1).
+    public static func primaryForecastAge(_ report: WeatherReport, now: Date) -> TimeInterval {
+        max(0, now.timeIntervalSince(report.forecastAsOf ?? report.dataAsOf))
     }
 }

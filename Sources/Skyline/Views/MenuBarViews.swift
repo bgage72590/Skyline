@@ -481,7 +481,7 @@ struct MiniNowcast: View {
             GeometryReader { geo in
                 let w = geo.size.width, h = geo.size.height
                 let pts = samples.enumerated().map { i, s in
-                    CGPoint(x: w * CGFloat(i) / CGFloat(max(samples.count - 1, 1)), y: h - h * CGFloat(NowcastCurve.level(s.rate) / 3))
+                    CGPoint(x: w * CGFloat(i) / CGFloat(max(samples.count - 1, 1)), y: h - h * CGFloat(NowcastCurve.miniLevel(s.rate) / 3))
                 }
                 ZStack {
                     ForEach([1.0, 2.0], id: \.self) { l in

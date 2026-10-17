@@ -482,6 +482,8 @@ final class WeatherStore {
     }
 
     private var lastDropdownOpen: Date?
+    /// When each place's last forced refresh-on-open started (success or failure): the 3-min cooldown.
+    private var lastForcedOpen: [String: Date] = [:]
 
     /// The dropdown (or hotkey panel) opened. While it's raining or rain is due and the data is a few
     /// minutes old, refetch now (forced: past the 10-minute guard and the HTTP cache), otherwise the
@@ -491,13 +493,15 @@ final class WeatherStore {
         if let last = lastDropdownOpen, now.timeIntervalSince(last) < 2 { return } // `.task` + became-key on one open
         lastDropdownOpen = now
         guard let location = menuBarLocation else { return }
-        if let report = reports[location.id], MenuSummary.refreshOnOpen(report, now: now), !isLoading(location) {
+        if let report = reports[location.id], !isLoading(location),
+           MenuSummary.refreshOnOpen(report, now: now, lastForcedAttempt: lastForcedOpen[location.id]) {
+            lastForcedOpen[location.id] = now // set before the fetch: a failure counts too
             await load(location, force: true)
         } else {
             await load(location)
         }
         let stale = allLocations.filter { $0.id != location.id }.prefix(5)
-            .filter { reports[$0.id].map { $0.dataAge(at: now) >= staleDataAge } ?? true }
+            .filter { reports[$0.id].map { MenuSummary.primaryForecastAge($0, now: now) >= staleDataAge } ?? true }
         if !stale.isEmpty { await refresh(locations: Array(stale), force: false) }
     }
 

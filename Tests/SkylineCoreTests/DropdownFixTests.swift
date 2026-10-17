@@ -194,6 +194,50 @@ final class DropdownFixTests: XCTestCase {
         XCTAssertFalse(MenuSummary.refreshOnOpen(dry, now: now), "not raining: the normal guard applies")
     }
 
+    /// CR #11 M1: one forced refresh-on-open per 3 minutes, success or failure.
+    func testRefreshOnOpenHasACooldown() {
+        var r = screenshot(minutely: [0, 0.4, 0.4, 0, 0, 0, 0, 0, 0, 0, 0])
+        r.dataAsOf = now.addingTimeInterval(-20 * 60)
+        r.forecastAsOf = r.dataAsOf
+        XCTAssertTrue(MenuSummary.refreshOnOpen(r, now: now, lastForcedAttempt: nil))
+        XCTAssertFalse(MenuSummary.refreshOnOpen(r, now: now, lastForcedAttempt: now.addingTimeInterval(-10)),
+                       "the forced refresh just failed: the next open doesn't force again")
+        XCTAssertFalse(MenuSummary.refreshOnOpen(r, now: now,
+                                                 lastForcedAttempt: now.addingTimeInterval(-MenuSummary.forcedOpenCooldown + 1)))
+        XCTAssertTrue(MenuSummary.refreshOnOpen(r, now: now,
+                                                lastForcedAttempt: now.addingTimeInterval(-MenuSummary.forcedOpenCooldown)))
+    }
+
+    /// CR #11 M1: an NWS copy kept from cache (oldest input) doesn't make every open force a refetch;
+    /// the Open-Meteo forecast's own age decides.
+    func testRefreshOnOpenUsesThePrimaryForecastAge() {
+        var r = screenshot(minutely: [0, 0.4, 0.4, 0, 0, 0, 0, 0, 0, 0, 0])
+        r.dataAsOf = now.addingTimeInterval(-3 * 3600)   // NWS forecast failing, served from cache
+        r.forecastAsOf = now.addingTimeInterval(-60)      // Open-Meteo fetched a minute ago
+        XCTAssertEqual(MenuSummary.primaryForecastAge(r, now: now), 60, accuracy: 1)
+        XCTAssertFalse(MenuSummary.refreshOnOpen(r, now: now))
+        r.forecastAsOf = nil // a report saved by an older build: falls back to the oldest input
+        XCTAssertTrue(MenuSummary.refreshOnOpen(r, now: now))
+    }
+
+    func testServiceRecordsThePrimaryForecastTime() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_791_725_400))
+        let s = WeatherService(client: MockHTTPClient(), cache: ResponseCache(directory: nil, now: { clock.now }),
+                               now: { clock.now })
+        let r = try await s.report(for: WeatherLocation(name: "New York", region: "NY", country: "United States",
+                                                         coordinate: Coordinate(latitude: 40.71, longitude: -74.01)))
+        XCTAssertEqual(r.forecastAsOf, clock.now)
+    }
+
+    func testLightRainDrawsTallerInTheDropdownChart() {
+        XCTAssertEqual(NowcastCurve.miniLevel(0.4), NowcastCurve.miniLightFloor, accuracy: 1e-9)
+        XCTAssertGreaterThan(NowcastCurve.miniLevel(0.4), NowcastCurve.level(0.4))
+        XCTAssertEqual(NowcastCurve.miniLevel(0.2), NowcastCurve.level(0.2), "below a wet quarter: unchanged")
+        XCTAssertEqual(NowcastCurve.miniLevel(0), 0)
+        XCTAssertEqual(NowcastCurve.miniLevel(5), NowcastCurve.level(5), "moderate and heavy unchanged")
+        XCTAssertGreaterThanOrEqual(NowcastCurve.miniLevel(2.4), NowcastCurve.miniLevel(0.4))
+    }
+
     func testOtherCityAge() {
         var r = screenshot()
         r.dataAsOf = now.addingTimeInterval(-10 * 60)
