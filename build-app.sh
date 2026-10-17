@@ -57,6 +57,12 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 # .framework bundle would need an allowlist under Contents/Frameworks/ in that script.
 cp "$ROOT/scripts/install-verified.sh" "$APP/Contents/Resources/install-verified.sh"
 chmod +x "$APP/Contents/Resources/install-verified.sh"
+# VERSION.txt inside the app too (QA, build 94: /Applications/Skyline.app had none), so the installed
+# copy says which build and commit it is. Written before signing, so the signature covers it.
+COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+DIRTY="$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null | grep -q . && echo ' (uncommitted changes)' || true)"
+printf 'Skyline build %s\ncommit %s%s\nbuilt %s\n' "$GIT_REV" "$COMMIT" "$DIRTY" "$(date '+%Y-%m-%d %H:%M %Z')" \
+  > "$APP/Contents/Resources/VERSION.txt"
 
 # Widget extension (T22): Contents/PlugIns/SkylineWidget.appex, a sandboxed WidgetKit extension that
 # only reads the forecast snapshot the app writes (no network).
