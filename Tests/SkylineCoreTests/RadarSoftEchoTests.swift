@@ -119,7 +119,7 @@ struct RadarSoftEchoTests {
 #if canImport(CoreGraphics)
         // image() is the one premultiply. Read those bytes; drawing the image again is a second composite.
         let img = try #require(RadarQC.image(rgba: px))
-        let stored = try #require(img.dataProvider.flatMap(CGDataProviderCopyData)) as Data
+        let stored = try #require(img.dataProvider?.data as Data?)
         func unpremul(_ px: Int, _ py: Int) -> (Int, Int, Int, Int) {
             let i = (py * 256 + px) * 4
             let a = Int(stored[i + 3])
