@@ -37,9 +37,9 @@ enum MemoryTest {
         case "radar":
             store.radarExpanded = true
             await sleep(6)
-            await zoom(to: d.object(forKey: "SkylineMemZoom") as? Int ?? 10, radar: radar)
+            await zoom(to: { let v = d.integer(forKey: "SkylineMemZoom"); return v > 0 ? v : 10 }(), radar: radar)
             radar.setPlaying(true)
-            let seconds = d.object(forKey: "SkylineMemSeconds") as? Double ?? 150
+            let seconds = { let v = d.double(forKey: "SkylineMemSeconds"); return v > 0 ? v : 150 }()
             var samples: [Int] = []
             let t0 = Date()
             while Date().timeIntervalSince(t0) < seconds {
@@ -52,7 +52,7 @@ enum MemoryTest {
             let steady = samples.suffix(max(1, samples.count * 2 / 3))
             log("RESULT radar steady min=\(steady.min()!) max=\(steady.max()!) avg=\(steady.reduce(0, +) / steady.count) peak=\(samples.max()!) z=\(radar.debugRadarZoom?() ?? -1)")
         default:
-            let n = d.object(forKey: "SkylineMemCycles") as? Int ?? 20
+            let n = { let v = d.integer(forKey: "SkylineMemCycles"); return v > 0 ? v : 20 }()
             let cities = store.allLocations
             var perCycle: [Int] = []
             for i in 1...n {
@@ -74,14 +74,14 @@ enum MemoryTest {
                 }
                 await sleep(1)
                 perCycle.append(mb())
-                log("cycle \(i) mem=\(perCycle.last!) maps=\(RadarMapContainer.live) liveTiles=\(RadarLayerView.liveTiles)")
+                log("cycle \(i) mem=\(perCycle.last!) maps=\(RadarMapContainer.live) engines=\(RadarMapContainer.liveMaps) liveTiles=\(RadarLayerView.liveTiles)")
             }
             store.selectedID = savedSelection
             await sleep(30)
             let open = mb()
             closeMainWindow()
             await sleep(45)
-            log("RESULT cycles first=\(perCycle.first!) last=\(perCycle.last!) max=\(perCycle.max()!) settledOpen=\(open) settledClosed=\(mb()) maps=\(RadarMapContainer.live)")
+            log("RESULT cycles first=\(perCycle.first!) last=\(perCycle.last!) max=\(perCycle.max()!) settledOpen=\(open) settledClosed=\(mb()) maps=\(RadarMapContainer.live) engines=\(RadarMapContainer.liveMaps)")
         }
         radar.setPlaying(false)
         store.radarExpanded = false

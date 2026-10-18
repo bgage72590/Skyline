@@ -116,6 +116,9 @@ final class RadarImageCache {
         urlCache.memoryCapacity = 0
         urlCache.memoryCapacity = 4 << 20
         pruneFailures()
+        // Scan rasters (~1 MB each, up to 40) and QC masks are only needed to cut new tiles.
+        let rasters = rasterStore.store, masks = maskStore
+        Task { await rasters.purge(); await masks.purge() }
     }
 
     private func pruneFailures() {

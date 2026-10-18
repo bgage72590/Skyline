@@ -381,6 +381,9 @@ final class RadarPlayback {
                 try? await Task.sleep(for: atLatest ? self.holdOnLatestInterval
                                        : (atNow ? self.holdOnNowInterval : self.frameInterval))
                 if Task.isCancelled || !self.clock.owns(token) { return }
+                // Once per loop: expanding frames and MapKit's redraws churn the small malloc zone,
+                // leaving ~100 MB of freed-but-dirty pages; hand them back (off the main thread).
+                if atLatest { MemoryRelief.soon(after: 0.5) }
                 if atLatest, let loadedAt = self.loadedAt, Date().timeIntervalSince(loadedAt) > Self.indexMaxAge {
                     // New scans: the map keeps showing the old frames until the new ones are prefetched.
                     await self.loadFrames(force: true)

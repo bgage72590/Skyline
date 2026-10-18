@@ -111,6 +111,13 @@ public actor RadarQCMaskStore {
     public private(set) var fetches = 0
 
     /// ~64 KB per entry: 96 dilated masks + 160 raw tiles ≈ 16 MB at most.
+    /// Window closed: drop the cached masks and raw alpha tiles (re-fetched on demand).
+    public func purge() {
+        masks = [:]; maskOrder = []
+        raw = [:]; rawOrder = []
+    }
+    public var cachedCount: Int { masks.count + raw.count }
+
     public init(maxMasks: Int = 96, maxRaw: Int = 160, fetchAlpha: @escaping Fetch) {
         self.fetchAlpha = fetchAlpha; self.maxMasks = maxMasks; self.maxRaw = maxRaw
     }

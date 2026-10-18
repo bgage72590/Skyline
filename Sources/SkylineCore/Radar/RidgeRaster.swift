@@ -338,6 +338,12 @@ public actor RidgeRasterStore {
         evict()
     }
     public func restore() { limit = normalLimit }
+    /// Window closed: drop every decoded scan (each ~1 MB). Back-off state and the cap are kept; the
+    /// next radar shown re-fetches its scans (from the URL disk cache when they are still current).
+    public func purge() {
+        cache = [:]
+        order = []
+    }
     public var count: Int { cache.count }
 
     private func touch(_ base: String) {

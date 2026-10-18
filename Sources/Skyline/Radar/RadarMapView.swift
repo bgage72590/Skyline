@@ -110,10 +110,7 @@ struct RadarMapView: NSViewRepresentable {
         container.radar.disconnect()
         // Menu-bar only after ⌘Q / close: hand MapKit everything back so its engine (vector tiles,
         // Metal buffers) can go. Without this a closed window's MKMapView stayed alive (F).
-        container.map.removeOverlays(container.map.overlays)
-        container.map.removeAnnotations(container.map.annotations)
-        container.radar.removeFromSuperview()
-        container.map.removeFromSuperview()
+        container.teardown()
     }
 
     @MainActor
@@ -207,7 +204,16 @@ enum RadarZoomLimits {
 final class RadarMapContainer: NSView {
     /// Live instance / tile-layer counts, for the stress test's memory log (main thread only).
     nonisolated(unsafe) static var live = 0
-    let map = MKMapView()
+    /// Live MKMapViews owned by containers (each is a whole VectorKit engine, ~100 MB once drawn).
+    nonisolated(unsafe) static var liveMaps = 0
+    /// The map, until `teardown`. AppKit can keep a dismantled container alive (its key-view loop
+    /// table, SwiftUI's platform-view host), and before build 104 that kept the whole MapKit engine
+    /// alive too: one more per window close/reopen (the ~1 GB climb). A torn-down container drops its
+    /// map; late async callers get a detached placeholder that is never put in a window.
+    private var ownedMap: MKMapView?
+    var map: MKMapView { ownedMap ?? Self.detachedMap }
+    private static let detachedMap = MKMapView(frame: .zero)
+    private(set) var isTornDown = false
     let radar = RadarLayerView()
     let rangeRings = RangeRingsOverlay()
     let stormOverlay = StormMotionOverlay()
@@ -216,8 +222,10 @@ final class RadarMapContainer: NSView {
     var pinCoordinate: CLLocationCoordinate2D?
 
     init(interactive: Bool) {
+        ownedMap = MKMapView()
         super.init(frame: .zero)
         Self.live += 1
+        Self.liveMaps += 1
         // Dark base map at full emphasis (not muted): brighter roads and higher-contrast town labels read
         // through the ~60 % source-over radar layer (R1), RadarScope/MyRadar style.
         map.appearance = NSAppearance(named: .darkAqua)
@@ -258,7 +266,29 @@ final class RadarMapContainer: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    deinit { Self.live -= 1 }
+    deinit {
+        Self.live -= 1
+        if ownedMap != nil { Self.liveMaps -= 1 }
+    }
+
+    /// The SwiftUI view went away (window closed, radar hidden): give everything heavy back now rather
+    /// than when (if) AppKit lets the container go. Idempotent.
+    func teardown() {
+        guard !isTornDown, let map = ownedMap else { return }
+        isTornDown = true
+        map.delegate = nil
+        radar.releaseAll()
+        alertOverlay.detachClickRecognizer(from: map)
+        map.removeOverlays(map.overlays)
+        map.removeAnnotations(map.annotations)
+        // Break key-view links: AppKit's previous-key-view table holds views strongly.
+        for view in [self, map, radar, rangeRings, stormOverlay, alertOverlay, pin] as [NSView] { view.nextKeyView = nil }
+        superview?.nextKeyView = nil
+        radar.removeFromSuperview()
+        map.removeFromSuperview()
+        ownedMap = nil
+        Self.liveMaps -= 1
+    }
 
     private(set) var overscan: CGFloat = 0
     /// Moves MapKit's own chrome (legal label) out of the clipped margins. Deferred to the next main-queue
@@ -375,6 +405,12 @@ final class AlertOverlayView: NSView {
 
     /// Install a click recognizer on the map so a tap inside a polygon opens the alert without
     /// swallowing click-drag pans (NSClickGestureRecognizer fails when the pointer moves).
+    func detachClickRecognizer(from mapView: MKMapView) {
+        if let clickRecognizer { mapView.removeGestureRecognizer(clickRecognizer) }
+        clickRecognizer = nil
+        onSelect = nil
+    }
+
     func attachClickRecognizer(to mapView: MKMapView) {
         guard clickRecognizer == nil else { return }
         let g = NSClickGestureRecognizer(target: self, action: #selector(handleClick(_:)))
@@ -948,6 +984,22 @@ final class RadarLayerView: NSView {
         cancelFade()
     }
 
+    /// Teardown (the container is going away): drop every held frame, prepared image and copy now.
+    func releaseAll() {
+        disconnect()
+        for group in fadeLayers { group.removeFromSuperlayer() }
+        fadeLayers = []
+        incoming = nil
+        dropAhead()
+        aheadInFlight = [:]
+        active = nil
+        pending = nil
+        shownFrame = nil
+        states.forEach { $0.clear() }
+        renderers = [nil]
+        map = nil
+    }
+
     private var lastIndex: Int { max(0, ((pending ?? active)?.frames.count ?? 1) - 1) }
 
     /// Called by RadarPlayback when its frame index changes (timer or scrubber) — never during layout.
@@ -1323,7 +1375,7 @@ final class RadarLayerView: NSView {
         tiles.compactMapValues { $0.image() }
     }
 
-    /// Expands the next two frames in the background, so a switch only swaps images.
+    /// Expands the next frame in the background, so a switch only swaps images.
     private func expandAhead() {
         guard let g = active, g.frames.count > 1, let shown = shownFrame else { return }
         for step in 1...min(aheadLimit, g.frames.count - 1) {
@@ -1350,16 +1402,17 @@ final class RadarLayerView: NSView {
                 self.ahead[token] = images
                 self.aheadOrder.removeAll { $0 == token }
                 self.aheadOrder.append(token)
-                // Two prepared frames at most (each ~12-25 MB expanded).
+                // One prepared frame at most (~12-25 MB expanded).
                 while self.aheadOrder.count > self.aheadLimit { self.ahead[self.aheadOrder.removeFirst()] = nil }
                 callbacks.forEach { $0() }
             }
         }
     }
 
-    /// Frames prepared ahead: 2, or 1 on large windows (full screen on a 1440p/4K display), where each
-    /// prepared frame with its ring is 40-80 MB. Memory only: the prepared frame is still ready in time.
-    private var aheadLimit: Int { bounds.width * bounds.height > 2_000_000 ? 1 : 2 }
+    /// Frames prepared ahead (off screen, expanded RGBA): one. A frame expands in well under a frame
+    /// interval in the background, so the next frame is always ready; a second one only held another
+    /// 12-25 MB (40-80 MB full screen). Every frame is still shown at full resolution.
+    private var aheadLimit: Int { 1 }
 
     private func dropAhead() { ahead = [:]; aheadOrder = [] }
 
