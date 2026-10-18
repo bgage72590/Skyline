@@ -271,6 +271,20 @@ struct RidgeRasterTests {
         #expect(await store.count == 2)
     }
 
+    // Memory: closing the window purges every scan; the cap is unchanged and the next radar re-fetches.
+    @Test func rasterStorePurgeDropsEverythingAndKeepsTheCap() async throws {
+        let png = try Self.fixture("OKX_N0B_202610161748", "png"), wld = try Self.fixture("OKX_N0B_202610161748", "wld")
+        let store = RidgeRasterStore(limit: 3) { url in url.pathExtension == "png" ? png : wld }
+        for k in 1...3 { _ = await store.raster(base: "https://a/\(k)") }
+        #expect(await store.count == 3)
+        await store.purge()
+        #expect(await store.count == 0)
+        #expect(await store.raster(base: "https://a/1") != nil)
+        #expect(await store.fetches == 4) // re-fetched after the purge
+        for k in 2...5 { _ = await store.raster(base: "https://a/\(k)") }
+        #expect(await store.count == 3) // same cap as before
+    }
+
     // CR #7.5: decodes run concurrently, off the actor (two slow fetches overlap).
     @Test func decodesRunConcurrently() async throws {
         let png = try Self.fixture("OKX_N0B_202610161748", "png"), wld = try Self.fixture("OKX_N0B_202610161748", "wld")
