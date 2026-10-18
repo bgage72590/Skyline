@@ -5,6 +5,63 @@ import ImageIO
 import Network
 import SkylineCore
 
+/// The radar tile session and its disk-backed cache. Closing the window drops the in-memory cache
+/// and the session (connection pool, HTTP message bookkeeping) and opens a new session on the same
+/// disk cache, so a reopen is still a disk hit.
+final class RadarSessionBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var session: URLSession
+    let cache: URLCache
+    private var sharedMemory: Int?
+
+    init() {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("com.briangage.Skyline/radar-tiles", isDirectory: true)
+        cache = URLCache(memoryCapacity: 4 << 20, diskCapacity: 300 << 20, directory: dir)
+        session = Self.make(cache: cache)
+    }
+
+    func current() -> URLSession {
+        lock.lock()
+        defer { lock.unlock() }
+        return session
+    }
+
+    /// RAM cache to zero, shared URLCache included. Disk entries stay. The old session finishes
+    /// what it already started, then goes away.
+    func suspend() {
+        lock.lock()
+        cache.memoryCapacity = 0
+        if sharedMemory == nil { sharedMemory = URLCache.shared.memoryCapacity }
+        let old = session
+        session = Self.make(cache: cache)
+        lock.unlock()
+        URLCache.shared.memoryCapacity = 0
+        old.finishTasksAndInvalidate()
+    }
+
+    func resume() {
+        lock.lock()
+        cache.memoryCapacity = 4 << 20
+        let memory = sharedMemory
+        lock.unlock()
+        if let memory { URLCache.shared.memoryCapacity = memory }
+    }
+
+    private static func make(cache: URLCache) -> URLSession {
+        let config = URLSessionConfiguration.default
+        config.urlCache = cache
+        config.requestCachePolicy = .useProtocolCachePolicy
+        config.httpMaximumConnectionsPerHost = 8
+        config.timeoutIntervalForRequest = 15
+        config.httpAdditionalHeaders = ["User-Agent": URLSessionHTTPClient.genericUserAgent]
+        config.httpCookieAcceptPolicy = .never
+        config.httpShouldSetCookies = false
+        config.httpCookieStorage = nil
+        return URLSession(configuration: config)
+    }
+}
+
 /// Decoded radar tiles shared by every radar map. Downloads go through a disk-backed URLCache
 /// (tile servers send `max-age`), decoding happens off the main thread, and concurrent requests
 /// for the same tile are coalesced.
@@ -12,9 +69,14 @@ import SkylineCore
 final class RadarImageCache {
     static let shared = RadarImageCache()
 
-    private let session: URLSession
-    private let urlCache: URLCache
+    private let sessionBox = RadarSessionBox()
+    private var urlCache: URLCache { sessionBox.cache }
     private let images = NSCache<NSString, RadarTile>()
+    /// Last loop's tiles as PNG bytes. Survives `closeForMenuBar` (the decoded cache does not).
+    private var retainedTiles = EncodedTileCache()
+    /// Bumped on close so a download that finishes afterwards does not refill the decoded cache.
+    private var loadEpoch = 0
+    private var cachesSuspended = false
     private struct Waiter {
         /// Still needed? (false once the requesting map/zoom/frame set is gone) — checked before starting.
         let wanted: () -> Bool
@@ -32,6 +94,7 @@ final class RadarImageCache {
     /// Posted (main queue) when failed tiles should be requested again: wake, network back, back-off over.
     static let retryNotification = Notification.Name("SkylineRadarRetryTiles")
     private var retryScheduled = false
+    private var retryGeneration = 0
     private let pathMonitor = NWPathMonitor()
     private var lastPathSatisfied = true
     private var wakeObserver: NSObjectProtocol?
@@ -58,25 +121,10 @@ final class RadarImageCache {
     nonisolated let rasterStore: RadarRasterStoreBox
 
     private init() {
-        let config = URLSessionConfiguration.default
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("com.briangage.Skyline/radar-tiles", isDirectory: true)
-        // Encoded PNGs: the disk cache does the real work; RAM only for the last few bursts (L8 / E1).
-        urlCache = URLCache(memoryCapacity: 4 << 20, diskCapacity: 300 << 20, directory: dir)
-        config.urlCache = urlCache
-        config.requestCachePolicy = .useProtocolCachePolicy
-        config.httpMaximumConnectionsPerHost = 8
-        config.timeoutIntervalForRequest = 15
-        // Tile hosts (IEM, RainViewer) get the plain User-Agent; only api.weather.gov gets the contact.
-        config.httpAdditionalHeaders = ["User-Agent": URLSessionHTTPClient.genericUserAgent]
-        config.httpCookieAcceptPolicy = .never
-        config.httpShouldSetCookies = false
-        config.httpCookieStorage = nil
-        session = URLSession(configuration: config)
         provisionalImages.totalCostLimit = 8 << 20
-        let s = session
-        maskStore = RadarQCMaskStore { url in await Self.fetchMaskAlpha(session: s, url: url) }
-        rasterStore = RadarRasterStoreBox(RidgeRasterStore { url in await Self.fetchData(session: s, url: url) })
+        let box = sessionBox
+        maskStore = RadarQCMaskStore { url in await Self.fetchMaskAlpha(session: box.current(), url: url) }
+        rasterStore = RadarRasterStoreBox(RidgeRasterStore { url in await Self.fetchData(session: box.current(), url: url) })
         // Decoded RGBA bytes; live tiles are held by the radar view anyway, so this bridges tiles pruned
         // after a pan and re-requested on pan-back without a network trip (24 MB ≈ 96 tiles; restored
         // from 8 MB in build 35, radar-pan-diagnosis fix 3). `-SkylineDecodedCacheMB N` is a measurement hook.
@@ -109,16 +157,51 @@ final class RadarImageCache {
         NotificationCenter.default.post(name: Self.retryNotification, object: nil)
     }
 
-    /// Window closed: drop decoded tiles nobody is drawing and the encoded-response RAM cache.
-    func trim() {
+    /// Window closed. Drops decoded tiles, in-memory URL caches, and the radar session's request
+    /// bookkeeping. Keeps the on-disk tile cache, compressed scan bytes, RLE masks, and the last
+    /// loop's PNG tiles.
+    func closeForMenuBar() {
+        cachesSuspended = true
+        loadEpoch += 1
+        retryGeneration += 1
+        retryScheduled = false
         images.removeAllObjects()
-        // Shrinking the RAM capacity evicts the in-memory copies; the disk cache is untouched.
-        urlCache.memoryCapacity = 0
-        urlCache.memoryCapacity = 4 << 20
-        pruneFailures()
-        // Scan rasters (~1 MB each, up to 40) and QC masks are only needed to cut new tiles.
+        provisionalImages.removeAllObjects()
+        provisional.removeAll()
+        queue.removeAll()
+        inFlight = 0
+        let dropped = waiters
+        waiters.removeAll()
+        for callbacks in dropped.values { callbacks.forEach { $0.cancelled() } }
+        transient.removeAll()
+        failures.removeAll()
+        gaveUp.removeAll()
+        sessionBox.suspend()
         let rasters = rasterStore.store, masks = maskStore
         Task { await rasters.purge(); await masks.purge() }
+    }
+
+    /// Window opened. Restores the RAM caches, drops a stale 5–10 s back-off, and starts re-decoding
+    /// the shown loop before the radar card asks.
+    func reopen(frames: [RadarFrame], shownIndex: Int) {
+        cachesSuspended = false
+        sessionBox.resume()
+        retryFailedNow()
+        rasterStore.store.invalidateBackoff()
+        var bases: [String] = []
+        if frames.indices.contains(shownIndex), let base = RadarQC.rasterBase(in: frames[shownIndex].urlTemplate) {
+            bases.append(base)
+        }
+        for (i, frame) in frames.enumerated() where i != shownIndex {
+            if let base = RadarQC.rasterBase(in: frame.urlTemplate) { bases.append(base) }
+        }
+        let shownMask = frames.indices.contains(shownIndex) ? RadarQC.qcTemplate(in: frames[shownIndex].urlTemplate) : nil
+        let rasters = rasterStore.store, masks = maskStore
+        Task {
+            await rasters.clearBackoff()
+            await rasters.prewarmRetained(preferring: bases)
+            await masks.prewarm(template: shownMask)
+        }
     }
 
     private func pruneFailures() {
@@ -144,9 +227,11 @@ final class RadarImageCache {
         // Offline: no point waking every minute; `networkChanged` retries when the path is back.
         guard !retryScheduled, lastPathSatisfied else { return }
         retryScheduled = true
+        let generation = retryGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.5) { [weak self] in
             MainActor.assumeIsolated {
                 guard let self else { return }
+                guard generation == self.retryGeneration else { self.retryScheduled = false; return }
                 self.retryScheduled = false
                 NotificationCenter.default.post(name: Self.retryNotification, object: nil)
             }
@@ -177,20 +262,33 @@ final class RadarImageCache {
         // CR #7.5: scan rasters (~1 MB each) shrink too; the shown loop re-fetches what it needs.
         let rasters = rasterStore.store
         Task { await rasters.trim(keep: critical ? 2 : 12) }
-        urlCache.memoryCapacity = 0
-        urlCache.memoryCapacity = 1 << 20
+        if !cachesSuspended {
+            urlCache.memoryCapacity = 0
+            urlCache.memoryCapacity = 1 << 20
+        }
         restoreTask?.cancel()
         restoreTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(120))
             guard !Task.isCancelled, let self else { return }
+            guard !self.cachesSuspended else { return }
             self.images.totalCostLimit = Self.normalCacheBytes
             self.urlCache.memoryCapacity = 4 << 20
             await self.rasterStore.store.restore()
         }
     }
 
+    /// Keeps this tile's PNG in the closed-window set and marks it most recently shown.
+    func rememberEncoded(_ url: URL, _ data: Data) {
+        retainedTiles.store(url.absoluteString, data: data)
+    }
+
     func image(for url: URL) -> RadarTile? {
-        images.object(forKey: url.absoluteString as NSString)
+        let key = url.absoluteString
+        if let hit = images.object(forKey: key as NSString) { return hit }
+        guard let png = retainedTiles.touch(key) else { return nil }
+        let tile = RadarTile(encoded: png, width: 256, height: 256)
+        images.setObject(tile, forKey: key as NSString, cost: png.count)
+        return tile
     }
 
     /// True if this tile failed recently (404/blank, or a transient failure still inside its back-off);
@@ -207,7 +305,7 @@ final class RadarImageCache {
     func load(_ url: URL, wanted: @escaping () -> Bool = { true },
               cancelled: @escaping () -> Void = {}, completion: @escaping (RadarTile?) -> Void) {
         let key = url.absoluteString
-        if let hit = images.object(forKey: key as NSString) { return completion(hit) }
+        if let hit = image(for: url) { return completion(hit) }
         let waiter = Waiter(wanted: wanted, completion: completion, cancelled: cancelled)
         if waiters[key] != nil {
             waiters[key]?.append(waiter)
@@ -246,9 +344,12 @@ final class RadarImageCache {
 
     private func start(_ url: URL) {
         let key = url.absoluteString
-        let session = self.session
+        let box = sessionBox
+        let epoch = loadEpoch
         Task {
-            let outcome = await Self.fetchDecoded(session: session, url: url, masks: maskStore, rasters: rasterStore.store)
+            let outcome = await Self.fetchDecoded(session: box.current(), url: url, masks: maskStore, rasters: rasterStore.store)
+            // A download that outlived the close must not occupy a slot the reopened window needs.
+            guard epoch == loadEpoch else { return }
             inFlight -= 1
             defer { pump() }
             var image: RadarTile?
@@ -256,6 +357,7 @@ final class RadarImageCache {
             case .image(let decoded):
                 image = decoded
                 images.setObject(decoded, forKey: key as NSString, cost: decoded.heldBytes)
+                if let bytes = decoded.encodedBytes { retainedTiles.store(key, data: bytes) }
                 failures[key] = nil
                 transient[key] = nil
                 provisional.remove(key)
@@ -268,7 +370,9 @@ final class RadarImageCache {
                 let attempts = (transient[key]?.attempts ?? 0) + 1
                 transient[key] = (Date(), attempts)
                 if RadarProvisionalRetry.shouldRetry(attempts: attempts) {
-                    scheduleRetryTick(after: Self.backoff(attempts: attempts))
+                    let delay = Self.backoff(attempts: attempts)
+                    RadarRetryLog.backoff(path: "provisional", seconds: delay)
+                    scheduleRetryTick(after: delay)
                 } else {
                     gaveUp.insert(key)
                 }
@@ -278,7 +382,9 @@ final class RadarImageCache {
                 // Not a hole: the tile exists, the network/server hiccupped. Ask again after a back-off.
                 let attempts = (transient[key]?.attempts ?? 0) + 1
                 transient[key] = (Date(), attempts)
-                scheduleRetryTick(after: Self.backoff(attempts: attempts))
+                let delay = Self.backoff(attempts: attempts)
+                RadarRetryLog.backoff(path: "transient", seconds: delay)
+                scheduleRetryTick(after: delay)
             }
             if failures.count + transient.count > 2_000 { pruneFailures() }
             let callbacks = waiters.removeValue(forKey: key) ?? []
