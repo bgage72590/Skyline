@@ -101,7 +101,7 @@ struct LocationDetailView: View {
     // MARK: Wide
 
     private func wideLayout(_ report: WeatherReport) -> some View {
-        let pin = store.units.temperatureString(report.current.temperature)
+        let pin = store.units.temperatureString(report.current.temperature, withUnit: true)
         let showColumn = !store.radarExpanded
         // Forecast column next to the sidebar, the large radar on the far right.
         // The forecast column is ALWAYS in the view tree (same identity), so opening/closing a module
@@ -158,7 +158,7 @@ struct LocationDetailView: View {
             .overlay {
                 ZStack {
                     if store.radarExpanded {
-                        ExpandedRadarView(location: location, pinText: store.units.temperatureString(report.current.temperature),
+                        ExpandedRadarView(location: location, pinText: store.units.temperatureString(report.current.temperature, withUnit: true),
                                           alerts: report.activeAlerts(), namespace: radarNamespace)
                             .padding(14)
                             .transition(.opacity.combined(with: .scale(scale: 0.96)))
@@ -241,7 +241,7 @@ struct ForecastColumn: View {
                     ModelComparisonCard(report: report, units: units)
                         .id("forecast-models")
                     if showsRadarCard {
-                        RadarCard(location: location, pinText: units.temperatureString(report.current.temperature),
+                        RadarCard(location: location, pinText: units.temperatureString(report.current.temperature, withUnit: true),
                                   alerts: report.activeAlerts(), namespace: radarNamespace)
                     }
                     if let office = report.nwsGridID {
@@ -341,15 +341,15 @@ struct HeroView: View {
                 Text(report.location.name)
                     .font(.system(size: 34, weight: .regular))
             }
-            Text(units.temperatureString(report.current.temperature))
+            Text(units.temperatureString(report.current.temperature, withUnit: true))
                 // Smaller in the wide layout's column, so the forecast starts higher (T18).
                 .font(.system(size: isWide ? 84 : 102, weight: .thin))
-                .padding(.leading, 28) // optically centre despite the trailing degree sign
+                .padding(.leading, 48) // optically centre past the trailing "°F" / "°C"
             Text(report.current.condition.description)
                 .font(.title3.weight(.medium))
                 .opacity(0.9)
             if let today = report.today {
-                Text("H:\(units.temperatureString(today.high))  L:\(units.temperatureString(today.low))")
+                Text("H:\(units.temperatureString(today.high, withUnit: true))  L:\(units.temperatureString(today.low, withUnit: true))")
                     .font(.title3.weight(.medium))
             }
             if let outlook = report.severeOutlooks.min(by: { $0.day < $1.day }) {
@@ -395,7 +395,7 @@ struct HourlyCard: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 2) {
                         ForEach(items) { item in
-                            cell(item).frame(width: 54)
+                            cell(item).frame(width: 64)
                         }
                     }
                     .padding(.vertical, 2)
@@ -419,8 +419,10 @@ struct HourlyCard: View {
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(Color(red: 0.55, green: 0.82, blue: 1.0))
                 }
-                Text(units.temperatureString(isNow ? report.current.temperature : hour.temperature))
+                Text(units.temperatureString(isNow ? report.current.temperature : hour.temperature, withUnit: true))
                     .font(.title3.weight(.medium))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
             }
         case .sun(let time, let sunrise):
             VStack(spacing: 8) {
@@ -519,13 +521,15 @@ struct DailyCard: View {
                 }
             }
             .frame(width: 34)
-            Text(units.temperatureString(day.low))
+            Text(units.temperatureString(day.low, withUnit: true))
                 .opacity(0.75)
-                .frame(width: 40, alignment: .trailing)
+                .lineLimit(1).minimumScaleFactor(0.7)
+                .frame(width: 58, alignment: .trailing)
             TemperatureRangeBar(rangeLow: rangeLow, rangeHigh: rangeHigh, low: day.low, high: day.high,
                                 current: offset == 0 ? report.current.temperature : nil)
-            Text(units.temperatureString(day.high))
-                .frame(width: 40, alignment: .trailing)
+            Text(units.temperatureString(day.high, withUnit: true))
+                .lineLimit(1).minimumScaleFactor(0.7)
+                .frame(width: 58, alignment: .trailing)
         }
         .font(.title3.weight(.medium))
         .monospacedDigit() // low/high columns line up (L16)

@@ -169,10 +169,13 @@ struct ModuleDetailView: View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             switch module {
             case .conditions, .feelsLike:
-                Text(units.temperatureString(isToday ? (module == .conditions ? report.current.temperature : report.current.apparentTemperature) : d.high))
+                Text(units.temperatureString(isToday ? (module == .conditions ? report.current.temperature : report.current.apparentTemperature) : d.high, withUnit: true))
                     .font(.system(size: 40, weight: .medium))
+                    .lineLimit(1).minimumScaleFactor(0.7)
                 WeatherSymbol(condition: d.condition, isDay: true, size: 26)
-                Text("H:\(units.temperatureString(d.high))  L:\(units.temperatureString(d.low))").font(.title3).opacity(0.85)
+                Text("H:\(units.temperatureString(d.high, withUnit: true))  L:\(units.temperatureString(d.low, withUnit: true))")
+                    .font(.title3).opacity(0.85)
+                    .lineLimit(1).minimumScaleFactor(0.7)
             case .uv:
                 Text("\(Int((d.uvIndexMax ?? 0).rounded()))").font(.system(size: 40, weight: .medium))
                 Text(UVScale.category(d.uvIndexMax)).font(.title3).opacity(0.85)
@@ -379,7 +382,7 @@ struct ModuleDetailView: View {
         }
         func cell(_ value: String, _ weight: String) -> some View {
             VStack(alignment: .trailing, spacing: 1) {
-                Text(value)
+                Text(value).lineLimit(1).minimumScaleFactor(0.75)
                 Text(weight).font(.caption.monospacedDigit()).opacity(0.65)
             }
             .frame(width: 92, alignment: .trailing)
@@ -405,8 +408,8 @@ struct ModuleDetailView: View {
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    cell(units.temperatureString(s.high), share(s.weight, s.high, highTotal, s.highShare))
-                    cell(units.temperatureString(s.low), share(s.weight, s.low, lowTotal, s.lowShare))
+                    cell(units.temperatureString(s.high, withUnit: true), share(s.weight, s.high, highTotal, s.highShare))
+                    cell(units.temperatureString(s.low, withUnit: true), share(s.weight, s.low, lowTotal, s.lowShare))
                 }
                 .font(.callout.monospacedDigit())
                 .padding(.vertical, 7)
@@ -414,8 +417,10 @@ struct ModuleDetailView: View {
             Divider().overlay(Color.white.opacity(0.2))
             HStack {
                 Text("Skyline blend").font(.callout.weight(.semibold)).frame(maxWidth: .infinity, alignment: .leading)
-                Text(units.temperatureString(d.high)).frame(width: 92, alignment: .trailing)
-                Text(units.temperatureString(d.low)).frame(width: 92, alignment: .trailing)
+                Text(units.temperatureString(d.high, withUnit: true)).lineLimit(1).minimumScaleFactor(0.75)
+                    .frame(width: 92, alignment: .trailing)
+                Text(units.temperatureString(d.low, withUnit: true)).lineLimit(1).minimumScaleFactor(0.75)
+                    .frame(width: 92, alignment: .trailing)
             }
             .font(.callout.weight(.semibold).monospacedDigit())
             .padding(.vertical, 7)
@@ -432,7 +437,7 @@ struct ModuleDetailView: View {
     private func summary(_ d: DailyForecast) -> String {
         switch module {
         case .conditions:
-            return d.summary ?? "\(d.condition.description). High \(units.temperatureString(d.high)), low \(units.temperatureString(d.low))."
+            return d.summary ?? "\(d.condition.description). High \(units.temperatureString(d.high, withUnit: true)), low \(units.temperatureString(d.low, withUnit: true))."
         case .uv:
             return "UV index peaks at \(Int((d.uvIndexMax ?? 0).rounded())) (\(UVScale.category(d.uvIndexMax))). Use sun protection when it is 3 or higher."
         case .wind:

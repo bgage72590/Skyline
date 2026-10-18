@@ -15,7 +15,7 @@ struct BriefingBar: View {
                                      delta: { Int(units.temperatureDelta($0).rounded()) })
         HStack(alignment: .center, spacing: 10) {
             WeatherSymbol(condition: report.current.condition, isDay: report.current.isDay, size: 18)
-            Text(units.temperatureString(report.current.temperature))
+            Text(units.temperatureString(report.current.temperature, withUnit: true))
                 .font(.title3.weight(.semibold)).monospacedDigit()
             Text(text)
                 .font(.callout.weight(.medium))

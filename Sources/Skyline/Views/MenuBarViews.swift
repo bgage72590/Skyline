@@ -4,8 +4,8 @@ import SkylineCore
 
 /// Status item: icon + temperature. Re-renders only when the report changes.
 /// Drawn as a template image (the menu bar tints it like any other item) so the layout can be fixed:
-/// the digits are tabular and the temperature always reserves the width of "88°", so 9° → 10° or a
-/// different digit doesn't nudge the neighbouring menu-bar icons (L11). When the data is stale or
+/// the digits are tabular and the temperature always reserves the width of "88°F" or "88°C", so
+/// 9°F → 10°F or a different digit doesn't nudge the neighbouring menu-bar icons (L11). When the data is stale or
 /// offline the image is drawn at reduced strength.
 struct MenuBarLabel: View {
     let store: WeatherStore
@@ -47,7 +47,9 @@ struct MenuBarLabel: View {
         let content = HStack(spacing: 4) {
             Image(systemName: spec.symbol)
             ZStack(alignment: .leading) {
-                Text("88°").hidden() // reserve two digits' width
+                // Two digits plus the unit letter actually in use, so the extra character isn't clipped
+                // and a digit change still doesn't move the icons beside this item.
+                Text(Self.reservedWidth(spec.text)).hidden()
                 Text(spec.text)
             }
             .monospacedDigit()
@@ -62,6 +64,13 @@ struct MenuBarLabel: View {
         guard let image = renderer.nsImage else { return nil }
         image.isTemplate = true
         return image
+    }
+
+    /// Width stand-in for a two-digit temperature in the same unit as `text` ("72°F" → "88°F").
+    static func reservedWidth(_ text: String) -> String {
+        if text.hasSuffix("C") { return "88°C" }
+        if text.hasSuffix("F") { return "88°F" }
+        return "88°"
     }
 }
 
@@ -287,20 +296,23 @@ struct MenuBarContentView: View {
                 Text(report.current.condition.description).font(.callout.weight(.medium))
                 // Only when it's at least 3° off (67° "feels like 68°" was noise).
                 if let feels = MenuSummary.feelsLikeText(temperature: report.current.temperature,
-                                                          apparent: report.current.apparentTemperature, units: store.units) {
+                                                          apparent: report.current.apparentTemperature, units: store.units,
+                                                          withUnit: true) {
                     Text(feels).font(.callout).opacity(0.9)
                 }
                 if let today = report.today {
-                    Text("H:\(store.units.temperatureString(today.high))  L:\(store.units.temperatureString(today.low))")
+                    Text("H:\(store.units.temperatureString(today.high, withUnit: true))  L:\(store.units.temperatureString(today.low, withUnit: true))")
                         .font(.callout.weight(.medium)).monospacedDigit()
+                        .lineLimit(1).minimumScaleFactor(0.8)
                 }
             }
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 0) {
                 WeatherSymbol(condition: report.current.condition, isDay: report.current.isDay, size: 34)
-                Text(store.units.temperatureString(report.current.temperature))
+                Text(store.units.temperatureString(report.current.temperature, withUnit: true))
                     .font(.system(size: 50, weight: .thin))
                     .monospacedDigit()
+                    .lineLimit(1).minimumScaleFactor(0.7)
             }
         }
         .padding(.horizontal, 2)
@@ -314,7 +326,9 @@ struct MenuBarContentView: View {
                     Text(Fmt.hour(hour.time, report.timeZone)).font(.caption2.weight(.semibold)).opacity(0.9)
                     WeatherSymbol(condition: hour.condition, isDay: hour.isDay, size: 18)
                         .frame(height: 20)
-                    Text(store.units.temperatureString(hour.temperature)).font(.callout.weight(.semibold)).monospacedDigit()
+                    Text(store.units.temperatureString(hour.temperature, withUnit: true))
+                        .font(.callout.weight(.semibold)).monospacedDigit()
+                        .lineLimit(1).minimumScaleFactor(0.75)
                     // Columns are named by the hour's END time (Brian, Oct 17), like the rain line.
                     // A rain icon always shows its % (one cutoff, `HourlyDisplay`).
                     let pop = HourlyDisplay.popText(hour)
@@ -434,8 +448,9 @@ struct MenuBarContentView: View {
                         .help("Data from \(r.map { Fmt.dataTime($0.dataAsOf) } ?? "")")
                 }
                 if let r { WeatherSymbol(condition: r.current.condition, isDay: r.current.isDay, size: 13) }
-                Text(store.units.temperatureString(r?.current.temperature)).monospacedDigit()
-                    .frame(width: 38, alignment: .trailing)
+                Text(store.units.temperatureString(r?.current.temperature, withUnit: true)).monospacedDigit()
+                    .lineLimit(1).minimumScaleFactor(0.75)
+                    .frame(width: 52, alignment: .trailing)
             }
             .font(.callout)
             .opacity(age == nil ? 1 : 0.6)
@@ -461,9 +476,13 @@ struct MenuBarContentView: View {
                     Text(HourlyDisplay.popText(day) ?? "").font(.caption2.weight(.semibold))
                         .foregroundStyle(Self.popBlue)
                         .frame(width: 30, alignment: .leading)
-                    Text(store.units.temperatureString(day.low)).opacity(0.8).frame(width: 34, alignment: .trailing)
+                    Text(store.units.temperatureString(day.low, withUnit: true)).opacity(0.8)
+                        .lineLimit(1).minimumScaleFactor(0.7)
+                        .frame(width: 50, alignment: .trailing)
                     TemperatureRangeBar(rangeLow: low, rangeHigh: high, low: day.low, high: day.high)
-                    Text(store.units.temperatureString(day.high)).frame(width: 34, alignment: .trailing)
+                    Text(store.units.temperatureString(day.high, withUnit: true))
+                        .lineLimit(1).minimumScaleFactor(0.7)
+                        .frame(width: 50, alignment: .trailing)
                 }
                 .font(.callout.weight(.medium))
                 .monospacedDigit()

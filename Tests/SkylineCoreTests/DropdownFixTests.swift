@@ -256,9 +256,11 @@ final class DropdownFixTests: XCTestCase {
         XCTAssertNil(MenuSummary.feelsLikeText(temperature: fToC(67.4), apparent: fToC(67.6), units: imperial), "67° vs 68° was noise")
         XCTAssertNil(MenuSummary.feelsLikeText(temperature: fToC(67), apparent: fToC(69.9), units: imperial))
         XCTAssertEqual(MenuSummary.feelsLikeText(temperature: fToC(67), apparent: fToC(72), units: imperial), "Feels like 72°")
+        XCTAssertEqual(MenuSummary.feelsLikeText(temperature: fToC(67), apparent: fToC(72), units: imperial, withUnit: true), "Feels like 72°F")
         XCTAssertEqual(MenuSummary.feelsLikeText(temperature: fToC(40), apparent: fToC(33), units: imperial), "Feels like 33°")
         let metric = DisplayUnits.metric
         XCTAssertNil(MenuSummary.feelsLikeText(temperature: 20, apparent: 22.9, units: metric))
         XCTAssertEqual(MenuSummary.feelsLikeText(temperature: 20, apparent: 23, units: metric), "Feels like 23°")
+        XCTAssertEqual(MenuSummary.feelsLikeText(temperature: 20, apparent: 23, units: metric, withUnit: true), "Feels like 23°C")
     }
 }

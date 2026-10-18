@@ -14,6 +14,11 @@ final class Batch3Tests: XCTestCase {
         XCTAssertEqual(DisplayUnits(preset: .system, locale: Locale(identifier: "de_DE")), .metric)
         // The preset shorthand still formats exactly as before.
         XCTAssertEqual(UnitPreference.imperial.temperatureString(0), "32°")
+        XCTAssertEqual(DisplayUnits.imperial.temperatureString(0, withUnit: true), "32°F")
+        XCTAssertEqual(DisplayUnits.metric.temperatureString(0, withUnit: true), "0°C")
+        XCTAssertEqual(DisplayUnits.imperial.temperatureString(nil, withUnit: true), "--")
+        // A per-dimension override wins: °C on an otherwise imperial preset.
+        XCTAssertEqual(DisplayUnits(preset: .imperial, temperature: .celsius).temperatureString(0, withUnit: true), "0°C")
         XCTAssertEqual(UnitPreference.imperial.pressureString(1013.25), "29.92 inHg")
         XCTAssertEqual(UnitPreference.metric.pressureString(1013.25), "1013 hPa")
     }

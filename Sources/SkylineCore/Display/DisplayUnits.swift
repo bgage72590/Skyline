@@ -74,10 +74,13 @@ public struct DisplayUnits: Codable, Hashable, Sendable {
         temperature == .fahrenheit ? celsius * 9 / 5 + 32 : celsius
     }
 
-    /// Rounded temperature with a degree sign, e.g. "62°".
-    public func temperatureString(_ celsius: Double?) -> String {
+    /// Rounded temperature with a degree sign, e.g. "62°". `withUnit` appends the unit letter with no
+    /// space, Apple Weather's "62°F" / "62°C".
+    public func temperatureString(_ celsius: Double?, withUnit: Bool = false) -> String {
         guard let celsius else { return "--" }
-        return "\(Int(temperature(celsius).rounded()))°"
+        let number = "\(Int(temperature(celsius).rounded()))°"
+        guard withUnit else { return number }
+        return number + (temperature == .fahrenheit ? "F" : "C")
     }
 
     /// Converts a temperature *difference*.

@@ -265,7 +265,7 @@ struct FeelsLikeTile: View {
             return c.humidity > 60 ? "Humidity is making it feel warmer." : "It feels warmer than the actual temperature."
         }()
         Tile(title: "Feels Like", systemImage: "thermometer.medium") {
-            TileValue(value: units.temperatureString(c.apparentTemperature), detail: detail)
+            TileValue(value: units.temperatureString(c.apparentTemperature, withUnit: true), detail: detail)
         }
     }
 }
