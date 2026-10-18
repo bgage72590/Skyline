@@ -105,9 +105,22 @@ extension RadarQC {
         return a.contains { $0 > 0 } ? a : []
     }
 
-    /// A 256² premultiplied RGBA buffer as a CGImage (sRGB).
+    /// A 256² straight RGBA buffer (palette RGB, independent alpha) as a premultiplied CGImage (sRGB).
+    /// Quartz only draws premultiplied alpha; the multiply happens here so the tile buffer itself keeps
+    /// the legend colour for each bin.
     public static func image(rgba px: [UInt8], size: Int = tileSize) -> CGImage? {
-        guard px.count == size * size * 4, let provider = CGDataProvider(data: Data(px) as CFData),
+        guard px.count == size * size * 4 else { return nil }
+        var premul = [UInt8](repeating: 0, count: px.count)
+        var i = 0
+        while i < px.count {
+            let a = Int(px[i + 3])
+            premul[i] = UInt8(Int(px[i]) * a / 255)
+            premul[i + 1] = UInt8(Int(px[i + 1]) * a / 255)
+            premul[i + 2] = UInt8(Int(px[i + 2]) * a / 255)
+            premul[i + 3] = px[i + 3]
+            i += 4
+        }
+        guard let provider = CGDataProvider(data: Data(premul) as CFData),
               let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
         return CGImage(width: size, height: size, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: size * 4, space: space,
                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),

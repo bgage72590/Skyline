@@ -2,28 +2,34 @@ import Foundation
 import Testing
 @testable import SkylineCore
 
-/// Light rain stays a soft wash: low dBZ fades, cores stay solid, and the QC mask feathers instead of
-/// cutting the field into mask-pixel squares.
+/// Light drizzle stays readable in the legend colour. Edges and the QC mask still feather; the bin
+/// itself does not fade to a wash.
 struct RadarSoftEchoTests {
-    @Test func alphaRampsWithReflectivityAndCoverage() {
-        // Index 80 ≈ 7.5 dBZ (light rain): translucent, and a multiple of 32.
-        let light = RidgeRaster.echoAlpha(level: 80, cover: 1)
-        #expect(light < 200 && light >= 32 && light % 32 == 0)
-        // Index 16 ≈ −24.5 dBZ, the faint edge of the fixture: still drawn, still soft.
-        let faint = RidgeRaster.echoAlpha(level: 16, cover: 1)
-        #expect(faint == 32)
-        // The ≥ ½ contour is feathered but never dropped, so the alpha>0 footprint is unchanged.
-        #expect(RidgeRaster.echoAlpha(level: 16, cover: 0.5) >= 32)
-        #expect(RidgeRaster.echoAlpha(level: 80, cover: 0.5) < light)
-        // 18 dBZ is index 101 (−32 + 0.5×100). Cores there and above are opaque.
-        #expect(RidgeRaster.echoAlpha(level: 101, cover: 1) == 255)
+    /// N0B index for a dBZ value. Index 1 is −32 dBZ; each step is +0.5 dBZ.
+    static func level(dbz: Double) -> Int { 1 + Int((dbz + 32) * 2) }
+
+    @Test func weakestBinIsVisibleAndMatchesTheLegendColor() {
+        // ≤ 0 dBZ is at least ~60% of an opaque core (160/255), not the old 32/255 wash.
+        #expect(RidgeRaster.echoAlphaFloor >= 153) // 153/255 = 60%
+        #expect(Double(RidgeRaster.echoAlphaFloor) / 255 >= 0.60)
+        let weakest = RidgeRaster.echoAlpha(level: 2, cover: 1) // −31.5 dBZ, first echo index
+        let atZero = RidgeRaster.echoAlpha(level: Self.level(dbz: 0), cover: 1)
+        #expect(weakest >= RidgeRaster.echoAlphaFloor && weakest == atZero)
+        #expect(weakest % 32 == 0)
+        // Ramp reaches opaque by 18 dBZ. 5/10/15 dBZ (legend stops) sit on that ramp and stay above the floor.
+        let a5 = RidgeRaster.echoAlpha(level: Self.level(dbz: 5), cover: 1)
+        let a10 = RidgeRaster.echoAlpha(level: Self.level(dbz: 10), cover: 1)
+        let a15 = RidgeRaster.echoAlpha(level: Self.level(dbz: 15), cover: 1)
+        #expect(a5 > RidgeRaster.echoAlphaFloor && a10 > a5 && a15 >= a10)
+        #expect(RidgeRaster.echoAlpha(level: Self.level(dbz: 18), cover: 1) == 255)
         #expect(RidgeRaster.echoAlpha(level: 140, cover: 1) == 255)
-        // A heavy core's edge still feathers.
+        // The contour still feathers (edge anti-alias) and is never dropped.
+        #expect(RidgeRaster.echoAlpha(level: 2, cover: 0.5) < weakest)
+        #expect(RidgeRaster.echoAlpha(level: 2, cover: 0.5) >= 32)
         #expect(RidgeRaster.echoAlpha(level: 140, cover: 0.5) < 255)
         #expect(RidgeRaster.echoAlpha(level: 0, cover: 1) == 0)
-    }
 
-    @Test func renderTileFadesLightEchoAndKeepsCoresSolid() {
+        // A painted bin uses the palette RGB exactly (the legend colour), not RGB scaled by alpha.
         let z = 4, x = 4, y = 6
         let n = pow(2.0, Double(z))
         let lon = (Double(x) + 128.5 / 256) / n * 360 - 180
@@ -34,10 +40,13 @@ struct RadarSoftEchoTests {
                         lon0: lon, lat0: lat, dLon: 1, dLat: -1)
         }
         let p = (128 * 256 + 128) * 4
-        let light = raster(80).renderTile(z: z, x: x, y: y)
-        let a = Int(RidgeRaster.echoAlpha(level: 80, cover: 1))
-        #expect(light[p + 3] == a && a < 255)
-        #expect(light[p] == UInt8(80 * a / 255) && light[p + 1] == UInt8(10 * a / 255) && light[p + 2] == UInt8(20 * a / 255))
+        let drizzle = raster(2).renderTile(z: z, x: x, y: y)
+        #expect(drizzle[p] == 2 && drizzle[p + 1] == 10 && drizzle[p + 2] == 20)
+        #expect(drizzle[p + 3] == weakest)
+        let light = raster(80).renderTile(z: z, x: x, y: y) // ~7.5 dBZ
+        #expect(light[p] == 80 && light[p + 1] == 10 && light[p + 2] == 20)
+        #expect(light[p + 3] == RidgeRaster.echoAlpha(level: 80, cover: 1))
+        #expect(light[p + 3] > weakest && light[p + 3] < 255)
         let core = raster(140).renderTile(z: z, x: x, y: y)
         #expect(core[p + 3] == 255 && core[p] == 140 && core[p + 1] == 10 && core[p + 2] == 20)
     }

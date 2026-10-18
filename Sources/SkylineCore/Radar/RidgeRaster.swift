@@ -93,26 +93,30 @@ public struct RidgeRaster: Sendable {
         return (UInt8(min(255, (sum / cover).rounded())), cover)
     }
 
-    /// Alpha for one drawn echo pixel. IEM's N0B index is dBZ = −32 + 0.5×(level−1). Below ~18 dBZ the
-    /// pixel fades (light rain is a wash, not an opaque square); cores at 18 dBZ and above stay solid so
-    /// the legend colour is unchanged. `cover` feathers the ≥ ½ contour. Drawn alphas are 255 or a
+    /// Interior alpha for echo at or below 0 dBZ: 160/255 ≈ 63% of an opaque core, so the weakest bin
+    /// still reads on the dark map. A multiple of 32, matching the quantized ramp.
+    public static let echoAlphaFloor: UInt8 = 160
+
+    /// Alpha for one drawn echo pixel. IEM's N0B index is dBZ = −32 + 0.5×(level−1). The bin itself
+    /// ramps from `echoAlphaFloor` at ≤ 0 dBZ to opaque at 18 dBZ. `cover` only feathers the ≥ ½
+    /// contour (the edge anti-alias); it does not dim the whole region. Drawn alphas are 255 or a
     /// multiple of 32, which keeps the PNG small (partial alpha cannot be palette-packed).
     public static func echoAlpha(level: Int, cover: Double) -> UInt8 {
         guard level >= 2 else { return 0 }
         let dbz = -32.0 + 0.5 * Double(level - 1)
         let byDbz: Double
         if dbz >= 18 { byDbz = 255 }
-        else if dbz <= 0 { byDbz = 32 }
-        else { byDbz = 32 + 223.0 * (dbz / 18) }
+        else if dbz <= 0 { byDbz = Double(echoAlphaFloor) }
+        else { byDbz = Double(echoAlphaFloor) + Double(255 - Int(echoAlphaFloor)) * (dbz / 18) }
         let feather = min(1, max(0, (cover - 0.5) / 0.5))
         let raw = byDbz * (0.5 + 0.5 * feather)
         if raw >= 240 { return 255 }
         let q = Int((raw / 32).rounded()) * 32
-        return UInt8(min(224, max(32, q)))
+        return UInt8(min(255, max(32, q)))
     }
 
-    /// Premultiplied RGBA for Web Mercator tile z/x/y, 256². Colours are the IEM palette; alpha follows
-    /// `echoAlpha` (CGImage is premultipliedLast, so RGB is scaled by that alpha).
+    /// Straight RGBA for Web Mercator tile z/x/y, 256². RGB is the IEM palette entry for that bin
+    /// (the legend colour), never scaled by alpha. Alpha follows `echoAlpha`.
     public func renderTile(z: Int, x: Int, y: Int, size: Int = 256) -> [UInt8] {
         var out = [UInt8](repeating: 0, count: size * size * 4)
         guard (0...22).contains(z) else { return out }
@@ -125,13 +129,10 @@ public struct RidgeRaster: Sendable {
             if fr < -1 || fr > Double(height) { continue }
             for px in 0..<size {
                 guard let s = sampleEcho(lon: lons[px], lat: lat), Int(s.level) < palette.count else { continue }
-                let c = palette[Int(s.level)], a = Int(Self.echoAlpha(level: Int(s.level), cover: s.cover))
+                let c = palette[Int(s.level)], a = Self.echoAlpha(level: Int(s.level), cover: s.cover)
                 guard a > 0 else { continue }
                 let p = (py * size + px) * 4
-                out[p] = UInt8(Int(c.0) * a / 255)
-                out[p + 1] = UInt8(Int(c.1) * a / 255)
-                out[p + 2] = UInt8(Int(c.2) * a / 255)
-                out[p + 3] = UInt8(a)
+                out[p] = c.0; out[p + 1] = c.1; out[p + 2] = c.2; out[p + 3] = a
             }
         }
         return out

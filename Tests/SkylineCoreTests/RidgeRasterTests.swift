@@ -80,18 +80,15 @@ struct RidgeRasterTests {
         // ~13 px). Smooth contours change on most rows (158).
         #expect(Self.edgeSteps(iem) < 30)
         #expect(Self.edgeSteps(smooth) > 5 * Self.edgeSteps(iem))
-        // Opaque cores stay exact palette colours. Partial alpha is that colour premultiplied
-        // (CGImage is premultipliedLast), quantized to 255 or a multiple of 32.
+        // Every drawn pixel keeps its legend (palette) RGB. Alpha is 255 or a multiple of 32;
+        // bins at or below 0 dBZ stay at least echoAlphaFloor in the interior.
         var unmatched = 0, badAlpha = 0
         for p in stride(from: 0, to: smooth.count, by: 4) {
             let a = Int(smooth[p + 3])
             guard a > 0 else { continue }
             if a != 255 && a % 32 != 0 { badAlpha += 1 }
             let ok = r.palette.indices.contains { i in
-                !r.noEcho[i]
-                    && Int(r.palette[i].0) * a / 255 == Int(smooth[p])
-                    && Int(r.palette[i].1) * a / 255 == Int(smooth[p + 1])
-                    && Int(r.palette[i].2) * a / 255 == Int(smooth[p + 2])
+                !r.noEcho[i] && r.palette[i].0 == smooth[p] && r.palette[i].1 == smooth[p + 1] && r.palette[i].2 == smooth[p + 2]
             }
             if !ok { unmatched += 1 }
         }
@@ -127,24 +124,21 @@ struct RidgeRasterTests {
             #expect(cells > 0)
             var drawnMax = 0
             for p in Swift.stride(from: 0, to: px.count, by: 4) where px[p + 3] > 0 {
-                // Colour → level, undoing premultiplication. IEM repeats some colours, so take the highest.
-                let a = Int(px[p + 3])
+                // Colour → level. RGB is the palette entry (not scaled by alpha). IEM repeats some colours.
                 let lv = r.palette.indices.filter { i in
-                    guard !r.noEcho[i] else { return false }
-                    let c = r.palette[i]
-                    return Int(c.0) * a / 255 == Int(px[p]) && Int(c.1) * a / 255 == Int(px[p + 1]) && Int(c.2) * a / 255 == Int(px[p + 2])
+                    !r.noEcho[i] && r.palette[i].0 == px[p] && r.palette[i].1 == px[p + 1] && r.palette[i].2 == px[p + 2]
                 }.max() ?? 0
                 drawnMax = max(drawnMax, lv)
             }
             #expect(drawnMax >= rawMax, "z\(z): drawn max \(drawnMax) < raw max \(rawMax)")
-            // Each peak cell's centre shows that peak, premultiplied by the soft-alpha ramp (255 at ≥ ~18 dBZ).
+            // Each peak cell's centre shows that peak's legend colour. Alpha is the bin ramp (255 at ≥ 18 dBZ).
             for row in 0..<r.height { for col in 0..<r.width {
                 guard let v = r.echo(row, col), r.isPeak(row, col, v),
                       let (fx, fy) = pixel(lat: r.lat0 + Double(row) * r.dLat, lon: r.lon0 + Double(col) * r.dLon) else { continue }
                 let p = (fy * 256 + fx) * 4, c = r.palette[Int(v)]
-                let a = Int(RidgeRaster.echoAlpha(level: Int(v), cover: 1))
+                let a = RidgeRaster.echoAlpha(level: Int(v), cover: 1)
                 #expect(px[p + 3] == a)
-                #expect(px[p] == UInt8(Int(c.0) * a / 255) && px[p + 1] == UInt8(Int(c.1) * a / 255) && px[p + 2] == UInt8(Int(c.2) * a / 255))
+                #expect(px[p] == c.0 && px[p + 1] == c.1 && px[p + 2] == c.2)
             } }
         }
     }
