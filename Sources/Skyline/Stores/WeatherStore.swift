@@ -66,7 +66,15 @@ final class WeatherStore {
     /// Why the last search failed (offline, rate limit, timeout); nil after a search that answered (QA #2).
     var searchError: String?
     /// The query `searchResults` belong to, so Return never adds a result for older text (QA #1).
-    @ObservationIgnored private var resultsQuery = ""
+    private var resultsQuery = ""
+    /// Return found only places it won't add by itself (a country): say "choose one" instead of nothing.
+    private var submitFoundNothingToAdd = false
+
+    /// What the search list says besides its results (never silent: hint, searching, none, failed).
+    var searchStatus: PlaceSearch.Status? {
+        PlaceSearch.status(text: searchText, isSearching: isSearching, resultCount: searchResults.count,
+                           resultsQuery: resultsQuery, error: searchError, nothingAdded: submitFoundNothingToAdd)
+    }
 
     /// Radar map expanded to fill the detail area (in-window, Apple-Weather style).
     var radarExpanded = false
@@ -747,6 +755,7 @@ final class WeatherStore {
 
     func searchTextChanged() {
         searchTask?.cancel()
+        submitFoundNothingToAdd = false
         let query = SearchSubmit.normalized(searchText)
         guard query.count >= 2 else {
             searchResults = []
@@ -766,23 +775,29 @@ final class WeatherStore {
     /// One search; errors are shown (not turned into "No matches"), and results remember their query.
     private func runSearch(_ query: String, addFirst: Bool) async {
         do {
-            let results = SearchSubmit.ranked(try await service.search(query), query: query)
+            let service = self.service
+            let found = try await PlaceSearch.withTimeout(PlaceSearch.timeout) { try await service.search(query) }
+            let results = SearchSubmit.ranked(found, query: query)
             guard !Task.isCancelled else { return }
             isSearching = false
             searchError = nil
             if addFirst, let first = SearchSubmit.autoAdd(results) { add(first); return }
             searchResults = results
             resultsQuery = query
+            submitFoundNothingToAdd = addFirst && !results.isEmpty
         } catch {
             guard !Task.isCancelled else { return }
             isSearching = false
             searchResults = []
             resultsQuery = ""
-            searchError = "Couldn’t search. " + UserFacingError.message(error)
+            searchError = PlaceSearch.errorMessage(error)
         }
     }
 
-    func retrySearch() { searchTextChanged() }
+    func retrySearch() {
+        searchError = nil
+        searchTextChanged()
+    }
 
     func add(_ result: PlaceSearchResult) {
         let location = result.asLocation
@@ -868,7 +883,7 @@ final class WeatherStore {
         if let first = SearchSubmit.pick(results: searchResults, resultsQuery: resultsQuery, currentText: searchText) {
             add(first); return
         }
-        guard query.count >= 2 else { return }
+        guard query.count >= 2 else { return } // the list already says "Type at least 2 letters"
         // Results are for older text (still inside the debounce) or missing: search the current text now.
         searchTask?.cancel()
         isSearching = true

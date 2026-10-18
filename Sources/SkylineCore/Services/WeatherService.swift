@@ -107,10 +107,19 @@ public actor WeatherService {
     }
 
     public func search(_ query: String) async throws -> [PlaceSearchResult] {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard q.count >= 2 else { return [] }
-        let data = try await fetch(Endpoints.geocoding(q), ttl: TTL.geocoding)
-        return try OpenMeteoGeocodingResponse.decode(data)
+        let (name, qualifier) = PlaceSearch.parse(query)
+        guard name.count >= 2 else { return [] }
+        let url = Endpoints.geocoding(name, count: qualifier == nil ? 8 : 20)
+        var entry = try await fetchEntry(url, ttl: TTL.geocoding)
+        var results = try OpenMeteoGeocodingResponse.decode(entry.data)
+        // An empty answer isn't kept for 30 days: a geocoder hiccup (or a new place) would read as
+        // "No places found" for a month.
+        if results.isEmpty, now().timeIntervalSince(entry.storedAt) >= PlaceSearch.emptyResultTTL {
+            entry = try await fetchEntry(url, ttl: TTL.geocoding, force: true)
+            results = try OpenMeteoGeocodingResponse.decode(entry.data)
+        }
+        let ranked = PlaceSearch.ranked(results, qualifier: qualifier)
+        return qualifier == nil ? ranked : Array(ranked.prefix(8))
     }
 
     /// Key messages from the NWS office's latest Area Forecast Discussion (T17). Two small requests,
