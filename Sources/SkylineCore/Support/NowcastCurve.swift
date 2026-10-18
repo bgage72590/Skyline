@@ -64,6 +64,13 @@ public enum NowcastCurve {
         return min(3, 2 + (rate - moderateUpper) / (heavyRef - moderateUpper))
     }
 
+    /// The dropdown's 46-pt chart: a wet quarter's light rain (≥ 0.4 mm/h, i.e. 0.1 mm per 15 min) draws
+    /// at least a quarter of the height instead of a ~6-pt sliver. Heavier rain is unchanged.
+    public static let miniLightFloor = 0.75
+    public static func miniLevel(_ rate: Double) -> Double {
+        rate >= 0.4 ? max(level(rate), miniLightFloor) : level(rate)
+    }
+
     public static func intensityName(_ rate: Double) -> String {
         rate < 0.1 ? "None" : rate < lightUpper ? "Light" : rate < moderateUpper ? "Moderate" : "Heavy"
     }

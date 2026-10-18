@@ -195,13 +195,16 @@ public enum ForecastBlender {
     }
 
     /// Makes the categorical icon agree with the blended numbers.
-    /// * precip icon but consensus says it's unlikely and dry → cloudy
+    /// * precip icon but the chance is below the printed cutoff (20 %), or unlikely and dry → cloudy
     /// * dry icon but consensus says likely and wet → rain / snow
     /// * snow icon but the temperature is above ~37 °F → the matching rain icon
     public static func reconcile(code: Int, precipitationProbability pop: Double?, precipitation: Double?,
                                  temperature: Double) -> Int {
         let condition = WeatherCondition(wmoCode: code)
         let p = pop ?? 0, amount = precipitation ?? 0
+        // Dropdown review: a precipitation icon needs a chance the row prints (`HourlyDisplay.popCutoff`),
+        // whatever one model's amount says. Before, 15 % + 0.1 mm kept a rain icon with no % under it.
+        if condition.isPrecipitation, let pop, pop.rounded() < Double(HourlyDisplay.popCutoff) { return 3 }
         if condition.isPrecipitation, p < 25, amount < 0.05 { return 3 }
         if !condition.isPrecipitation, condition.category != .fog, p >= 60, amount >= 0.2 {
             if temperature <= 0 { return amount >= 1 ? 73 : 71 }
@@ -254,6 +257,11 @@ public enum ForecastBlender {
     /// otherwise `dryFallback` (the sky part of the NWS wording, else Partly Cloudy) is shown.
     public static func dailyIcon(code: Int, dryFallback: Int?, precipitationProbability pop: Double?,
                                  precipitation: Double?, temperature: Double) -> Int {
+        // Below the daily cutoff a precipitation code goes to the dry fallback (before `reconcile`, whose
+        // own 20 % cutoff would otherwise turn it into plain cloudy first).
+        if WeatherCondition(wmoCode: code).isPrecipitation, (pop ?? 0) < dailyPrecipitationIconMinPoP {
+            return rainIfWarm(dryFallback ?? 2, temperature: temperature)
+        }
         var c = reconcile(code: code, precipitationProbability: pop, precipitation: precipitation, temperature: temperature)
         if WeatherCondition(wmoCode: c).isPrecipitation, (pop ?? 0) < dailyPrecipitationIconMinPoP {
             c = dryFallback ?? 2
@@ -561,6 +569,22 @@ public enum Nowcast {
             if q.dropFirst(i + 1).prefix(2).allSatisfy({ !isWet($0) }) { return m.time.addingTimeInterval(-15 * 60) }
         }
         return nil
+    }
+
+    /// The header's condition ("Rain"), checked against the nowcast (dropdown review S3). Open-Meteo's
+    /// `current.weather_code` is a model value for the last quarter; when the quarter under way and the
+    /// next one are both dry, it isn't raining now (precipitation icon → cloudy), and when both are wet a
+    /// dry icon becomes rain. Without nowcast quarters ahead the code is left alone.
+    public static func reconcileCurrent(code: Int, minutely: [MinutelyPrecipitation], now: Date, temperature: Double) -> Int {
+        let q = quarters(minutely, now: now)
+        guard q.count >= 2 else { return code }
+        let condition = WeatherCondition(wmoCode: code)
+        if condition.isPrecipitation, !isWet(q[0]), !isWet(q[1]) { return 3 }
+        if !condition.isPrecipitation, condition.category != .fog, isWet(q[0]), isWet(q[1]) {
+            if temperature <= 0 { return 71 }
+            return q[0].precipitation >= 1 ? 63 : 61
+        }
+        return code
     }
 
     /// Minutes from `now`, to the nearest 5 (at least 5).

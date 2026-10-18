@@ -168,29 +168,34 @@ final class Batch5Tests: XCTestCase {
 
     // MARK: Briefing content (QA: coverage was 15 %)
 
-    func testBriefingLabelsHoursByTheirStart() {
+    func testBriefingLabelsHoursByTheirEnd() {
         let h = (1...12).map { k -> HourlyForecast in
             let t = Date(timeIntervalSince1970: (fixtureTime.timeIntervalSince1970 / 3600).rounded(.down) * 3600 + Double(k) * 3600)
             return k >= 7 ? hour(t, code: 63, pop: 80, precip: 2) : hour(t)
         }
-        // Hour ending 4 PM (k = 7 from 9 AM) is the 3–4 PM hour: "from 3 PM".
+        func headline(_ r: WeatherReport) -> String {
+            Briefing.headline(r, now: fixtureTime, hourLabel: hourLabel, delta: { Int($0) })
+        }
+        // Brian (Oct 17): hours are named by their END time, like the hourly row's columns. The first wet
+        // hour is the one ending 4 PM (k = 7 from 9 AM), so "around 4 PM", the same column as the row.
         let r = report(hourly: h)
-        XCTAssertEqual(Briefing.nextChange(r, now: fixtureTime, hourLabel: hourLabel), "Rain likely from 3 PM (80%).")
+        XCTAssertEqual(headline(r), "Rain likely around 4 PM (80%).")
         // The hour under way already wet: "likely now".
         let wetNow = report(hourly: h.map { hour($0.time, code: 63, pop: 80, precip: 2) })
-        XCTAssertEqual(Briefing.nextChange(wetNow, now: fixtureTime, hourLabel: hourLabel), "Rain likely now (80%).")
-        // Raining now: ending at the start of the first dry hour.
+        XCTAssertEqual(headline(wetNow), "Rain likely now (80%).")
+        // Raining now: ending at the end of the last wet hour (k = 3, 12 PM), two dry hours after it.
         let ending = report(hourly: h.enumerated().map { $0.offset < 3 ? hour($0.element.time, code: 63, pop: 80, precip: 2) : hour($0.element.time) },
                             code: 63)
-        XCTAssertEqual(Briefing.nextChange(ending, now: fixtureTime, hourLabel: hourLabel), "Rain ending around 12 PM.")
+        XCTAssertEqual(headline(ending), "Rain ending around 12 PM.")
         // Nothing changes.
-        XCTAssertEqual(Briefing.nextChange(report(hourly: h.prefix(6).map { $0 }), now: fixtureTime, hourLabel: hourLabel),
-                       "Cloudy for the next 12 hours.")
+        XCTAssertEqual(headline(report(hourly: h.prefix(6).map { $0 })), "Cloudy for the next 12 hours.")
         // A past hour is never "now" (QA: Toronto said "Heavy Drizzle now" for the hour that had ended).
         let pastWet = hour(fixtureTime.addingTimeInterval(-600), code: 55, pop: 90, precip: 1)
-        XCTAssertEqual(Briefing.nextChange(report(hourly: [pastWet] + h.prefix(3)), now: fixtureTime, hourLabel: hourLabel),
-                       "Cloudy for the next 12 hours.")
-        XCTAssertEqual(Briefing.nextChange(report(hourly: []), now: fixtureTime, hourLabel: hourLabel), "Cloudy.")
+        XCTAssertEqual(headline(report(hourly: [pastWet] + h.prefix(3))), "Cloudy for the next 12 hours.")
+        XCTAssertEqual(headline(report(hourly: [])), "Cloudy.")
+        // Sky changes are named by end time too.
+        let clearing = report(hourly: h.prefix(6).enumerated().map { $0.offset >= 2 ? hour($0.element.time, code: 0) : $0.element })
+        XCTAssertEqual(headline(clearing), "Cloudy now, clear sky by 12 PM.".replacingOccurrences(of: "clear sky", with: WeatherCondition(wmoCode: 0).description.lowercased()))
     }
 
     func testBriefingHeadlineAddsTomorrowAndSevereRisk() {

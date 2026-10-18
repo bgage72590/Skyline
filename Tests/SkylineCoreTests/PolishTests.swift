@@ -105,7 +105,7 @@ final class PolishTests: XCTestCase {
         r.hourly[i].precipitationProbability = 70
         r.hourly[i].weatherCode = 61
         let s = try XCTUnwrap(MenuSummary.rainTiming(r, now: f.now, hourLabel: label))
-        XCTAssertTrue(s.hasSuffix("likely around \(label(r.hourly[i].time)) · 70%"), s)
+        XCTAssertTrue(s.hasSuffix("likely around \(label(r.hourly[i].time)) (70%)"), s)
     }
 
     func testNextSunEventAndComfort() {
