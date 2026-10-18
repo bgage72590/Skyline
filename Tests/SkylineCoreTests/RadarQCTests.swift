@@ -118,6 +118,21 @@ struct RadarQCTests {
         #expect(Set(under) == [T(z: 6, x: 18, y: 23)])
     }
 
+    // Memory: closing the window purges masks and raw tiles; the next ask fetches again, same result.
+    @Test func purgeDropsCachedMasksAndRefetches() async {
+        let c = Counter()
+        let store = RadarQCMaskStore { url in c.note(url); return [] }
+        let first = await store.mask(template: Self.template, tile: T(z: 6, x: 18, y: 23))
+        let fetched = c.count
+        #expect(await store.cachedCount > 0)
+        _ = await store.mask(template: Self.template, tile: T(z: 6, x: 18, y: 23))
+        #expect(c.count == fetched) // cached
+        await store.purge()
+        #expect(await store.cachedCount == 0)
+        let again = await store.mask(template: Self.template, tile: T(z: 6, x: 18, y: 23))
+        #expect(c.count > fetched && again == first)
+    }
+
     // Clear sky (all neighbours blank but present) masks everything: the Fairfield case.
     @Test func blankButPresentMaskRemovesEverything() async {
         let store = RadarQCMaskStore { _ in [] }

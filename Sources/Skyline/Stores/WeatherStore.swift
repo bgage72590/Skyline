@@ -603,6 +603,10 @@ final class WeatherStore {
             isScrubbing = false
             RadarImageCache.shared.trim()
             MemoryRelief.soon(after: 5) // after SwiftUI has deallocated the window content
+            // MapKit/VectorKit tear their engine down asynchronously; relieve again once that is done.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+                if self?.isMainWindowOpen == false { MemoryRelief.soon(after: 0) }
+            }
             // Window gone: retries are only for the menu-bar location.
             for (id, task) in retryTasks where id != menuBarLocation?.id { task.cancel(); retryTasks[id] = nil }
         }
