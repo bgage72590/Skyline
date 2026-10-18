@@ -90,6 +90,22 @@ public enum RadarQC {
         return (image, mask, tile, params["raw"])
     }
 
+    /// The `#raw=` scan base in a frame template, if this frame is drawn from a ridge raster.
+    public static func rasterBase(in template: String) -> String? {
+        guard let range = template.range(of: "raw=") else { return nil }
+        let rest = template[range.upperBound...]
+        let end = rest.firstIndex(of: "&") ?? rest.endIndex
+        let base = String(rest[..<end])
+        return base.hasPrefix("https://") ? base : nil
+    }
+
+    /// The `#qc=` mask template (`…/{z}/{x}/{y}.png`) in a frame template.
+    public static func qcTemplate(in template: String) -> String? {
+        guard let range = template.range(of: "qc=") else { return nil }
+        let rest = String(template[range.upperBound...])
+        return rest.contains("{z}") ? rest : nil
+    }
+
 }
 
 #if canImport(CoreGraphics)

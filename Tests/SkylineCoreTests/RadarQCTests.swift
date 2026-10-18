@@ -129,19 +129,50 @@ struct RadarQCTests {
         #expect(Set(under) == [T(z: 6, x: 18, y: 23)])
     }
 
-    // Memory: closing the window purges masks and raw tiles; the next ask fetches again, same result.
-    @Test func purgeDropsCachedMasksAndRefetches() async {
+    // Closing the window drops decoded masks and raw tiles. The RLE copy answers the next ask.
+    @Test func purgeKeepsCompressedMasksWithoutRefetch() async {
         let c = Counter()
         let store = RadarQCMaskStore { url in c.note(url); return [] }
         let first = await store.mask(template: Self.template, tile: T(z: 6, x: 18, y: 23))
         let fetched = c.count
         #expect(await store.cachedCount > 0)
+        #expect(await store.compressedBytes > 0)
+        #expect(await store.compressedBytes <= RadarQCMaskStore.defaultCompressedBudget)
         _ = await store.mask(template: Self.template, tile: T(z: 6, x: 18, y: 23))
         #expect(c.count == fetched) // cached
         await store.purge()
         #expect(await store.cachedCount == 0)
         let again = await store.mask(template: Self.template, tile: T(z: 6, x: 18, y: 23))
-        #expect(c.count > fetched && again == first)
+        #expect(c.count == fetched && again == first)
+        #expect(await store.compressedBytes <= RadarQCMaskStore.defaultCompressedBudget)
+    }
+
+    @Test func maskBytesRoundTripAndStaySmall() {
+        var sparse = [UInt8](repeating: 0, count: 256 * 256)
+        sparse[128 * 256 + 128] = 1
+        sparse[128 * 256 + 129] = 1
+        let packed = MaskRLE.compress(sparse)
+        #expect(packed.count < 32)
+        #expect(MaskRLE.decompress(packed) == sparse)
+        let zeros = [UInt8](repeating: 0, count: 256 * 256)
+        let ones = [UInt8](repeating: 1, count: 256 * 256)
+        #expect(MaskRLE.compress(zeros).count == 1 && MaskRLE.decompress(MaskRLE.compress(zeros)) == zeros)
+        #expect(MaskRLE.compress(ones).count == 1 && MaskRLE.decompress(MaskRLE.compress(ones)) == ones)
+        #expect(MaskRLE.decompress(Data([9])) == nil)
+    }
+
+    @Test func encodedTilesStayInsideFourMegabytes() {
+        var cache = EncodedTileCache()
+        let blob = Data(repeating: 1, count: 100_000)
+        for i in 0..<50 { cache.store("t\(i)", data: blob) }
+        #expect(cache.bytes <= EncodedTileCache.budgetBytes)
+        #expect(cache.bytes > 0)
+        #expect(cache.touch("t49")?.count == 100_000)
+        #expect(cache.touch("t0") == nil)
+        cache.store("big", data: Data(count: EncodedTileCache.budgetBytes + 1))
+        #expect(cache.touch("big") == nil)
+        RadarRetryLog.backoff(path: "transient", seconds: 5)
+        RadarRetryLog.backoff(path: "transient", seconds: 5)
     }
 
     // Clear sky (all neighbours blank but present) masks everything: the Fairfield case.

@@ -38,6 +38,8 @@ public final class RadarTile: @unchecked Sendable {
     public var isPacked: Bool { rgba == nil && encoded == nil }
     /// Kept as the original compressed bytes.
     public var isCompressed: Bool { encoded != nil }
+    /// PNG (or WebP) bytes when `isCompressed`. Reopen keeps these and decodes them again.
+    public var encodedBytes: Data? { encoded }
 
     /// Bytes this tile holds.
     public var heldBytes: Int {

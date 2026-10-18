@@ -308,73 +308,185 @@ public enum PalettePNG {
 /// Fetches and caches one raster per scan, shared by every tile and zoom of that frame (LRU). Failures
 /// are remembered with back-off (CR #7.4: no request storm while the archive lags). PNG decoding runs
 /// off the actor, so lookups and other scans' decodes don't wait on it (CR #7.5).
+///
+/// The decoded raster is about 1 MB. The png + world file are about 15–60 KB and are kept across
+/// `purge()` (≤ ~2.5 MB for the newest scans) so a reopen re-decodes in a few milliseconds instead of
+/// fetching again and tripping the 10 s back-off.
 public actor RidgeRasterStore {
     public typealias Fetch = @Sendable (URL) async -> Data?
+    private struct PackedScan: Sendable { var png: Data; var world: Data }
+    private struct ScanResult: Sendable { var raster: RidgeRaster?; var png: Data?; var world: Data? }
     private let fetch: Fetch
     private var cache: [String: RidgeRaster] = [:]
     private var order: [String] = [] // least recently used first
-    private var inFlight: [String: Task<RidgeRaster?, Never>] = [:]
+    private var packed: [String: PackedScan] = [:]
+    private var packedOrder: [String] = []
+    private var packedBytes = 0
+    private var inFlight: [String: Task<ScanResult, Never>] = [:]
     private var failures: [String: (at: Date, attempts: Int)] = [:]
+    private var failureStamp: [String: Int] = [:]
+    private var loggedBackoff: Set<String> = []
+    /// Sendable and internally locked, so window-open can bump it without hopping to the actor.
+    nonisolated private let epoch = BackoffEpoch()
     private var limit: Int
     public let normalLimit: Int
+    private let compressedBudget: Int
     private let clock: @Sendable () -> Date
     public private(set) var fetches = 0
+    /// png + world-file bytes still held after the decoded rasters are dropped.
+    public var compressedBytes: Int { packedBytes }
+    /// Newest ~40 scans of compressed png + world file. A scan is ~15–60 KB.
+    public static let defaultCompressedBudget = 2_500_000
 
-    /// 40 scans ≈ 40 MB: a full 3-hour loop (37 frames) plus a fresh scan.
-    public init(limit: Int = 40, clock: @escaping @Sendable () -> Date = { Date() }, fetch: @escaping Fetch) {
-        self.fetch = fetch; self.limit = limit; self.normalLimit = limit; self.clock = clock
+    /// 40 scans ≈ 40 MB decoded: a full 3-hour loop (37 frames) plus a fresh scan.
+    public init(limit: Int = 40, compressedBudget: Int = RidgeRasterStore.defaultCompressedBudget,
+                clock: @escaping @Sendable () -> Date = { Date() }, fetch: @escaping Fetch) {
+        self.fetch = fetch
+        self.limit = limit
+        self.normalLimit = limit
+        self.compressedBudget = compressedBudget
+        self.clock = clock
     }
 
     /// Back-off after `attempts` consecutive failures: 10 s, 20 s, 40 s … capped at 5 min.
     public static func backoff(attempts: Int) -> TimeInterval { min(10 * pow(2, Double(max(attempts - 1, 0))), 300) }
 
-    public func isBackingOff(_ base: String) -> Bool {
-        guard let f = failures[base] else { return false }
-        return clock().timeIntervalSince(f.at) < Self.backoff(attempts: f.attempts)
+    public func isBackingOff(_ base: String) -> Bool { backoffApplies(base) }
+
+    /// Window opened: a back-off recorded before the close must not hold the first frame.
+    /// Takes effect immediately, including for a lookup already in flight on this actor.
+    public nonisolated func invalidateBackoff() { epoch.bump() }
+
+    /// Drops remembered failures. Pair with `invalidateBackoff()` from the window-open path.
+    public func clearBackoff() {
+        failures.removeAll()
+        failureStamp.removeAll()
+        loggedBackoff.removeAll()
     }
 
     /// `base` is the scan URL without extension (`…/OKX_N0B_202610161748`). nil on failure or back-off.
     public func raster(base: String) async -> RidgeRaster? {
         if let r = cache[base] { touch(base); return r }
-        if let t = inFlight[base] { return await t.value }
-        if isBackingOff(base) { return nil }
+        if let t = inFlight[base] { return await t.value.raster }
+        if let scan = packed[base], let raster = await decodeRetained(base, scan) { return raster }
+        if backoffApplies(base) {
+            logSuppressed(base)
+            return nil
+        }
         guard let png = URL(string: base + ".png"), let wld = URL(string: base + ".wld") else { return nil }
-        fetches += 1
-        let fetch = self.fetch
-        let t = Task.detached(priority: .userInitiated) { () -> RidgeRaster? in
-            async let p = fetch(png)
-            async let w = fetch(wld)
-            guard let pd = await p, let wd = await w, let text = String(data: wd, encoding: .ascii) else { return nil }
-            return RidgeRaster.decode(png: pd, worldFile: text)
-        }
-        inFlight[base] = t
-        let r = await t.value
-        inFlight[base] = nil
-        if let r {
-            failures[base] = nil
-            cache[base] = r
-            touch(base)
-            evict()
-        } else {
-            failures[base] = (clock(), (failures[base]?.attempts ?? 0) + 1)
-            if failures.count > 200 { failures = failures.filter { isBackingOff($0.key) } }
-        }
-        return r
+        return await fetchScan(base, png: png, world: wld)
     }
 
-    /// Memory pressure: keep only the newest `keep` scans (and use that as the cap) until `restore()`.
+    /// Re-decode retained scans, shown frames first. Does not fetch a scan that was not kept.
+    public func prewarmRetained(preferring bases: [String]) async {
+        let keys = bases.isEmpty ? packedOrder : bases.filter { packed[$0] != nil }
+        for base in keys where cache[base] == nil {
+            _ = await raster(base: base)
+        }
+    }
+
+    /// Memory pressure: keep only the newest `keep` decoded scans (and use that as the cap) until `restore()`.
+    /// Compressed bytes are left alone; they are already under `compressedBudget`.
     public func trim(keep: Int) {
         limit = max(0, keep)
         evict()
     }
     public func restore() { limit = normalLimit }
-    /// Window closed: drop every decoded scan (each ~1 MB). Back-off state and the cap are kept; the
-    /// next radar shown re-fetches its scans (from the URL disk cache when they are still current).
+    /// Window closed: drop every decoded scan (~1 MB each). Compressed png + world file stay.
     public func purge() {
         cache = [:]
         order = []
     }
     public var count: Int { cache.count }
+
+    private func backoffApplies(_ base: String) -> Bool {
+        guard let f = failures[base], failureStamp[base] == epoch.current() else { return false }
+        return clock().timeIntervalSince(f.at) < Self.backoff(attempts: f.attempts)
+    }
+
+    private func logSuppressed(_ base: String) {
+        let token = "\(epoch.current())|\(base)"
+        guard loggedBackoff.insert(token).inserted else { return }
+        if loggedBackoff.count > 500 { loggedBackoff.removeAll() }
+        let seconds = failures[base].map { Self.backoff(attempts: $0.attempts) } ?? 0
+        RadarRetryLog.backoff(path: "raster", seconds: seconds)
+    }
+
+    private func decodeRetained(_ base: String, _ scan: PackedScan) async -> RidgeRaster? {
+        let task = Task.detached(priority: .userInitiated) { () -> ScanResult in
+            let text = String(data: scan.world, encoding: .ascii) ?? ""
+            return ScanResult(raster: RidgeRaster.decode(png: scan.png, worldFile: text), png: nil, world: nil)
+        }
+        inFlight[base] = task
+        let raster = await task.value.raster
+        inFlight[base] = nil
+        guard let raster else {
+            dropPacked(base)
+            return nil
+        }
+        adopt(base, raster)
+        return raster
+    }
+
+    private func fetchScan(_ base: String, png: URL, world: URL) async -> RidgeRaster? {
+        fetches += 1
+        let fetch = self.fetch
+        let task = Task.detached(priority: .userInitiated) { () -> ScanResult in
+            async let p = fetch(png)
+            async let w = fetch(world)
+            guard let pd = await p, let wd = await w, let text = String(data: wd, encoding: .ascii) else {
+                return ScanResult(raster: nil, png: nil, world: nil)
+            }
+            return ScanResult(raster: RidgeRaster.decode(png: pd, worldFile: text), png: pd, world: wd)
+        }
+        inFlight[base] = task
+        let result = await task.value
+        inFlight[base] = nil
+        if let raster = result.raster {
+            if let png = result.png, let world = result.world { storePacked(base, png: png, world: world) }
+            failureStamp[base] = nil
+            failures[base] = nil
+            adopt(base, raster)
+            return raster
+        }
+        let previous = failureStamp[base] == epoch.current() ? (failures[base]?.attempts ?? 0) : 0
+        let attempts = previous + 1
+        failures[base] = (clock(), attempts)
+        failureStamp[base] = epoch.current()
+        if failures.count > 200 {
+            let now = epoch.current()
+            failures = failures.filter { failureStamp[$0.key] == now && backoffApplies($0.key) }
+        }
+        return nil
+    }
+
+    private func adopt(_ base: String, _ raster: RidgeRaster) {
+        cache[base] = raster
+        touch(base)
+        evict()
+    }
+
+    private func storePacked(_ base: String, png: Data, world: Data) {
+        let cost = png.count + world.count
+        guard cost > 0, cost <= compressedBudget else { return }
+        if let old = packed.removeValue(forKey: base) {
+            packedBytes -= old.png.count + old.world.count
+            packedOrder.removeAll { $0 == base }
+        }
+        while packedBytes + cost > compressedBudget, !packedOrder.isEmpty {
+            let oldest = packedOrder.removeFirst()
+            if let old = packed.removeValue(forKey: oldest) { packedBytes -= old.png.count + old.world.count }
+        }
+        guard packedBytes + cost <= compressedBudget else { return }
+        packed[base] = PackedScan(png: png, world: world)
+        packedOrder.append(base)
+        packedBytes += cost
+    }
+
+    private func dropPacked(_ base: String) {
+        if let old = packed.removeValue(forKey: base) { packedBytes -= old.png.count + old.world.count }
+        packedOrder.removeAll { $0 == base }
+    }
 
     private func touch(_ base: String) {
         order.removeAll { $0 == base }
@@ -383,4 +495,12 @@ public actor RidgeRasterStore {
     private func evict() {
         while order.count > limit { cache[order.removeFirst()] = nil }
     }
+}
+
+/// Bumped when the window opens so a back-off stored on the actor is ignored before the actor runs.
+private final class BackoffEpoch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func bump() { lock.lock(); value &+= 1; lock.unlock() }
+    func current() -> Int { lock.lock(); defer { lock.unlock() }; return value }
 }
