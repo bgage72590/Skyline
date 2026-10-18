@@ -219,8 +219,12 @@ struct WindTile: View {
             .frame(maxHeight: .infinity)
             if let peak = Briefing.peak(report.hourly.compactMap { h in h.windGust.map { (h.time, $0) } },
                                         from: report.current.time, hours: 24), peak.value > 0 {
+                // One line, shrinking if needed: "Peak gust 100 km/h at 11 PM" and the shorter
+                // 24-hour form ("… at 23") both fit the tile instead of ending in an ellipsis.
                 Text("Peak gust \(units.speedString(peak.value)) at \(Fmt.hour(peak.time, report.timeZone))")
-                    .font(.caption).foregroundStyle(Glass.secondaryText).lineLimit(1).minimumScaleFactor(0.8)
+                    .font(.caption).foregroundStyle(Glass.secondaryText)
+                    .lineLimit(1).minimumScaleFactor(0.6).allowsTightening(true)
+                    .layoutPriority(1)
             }
         }
     }

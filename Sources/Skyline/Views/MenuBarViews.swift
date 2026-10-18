@@ -368,7 +368,9 @@ struct MenuBarContentView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Label(t.1, systemImage: t.0).font(.caption2.weight(.semibold)).opacity(0.85).lineLimit(1)
                     Text(t.2).font(.callout.weight(.semibold)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.8)
-                    Text(t.3.isEmpty ? " " : t.3).font(.caption2).opacity(0.85).lineLimit(2)
+                    // The wind caption is the longest ("from WNW · 24-h peak gust 100 km/h"). Three lines
+                    // plus a small shrink keep the whole label inside the cell.
+                    Text(t.3.isEmpty ? " " : t.3).font(.caption2).opacity(0.85).lineLimit(3).minimumScaleFactor(0.7)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .frame(maxWidth: .infinity, minHeight: 58, alignment: .topLeading)
