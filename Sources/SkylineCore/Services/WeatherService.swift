@@ -44,7 +44,13 @@ public actor WeatherService {
         var data: Data
         var storedAt: Date
         var isFallback: Bool
+        /// Why the stale copy was used.
+        var cause: FallbackCause? = nil
     }
+
+    /// Pause before the one immediate re-try of a GET that died in flight (`FallbackCause.retriesOnce`).
+    private var transientRetryDelay: TimeInterval = 0.5
+    func setTransientRetryDelay(_ seconds: TimeInterval) { transientRetryDelay = seconds }
 
     private let client: HTTPClient
     private let cache: ResponseCache
@@ -101,10 +107,19 @@ public actor WeatherService {
     }
 
     public func search(_ query: String) async throws -> [PlaceSearchResult] {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard q.count >= 2 else { return [] }
-        let data = try await fetch(Endpoints.geocoding(q), ttl: TTL.geocoding)
-        return try OpenMeteoGeocodingResponse.decode(data)
+        let (name, qualifier) = PlaceSearch.parse(query)
+        guard name.count >= 2 else { return [] }
+        let url = Endpoints.geocoding(name, count: qualifier == nil ? 8 : 20)
+        var entry = try await fetchEntry(url, ttl: TTL.geocoding)
+        var results = try OpenMeteoGeocodingResponse.decode(entry.data)
+        // An empty answer isn't kept for 30 days: a geocoder hiccup (or a new place) would read as
+        // "No places found" for a month.
+        if results.isEmpty, now().timeIntervalSince(entry.storedAt) >= PlaceSearch.emptyResultTTL {
+            entry = try await fetchEntry(url, ttl: TTL.geocoding, force: true)
+            results = try OpenMeteoGeocodingResponse.decode(entry.data)
+        }
+        let ranked = PlaceSearch.ranked(results, qualifier: qualifier)
+        return qualifier == nil ? ranked : Array(ranked.prefix(8))
     }
 
     /// Key messages from the NWS office's latest Area Forecast Discussion (T17). Two small requests,
@@ -284,6 +299,7 @@ public actor WeatherService {
                              dataAsOf: dataAsOf, isOfflineFallback: omEntry.isFallback)
         report.nwsGridID = nws?.point.gridID
         report.forecastAsOf = omEntry.storedAt
+        report.fallbackCause = omEntry.isFallback ? (omEntry.cause ?? .unreachable) : nil
         report.earlierOutlook = earlier
         report.severeOutlooks = outlooks
         report.modelSeries = ForecastBlender.modelSeries(openMeteo: om, nwsHourly: nws?.hourly ?? [], blended: hourly,
@@ -408,7 +424,7 @@ public actor WeatherService {
         var waits = force
         if !force, let until = backoffUntil[host], until > now() {
             if let stale = await cache.entry(key, maxAge: maxStale) {
-                return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true)
+                return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true, cause: .busy)
             }
             guard priority == .interactive else { throw HTTPError.backingOff(host: host, until: until) }
             waits = true
@@ -431,7 +447,17 @@ public actor WeatherService {
                     throw HTTPError.backingOff(host: host, until: until)
                 }
                 let epoch = throttleEpoch[host, default: 0]
-                let data = try await client.get(url, headers: headers)
+                let data: Data
+                do {
+                    data = try await client.get(url, headers: headers)
+                } catch let error where FallbackCause.retriesOnce(error) {
+                    // Root cause of the false "Offline" banner after Refresh (QA, build 88): a forced
+                    // burst often meets one dropped request (-1005 on a keep-alive connection the server
+                    // had closed, or a 502). That fell straight back to the saved copy and the banner
+                    // called it "Offline". Try once more, still inside this host's turn.
+                    try await Task.sleep(for: .seconds(transientRetryDelay))
+                    data = try await client.get(url, headers: headers)
+                }
                 if throttleEpoch[host, default: 0] == epoch {
                     backoffUntil[host] = nil
                     backoffStrikes[host] = nil
@@ -442,7 +468,7 @@ public actor WeatherService {
                 if waits, case HTTPError.backingOff = error { throw error }
                 if case HTTPError.throttled(_, _, let retryAfter) = error { noteThrottled(host, retryAfter: retryAfter) }
                 if let stale = await cache.entry(key, maxAge: maxStale) {
-                    return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true)
+                    return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true, cause: FallbackCause(error))
                 }
                 throw error
             }
