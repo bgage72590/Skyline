@@ -100,6 +100,10 @@ struct RadarQCTests {
         #expect(rgba[(10 * 256 + 31) * 4 + 3] == 128)
         #expect(rgba[(10 * 256 + 32) * 4 + 3] == 64)
         #expect(rgba[(10 * 256 + 80) * 4 + 3] == 0 && rgba[(255 * 256 + 255) * 4 + 3] == 0)
+        // This buffer is premultiplied (the IEM path). RGB scales with the new alpha; a straight
+        // nearest-site tile must not (see straightAlphaMaskKeepsLegendRGBOnAPartialEdge).
+        #expect(rgba[(10 * 256 + 31) * 4] == 128 && rgba[(10 * 256 + 32) * 4] == 64)
+        #expect(rgba[(10 * 256 + 80) * 4] == 0)
         // A fully-on mask does not fade the display tile's border (edge samples repeat the edge pixel).
         let full = [UInt8](repeating: 1, count: 256 * 256)
         var edge = [UInt8](repeating: 180, count: 256 * 256 * 4)

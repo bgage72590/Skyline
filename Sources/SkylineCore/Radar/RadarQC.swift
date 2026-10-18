@@ -142,6 +142,8 @@ extension RadarQC {
         guard w == tileSize, h == tileSize else { return nil }
         // Same space as the tile so the N0Q/N0B colours come through unchanged.
         let space = (image.colorSpace?.model == .rgb ? image.colorSpace : nil) ?? CGColorSpaceCreateDeviceRGB()
+        // Already premultiplied by the draw above. apply scales RGB with alpha (straightAlpha stays false)
+        // so this buffer is not multiplied a second time.
         var px = RadarTilePacker.render(image, space: space)
         RadarQCMask.apply(rgba: &px, tile: tile, mask: mask)
         guard let provider = CGDataProvider(data: Data(px) as CFData),

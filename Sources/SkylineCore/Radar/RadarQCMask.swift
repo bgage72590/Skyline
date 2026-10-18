@@ -96,7 +96,12 @@ public enum RadarQCMask {
     /// as drawn; fully outside is cleared. The feather (a mask-pixel edge) quantizes alpha to a multiple
     /// of 32 so the extra partial pixels stay a small PNG. Scale 1 samples pixel centres exactly, so a
     /// mask at the display zoom is still a hard on/off.
-    public static func apply(rgba: inout [UInt8], tile t: TileID, mask: [UInt8]) {
+    ///
+    /// `straightAlpha`: nearest-site tiles store legend RGB with an independent alpha (`RidgeRaster.renderTile`).
+    /// The mask then changes alpha only, and `RadarQC.image` is the one premultiply before Quartz. IEM tiles
+    /// arrive already premultiplied (`RadarTilePacker.render`); leave this false so RGB scales with alpha
+    /// and a partial edge keeps its colour instead of a bright fringe.
+    public static func apply(rgba: inout [UInt8], tile t: TileID, mask: [UInt8], straightAlpha: Bool = false) {
         let n = RadarQC.tileSize
         guard rgba.count == n * n * 4, mask.count == n * n else { return }
         let m = maskTile(for: t)
@@ -113,9 +118,11 @@ public enum RadarQCMask {
                 var a = Int((Double(oldA) * w).rounded())
                 let q = Int((Double(a) / 32).rounded()) * 32
                 a = min(oldA, max(32, q))
-                rgba[p] = UInt8(Int(rgba[p]) * a / oldA)
-                rgba[p + 1] = UInt8(Int(rgba[p + 1]) * a / oldA)
-                rgba[p + 2] = UInt8(Int(rgba[p + 2]) * a / oldA)
+                if !straightAlpha {
+                    rgba[p] = UInt8(Int(rgba[p]) * a / oldA)
+                    rgba[p + 1] = UInt8(Int(rgba[p + 1]) * a / oldA)
+                    rgba[p + 2] = UInt8(Int(rgba[p + 2]) * a / oldA)
+                }
                 rgba[p + 3] = UInt8(a)
             }
         }

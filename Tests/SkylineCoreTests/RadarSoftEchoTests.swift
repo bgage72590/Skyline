@@ -1,3 +1,6 @@
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 import Foundation
 import Testing
 @testable import SkylineCore
@@ -70,5 +73,64 @@ struct RadarSoftEchoTests {
         let full = [UInt8](repeating: 1, count: 256 * 256)
         #expect(RadarQCMask.coverage(mask: full, scale: 4, offsetX: 0, offsetY: 0, x: 0, y: 0) == 1)
         #expect(RadarQCMask.coverage(mask: full, scale: 4, offsetX: 0, offsetY: 0, x: 255, y: 255) == 1)
+    }
+
+    /// Nearest-site tiles are straight legend RGB. The QC mask must scale alpha only, so a pixel half
+    /// inside the mask keeps its colour. Fully outside the mask is transparent.
+    @Test func straightAlphaMaskKeepsLegendRGBOnAPartialEdge() throws {
+        let z = 8, x = 75, y = 95
+        let n = pow(2.0, Double(z))
+        let lon = (Double(x) + 128.5 / 256) / n * 360 - 180
+        let lat = atan(sinh(Double.pi * (1 - 2 * (Double(y) + 128.5 / 256) / n))) * 180 / .pi
+        let level: UInt8 = 2 // weakest bin, alpha well below opaque
+        let legend: (UInt8, UInt8, UInt8) = (180, 64, 220)
+        var palette = [(UInt8, UInt8, UInt8)](repeating: (0, 0, 0), count: 256)
+        palette[Int(level)] = legend
+        // One cell much larger than the tile, centred on it, so every pixel is that bin at full cover.
+        let raster = RidgeRaster(width: 1, height: 1, indices: [level], palette: palette,
+                                 lon0: lon, lat0: lat, dLon: 40, dLat: -40)
+        var px = raster.renderTile(z: z, x: x, y: y)
+        let bin = Int(RidgeRaster.echoAlpha(level: Int(level), cover: 1))
+        func rgba(_ buf: [UInt8], _ px: Int, _ py: Int) -> (UInt8, UInt8, UInt8, UInt8) {
+            let i = (py * 256 + px) * 4
+            return (buf[i], buf[i + 1], buf[i + 2], buf[i + 3])
+        }
+        #expect(rgba(px, 16, 10) == (legend.0, legend.1, legend.2, UInt8(bin)))
+        #expect(rgba(px, 31, 10).3 == UInt8(bin) && rgba(px, 80, 10).3 == UInt8(bin))
+
+        var mask = [UInt8](repeating: 0, count: 256 * 256)
+        for row in 192..<256 { for col in 192..<200 { mask[row * 256 + col] = 1 } }
+        RadarQCMask.apply(rgba: &px, tile: .init(z: z, x: x, y: y), mask: mask, straightAlpha: true)
+
+        let inside = rgba(px, 16, 10)
+        #expect(inside == (legend.0, legend.1, legend.2, UInt8(bin)))
+
+        let w = RadarQCMask.coverage(mask: mask, scale: 4, offsetX: 192, offsetY: 192, x: 31, y: 10)
+        let edge = rgba(px, 31, 10)
+        #expect(edge.0 == legend.0 && edge.1 == legend.1 && edge.2 == legend.2)
+        let raw = Int((Double(bin) * w).rounded())
+        let quantized = min(bin, max(32, Int((Double(raw) / 32).rounded()) * 32))
+        #expect(Int(edge.3) == quantized)
+        #expect(abs(Double(edge.3) - Double(bin) * w) <= 16)
+
+        #expect(rgba(px, 80, 10) == (0, 0, 0, 0))
+        #expect(rgba(px, 255, 255) == (0, 0, 0, 0))
+
+#if canImport(CoreGraphics)
+        // Quartz sees one premultiply. Un-premultiplying that image recovers the legend RGB.
+        let img = try #require(RadarQC.image(rgba: px))
+        let drawn = RadarTilePacker.render(img, space: CGColorSpace(name: CGColorSpace.sRGB))
+        func unpremul(_ px: Int, _ py: Int) -> (Int, Int, Int, Int) {
+            let i = (py * 256 + px) * 4
+            let a = Int(drawn[i + 3])
+            guard a > 0 else { return (0, 0, 0, 0) }
+            func u(_ c: UInt8) -> Int { (Int(c) * 255 + a / 2) / a }
+            return (u(drawn[i]), u(drawn[i + 1]), u(drawn[i + 2]), a)
+        }
+        let back = unpremul(31, 10)
+        #expect(abs(back.0 - Int(legend.0)) <= 1 && abs(back.1 - Int(legend.1)) <= 1 && abs(back.2 - Int(legend.2)) <= 1)
+        #expect(back.3 == quantized)
+        #expect(unpremul(80, 10) == (0, 0, 0, 0))
+#endif
     }
 }
