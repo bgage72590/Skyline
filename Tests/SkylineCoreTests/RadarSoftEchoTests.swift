@@ -117,19 +117,28 @@ struct RadarSoftEchoTests {
         #expect(rgba(px, 255, 255) == (0, 0, 0, 0))
 
 #if canImport(CoreGraphics)
-        // Quartz sees one premultiply. Un-premultiplying that image recovers the legend RGB.
+        // image() is the one premultiply. Read those bytes; drawing the image again is a second composite.
         let img = try #require(RadarQC.image(rgba: px))
-        let drawn = RadarTilePacker.render(img, space: CGColorSpace(name: CGColorSpace.sRGB))
+        let stored = try #require(img.dataProvider.flatMap(CGDataProviderCopyData)) as Data
         func unpremul(_ px: Int, _ py: Int) -> (Int, Int, Int, Int) {
             let i = (py * 256 + px) * 4
-            let a = Int(drawn[i + 3])
+            let a = Int(stored[i + 3])
             guard a > 0 else { return (0, 0, 0, 0) }
             func u(_ c: UInt8) -> Int { (Int(c) * 255 + a / 2) / a }
-            return (u(drawn[i]), u(drawn[i + 1]), u(drawn[i + 2]), a)
+            return (u(stored[i]), u(stored[i + 1]), u(stored[i + 2]), a)
         }
+        let i = (10 * 256 + 31) * 4
+        let a = Int(stored[i + 3])
+        #expect(a == quantized)
+        // Exactly one multiply of the legend colour. A second darken would not match this.
+        #expect(Int(stored[i]) == Int(legend.0) * a / 255)
+        #expect(Int(stored[i + 1]) == Int(legend.1) * a / 255)
+        #expect(Int(stored[i + 2]) == Int(legend.2) * a / 255)
         let back = unpremul(31, 10)
-        #expect(abs(back.0 - Int(legend.0)) <= 1 && abs(back.1 - Int(legend.1)) <= 1 && abs(back.2 - Int(legend.2)) <= 1)
-        #expect(back.3 == quantized)
+        // 8-bit premultiply does not invert exactly (180×96/255 is 67, and 67×255/96 is 178).
+        #expect(abs(back.0 - Int(legend.0)) <= 2)
+        #expect(abs(back.1 - Int(legend.1)) <= 2)
+        #expect(abs(back.2 - Int(legend.2)) <= 2)
         #expect(unpremul(80, 10) == (0, 0, 0, 0))
 #endif
     }
