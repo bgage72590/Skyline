@@ -77,6 +77,8 @@ final class RadarPlayback {
     /// and read (visible holes in the shown frame, missing ring tiles, held tiles).
     @ObservationIgnored var debugPanHandler: ((Double, Double) -> Void)?
     @ObservationIgnored var debugRadarStats: (() -> (holes: Int, ringMissing: Int, held: Int))?
+    /// Measurement hook: the expanded map's radar tile zoom.
+    @ObservationIgnored var debugRadarZoom: (() -> Int)?
 
     @ObservationIgnored private let service: WeatherService
     /// The play clock. A TaskSlot so a clock task that resumes after being replaced can't orphan its successor.

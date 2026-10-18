@@ -77,6 +77,7 @@ struct ContentView: View {
             OverscanHitProbe.runIfRequested(store: store)
             MenuSnapshot.runIfRequested(store: store)
             MeasureHooks.runIfRequested(store: store)
+            MemoryTest.runIfRequested(store: store)
             if let raw = defaults.string(forKey: "SkylineOpenModule"), let module = DetailModule(rawValue: raw) {
                 store.activeModule = ModuleSelection(module: module, day: nil)
             }

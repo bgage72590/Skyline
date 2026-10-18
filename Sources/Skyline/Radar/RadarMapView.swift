@@ -97,6 +97,7 @@ struct RadarMapView: NSViewRepresentable {
         if interactive {
             playback.debugZoomHandler = { [weak c] factor in c?.zoom(by: factor) }
             playback.debugPanHandler = { [weak c] dx, dy in c?.pan(dx: dx, dy: dy) }
+            playback.debugRadarZoom = { [weak radar] in radar?.currentZoom ?? -1 }
             playback.debugRadarStats = { [weak radar] in
                 guard let radar else { return (0, 0, 0) }
                 return (radar.visibleHolesInShownFrame(), radar.missingRingTiles(), radar.heldTileCount)
@@ -1595,6 +1596,7 @@ final class RadarLayerView: NSView {
         return neededFrames(g).reduce(0) { n, i in n + keep.filter { g.tiles[i][$0] == nil && !g.missing[i].contains($0) }.count }
     }
 
+    var currentZoom: Int { zoom }
     var heldTileCount: Int { [active, pending].compactMap { $0 }.reduce(0) { $0 + $1.tiles.reduce(0) { $0 + $1.count } } }
 }
 
