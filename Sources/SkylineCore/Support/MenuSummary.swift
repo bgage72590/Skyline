@@ -36,9 +36,9 @@ public enum MenuSummary {
     /// "Feels like 72°" only when it differs from the air temperature by at least 3° in the units shown,
     /// compared before rounding (67.4 vs 67.6 °F printed "67°" and "Feels like 68°"). nil otherwise.
     public static let feelsLikeMinDifference = 3.0
-    public static func feelsLikeText(temperature: Double, apparent: Double, units: DisplayUnits) -> String? {
+    public static func feelsLikeText(temperature: Double, apparent: Double, units: DisplayUnits, withUnit: Bool = false) -> String? {
         abs(units.temperatureDelta(apparent - temperature)) >= feelsLikeMinDifference
-            ? "Feels like \(units.temperatureString(apparent))" : nil
+            ? "Feels like \(units.temperatureString(apparent, withUnit: withUnit))" : nil
     }
 
     /// The wind tile's gust: the highest gust in the next 24 hours, labelled as such (it read as now).

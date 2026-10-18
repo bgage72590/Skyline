@@ -67,6 +67,12 @@ public struct RidgeRaster: Sendable {
     /// averaging only cells with echo (no halo), drawn where those cover at least half. Near a local-max
     /// cell's centre the full peak value is kept, so every core reaches its raw maximum.
     public func sample(lon: Double, lat: Double) -> UInt8? {
+        sampleEcho(lon: lon, lat: lat)?.level
+    }
+
+    /// The smoothed level plus how much of the neighbourhood is echo (1 at a kept core). Nil outside the
+    /// ≥ ½ contour, so the drawn footprint matches `sample`.
+    public func sampleEcho(lon: Double, lat: Double) -> (level: UInt8, cover: Double)? {
         let fc = (lon - lon0) / dLon, fr = (lat - lat0) / dLat
         guard fc > -1, fr > -1, fc < Double(width), fr < Double(height) else { return nil }
         let c0 = Int(fc.rounded(.down)), r0 = Int(fr.rounded(.down))
@@ -81,13 +87,36 @@ public struct RidgeRaster: Sendable {
         let nr = Int(fr.rounded()), nc = Int(fc.rounded())
         if let v = echo(nr, nc), (fr - Double(nr)) * (fr - Double(nr)) + (fc - Double(nc)) * (fc - Double(nc)) <= Self.peakRadius * Self.peakRadius,
            isPeak(nr, nc, v) {
-            return v
+            return (v, 1)
         }
         guard cover >= 0.5 else { return nil }
-        return UInt8(min(255, (sum / cover).rounded()))
+        return (UInt8(min(255, (sum / cover).rounded())), cover)
     }
 
-    /// Premultiplied RGBA (opaque or clear) for Web Mercator tile z/x/y, 256², palette colours only.
+    /// Interior alpha for echo at or below 0 dBZ: 160/255 ≈ 63% of an opaque core, so the weakest bin
+    /// still reads on the dark map. A multiple of 32, matching the quantized ramp.
+    public static let echoAlphaFloor: UInt8 = 160
+
+    /// Alpha for one drawn echo pixel. IEM's N0B index is dBZ = −32 + 0.5×(level−1). The bin itself
+    /// ramps from `echoAlphaFloor` at ≤ 0 dBZ to opaque at 18 dBZ. `cover` only feathers the ≥ ½
+    /// contour (the edge anti-alias); it does not dim the whole region. Drawn alphas are 255 or a
+    /// multiple of 32, which keeps the PNG small (partial alpha cannot be palette-packed).
+    public static func echoAlpha(level: Int, cover: Double) -> UInt8 {
+        guard level >= 2 else { return 0 }
+        let dbz = -32.0 + 0.5 * Double(level - 1)
+        let byDbz: Double
+        if dbz >= 18 { byDbz = 255 }
+        else if dbz <= 0 { byDbz = Double(echoAlphaFloor) }
+        else { byDbz = Double(echoAlphaFloor) + Double(255 - Int(echoAlphaFloor)) * (dbz / 18) }
+        let feather = min(1, max(0, (cover - 0.5) / 0.5))
+        let raw = byDbz * (0.5 + 0.5 * feather)
+        if raw >= 240 { return 255 }
+        let q = Int((raw / 32).rounded()) * 32
+        return UInt8(min(255, max(32, q)))
+    }
+
+    /// Straight RGBA for Web Mercator tile z/x/y, 256². RGB is the IEM palette entry for that bin
+    /// (the legend colour), never scaled by alpha. Alpha follows `echoAlpha`.
     public func renderTile(z: Int, x: Int, y: Int, size: Int = 256) -> [UInt8] {
         var out = [UInt8](repeating: 0, count: size * size * 4)
         guard (0...22).contains(z) else { return out }
@@ -99,9 +128,11 @@ public struct RidgeRaster: Sendable {
             let fr = (lat - lat0) / dLat
             if fr < -1 || fr > Double(height) { continue }
             for px in 0..<size {
-                guard let v = sample(lon: lons[px], lat: lat), Int(v) < palette.count else { continue }
-                let c = palette[Int(v)], p = (py * size + px) * 4
-                out[p] = c.0; out[p + 1] = c.1; out[p + 2] = c.2; out[p + 3] = 255
+                guard let s = sampleEcho(lon: lons[px], lat: lat), Int(s.level) < palette.count else { continue }
+                let c = palette[Int(s.level)], a = Self.echoAlpha(level: Int(s.level), cover: s.cover)
+                guard a > 0 else { continue }
+                let p = (py * size + px) * 4
+                out[p] = c.0; out[p + 1] = c.1; out[p + 2] = c.2; out[p + 3] = a
             }
         }
         return out

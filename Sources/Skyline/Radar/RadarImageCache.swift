@@ -301,7 +301,8 @@ final class RadarImageCache {
             let wantsMask = maskTemplate != nil
             let rendered: RadarTile? = await onDecodeQueue {
                 var px = raster.renderTile(z: tile.z, x: tile.x, y: tile.y)
-                if let mask { RadarQCMask.apply(rgba: &px, tile: tile, mask: mask) }
+                // Straight legend RGB. Scale alpha only; RadarQC.image premultiplies once for Quartz.
+                if let mask { RadarQCMask.apply(rgba: &px, tile: tile, mask: mask, straightAlpha: true) }
                 guard px.contains(where: { $0 != 0 }) else { return nil }
                 guard let img = RadarQC.image(rgba: px), let png = RadarQC.png(img) else { return nil }
                 return pack(img, encoded: png)

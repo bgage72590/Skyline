@@ -285,7 +285,7 @@ final class WeatherStore {
     var menuBarLabelSpec: MenuBarLabel.Spec? {
         guard let report = menuBarReport else { return nil }
         return MenuBarLabel.Spec(symbol: report.current.condition.symbolName(isDay: report.current.isDay),
-                                 text: units.temperatureString(report.current.temperature),
+                                 text: units.temperatureString(report.current.temperature, withUnit: true),
                                  dimmed: isStale(report))
     }
 

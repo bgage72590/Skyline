@@ -285,15 +285,17 @@ struct SidebarRow: View {
                     if let report {
                         WeatherSymbol(condition: report.current.condition, isDay: report.current.isDay, size: 18)
                     }
-                    Text(units.temperatureString(report?.current.temperature))
+                    Text(units.temperatureString(report?.current.temperature, withUnit: true))
                         .font(.system(size: 28, weight: .light))
                         .monospacedDigit()
+                        .lineLimit(1).minimumScaleFactor(0.7)
                 }
                 Spacer(minLength: 0)
                 if let today = report?.today {
-                    Text("H:\(units.temperatureString(today.high))  L:\(units.temperatureString(today.low))")
+                    Text("H:\(units.temperatureString(today.high, withUnit: true))  L:\(units.temperatureString(today.low, withUnit: true))")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(Glass.secondaryText)
+                        .lineLimit(1).minimumScaleFactor(0.7)
                 }
             }
         }

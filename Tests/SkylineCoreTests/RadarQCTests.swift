@@ -1,5 +1,7 @@
+#if canImport(CoreGraphics)
 import CoreGraphics
 import ImageIO
+#endif
 import Foundation
 import Testing
 @testable import SkylineCore
@@ -89,11 +91,24 @@ struct RadarQCTests {
 
     @Test func applyClearsOutsideTheMaskAtHigherZoom() {
         var mask = [UInt8](repeating: 0, count: 256 * 256)
-        for y in 192..<256 { for x in 192..<200 { mask[y * 256 + x] = 1 } } // left 8 mask px of tile (3,3)
+        for y in 192..<256 { for x in 192..<200 { mask[y * 256 + x] = 1 } } // left 8 mask px of the child tile
         var rgba = [UInt8](repeating: 200, count: 256 * 256 * 4)
         RadarQCMask.apply(rgba: &rgba, tile: T(z: 8, x: 75, y: 95), mask: mask)
-        #expect(rgba[3] == 200 && rgba[(10 * 256 + 31) * 4 + 3] == 200)  // 8 mask px × 4 = 32 display px
-        #expect(rgba[(10 * 256 + 32) * 4 + 3] == 0 && rgba[(255 * 256 + 255) * 4 + 3] == 0)
+        // Interior of the on-block stays exact. The edge is a bilinear feather (scale 4), quantized to
+        // multiples of 32: x=31 weight 0.625 → 128, x=32 weight 0.375 → 64. Well outside is clear.
+        #expect(rgba[(10 * 256 + 16) * 4 + 3] == 200)
+        #expect(rgba[(10 * 256 + 31) * 4 + 3] == 128)
+        #expect(rgba[(10 * 256 + 32) * 4 + 3] == 64)
+        #expect(rgba[(10 * 256 + 80) * 4 + 3] == 0 && rgba[(255 * 256 + 255) * 4 + 3] == 0)
+        // This buffer is premultiplied (the IEM path). RGB scales with the new alpha; a straight
+        // nearest-site tile must not (see straightAlphaMaskKeepsLegendRGBOnAPartialEdge).
+        #expect(rgba[(10 * 256 + 31) * 4] == 128 && rgba[(10 * 256 + 32) * 4] == 64)
+        #expect(rgba[(10 * 256 + 80) * 4] == 0)
+        // A fully-on mask does not fade the display tile's border (edge samples repeat the edge pixel).
+        let full = [UInt8](repeating: 1, count: 256 * 256)
+        var edge = [UInt8](repeating: 180, count: 256 * 256 * 4)
+        RadarQCMask.apply(rgba: &edge, tile: T(z: 8, x: 72, y: 92), mask: full)
+        #expect(edge[3] == 180 && edge[(255 * 256 + 255) * 4 + 3] == 180)
     }
 
     final class Counter: @unchecked Sendable {
@@ -158,6 +173,7 @@ struct RadarQCTests {
         #expect(c.count > before)
     }
 
+#if canImport(CoreGraphics)
     static func image(_ w: Int, _ h: Int, _ px: (Int, Int) -> (UInt8, UInt8, UInt8, UInt8)) -> CGImage {
         var bytes = [UInt8](); for y in 0..<h { for x in 0..<w { let p = px(x, y); bytes += [p.0, p.1, p.2, p.3] } }
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
@@ -184,4 +200,5 @@ struct RadarQCTests {
         #expect(RadarQC.masked(Self.image(16, 16) { _, _ in green }, tile: T(z: 4, x: 1, y: 1), mask: mask) == nil)
         #expect(RadarQC.alpha(of: Self.image(256, 256) { _, _ in (0, 0, 0, 0) }) == [])
     }
+#endif
 }

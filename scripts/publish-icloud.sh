@@ -34,6 +34,11 @@ CMD="$DIR/.Install Skyline.command.tmp"
   cat "$ROOT/scripts/install-command-footer.sh"; } > "$CMD"
 chmod 755 "$CMD"
 mv -f "$CMD" "$DIR/Install Skyline.command"
-printf 'Skyline build %s\ncommit %s%s\npublished %s\n' "$BUILD" "$COMMIT" "$DIRTY" "$(date '+%Y-%m-%d %H:%M %Z')" > "$DIR/VERSION.txt"
+# Prefer the copy already in the bundle so iCloud and the .app say the same thing (one timestamp).
+if [[ -f "$APP/Contents/Resources/VERSION.txt" ]]; then
+  cp "$APP/Contents/Resources/VERSION.txt" "$DIR/VERSION.txt"
+else
+  printf 'Skyline build %s\ncommit %s%s\npublished %s\n' "$BUILD" "$COMMIT" "$DIRTY" "$(date '+%Y-%m-%d %H:%M %Z')" > "$DIR/VERSION.txt"
+fi
 echo "$BUILD" > "$DIR/Skyline.version"
 echo "    $DIR/Skyline.zip + Install Skyline.command + VERSION.txt (build $BUILD, $COMMIT$DIRTY)"
