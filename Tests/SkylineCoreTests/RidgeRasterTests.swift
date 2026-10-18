@@ -1,6 +1,8 @@
+#if canImport(CoreGraphics)
 import CoreGraphics
-import Foundation
 import ImageIO
+#endif
+import Foundation
 import Testing
 @testable import SkylineCore
 
@@ -64,6 +66,7 @@ struct RidgeRasterTests {
         return steps
     }
 
+#if canImport(CoreGraphics)
     @Test func smoothTileMatchesIEMCoverageButIsNotBlocky() throws {
         let r = try Self.raster()
         let smooth = r.renderTile(z: Self.tile.z, x: Self.tile.x, y: Self.tile.y)
@@ -77,15 +80,29 @@ struct RidgeRasterTests {
         // ~13 px). Smooth contours change on most rows (158).
         #expect(Self.edgeSteps(iem) < 30)
         #expect(Self.edgeSteps(smooth) > 5 * Self.edgeSteps(iem))
-        // Colours stay IEM palette colours (legend still valid).
-        let paletteRGB = Set(r.palette.map { Self.rgb($0.0, $0.1, $0.2) })
-        #expect(Self.usedColours(smooth).isSubset(of: paletteRGB))
+        // Opaque cores stay exact palette colours. Partial alpha is that colour premultiplied
+        // (CGImage is premultipliedLast), quantized to 255 or a multiple of 32.
+        var unmatched = 0, badAlpha = 0
+        for p in stride(from: 0, to: smooth.count, by: 4) {
+            let a = Int(smooth[p + 3])
+            guard a > 0 else { continue }
+            if a != 255 && a % 32 != 0 { badAlpha += 1 }
+            let ok = r.palette.indices.contains { i in
+                !r.noEcho[i]
+                    && Int(r.palette[i].0) * a / 255 == Int(smooth[p])
+                    && Int(r.palette[i].1) * a / 255 == Int(smooth[p + 1])
+                    && Int(r.palette[i].2) * a / 255 == Int(smooth[p + 2])
+            }
+            if !ok { unmatched += 1 }
+        }
+        #expect(unmatched == 0 && badAlpha == 0)
         // And it still packs and compresses like a downloaded tile (≤ 256 colours, PNG ≪ RGBA).
         let img = try #require(RadarQC.image(rgba: smooth))
         let encoded = try #require(RadarQC.png(img))
         #expect(encoded.count < 256 * 256)
         #expect(RadarTilePacker.pack(img, encoded: encoded).heldBytes <= RadarMemoryBudget.packedTileBytes)
     }
+#endif
 
     // CR #7.3: every core keeps its raw maximum. For each 16×16-cell block of the raster inside the tile,
     // the highest rendered level equals the highest raw level of the cells whose centres fall inside it.
@@ -110,18 +127,24 @@ struct RidgeRasterTests {
             #expect(cells > 0)
             var drawnMax = 0
             for p in Swift.stride(from: 0, to: px.count, by: 4) where px[p + 3] > 0 {
-                // Colour → level; IEM repeats some colours, so take the highest level with that colour.
-                let key = Self.rgb(px[p], px[p + 1], px[p + 2])
-                let lv = r.palette.indices.filter { !r.noEcho[$0] && Self.rgb(r.palette[$0].0, r.palette[$0].1, r.palette[$0].2) == key }.max() ?? 0
+                // Colour → level, undoing premultiplication. IEM repeats some colours, so take the highest.
+                let a = Int(px[p + 3])
+                let lv = r.palette.indices.filter { i in
+                    guard !r.noEcho[i] else { return false }
+                    let c = r.palette[i]
+                    return Int(c.0) * a / 255 == Int(px[p]) && Int(c.1) * a / 255 == Int(px[p + 1]) && Int(c.2) * a / 255 == Int(px[p + 2])
+                }.max() ?? 0
                 drawnMax = max(drawnMax, lv)
             }
             #expect(drawnMax >= rawMax, "z\(z): drawn max \(drawnMax) < raw max \(rawMax)")
-            // And per local maximum: each peak cell's centre pixel shows the peak's own colour.
+            // Each peak cell's centre shows that peak, premultiplied by the soft-alpha ramp (255 at ≥ ~18 dBZ).
             for row in 0..<r.height { for col in 0..<r.width {
                 guard let v = r.echo(row, col), r.isPeak(row, col, v),
                       let (fx, fy) = pixel(lat: r.lat0 + Double(row) * r.dLat, lon: r.lon0 + Double(col) * r.dLon) else { continue }
                 let p = (fy * 256 + fx) * 4, c = r.palette[Int(v)]
-                #expect(px[p + 3] == 255 && px[p] == c.0 && px[p + 1] == c.1 && px[p + 2] == c.2)
+                let a = Int(RidgeRaster.echoAlpha(level: Int(v), cover: 1))
+                #expect(px[p + 3] == a)
+                #expect(px[p] == UInt8(Int(c.0) * a / 255) && px[p + 1] == UInt8(Int(c.1) * a / 255) && px[p + 2] == UInt8(Int(c.2) * a / 255))
             } }
         }
     }
@@ -152,6 +175,7 @@ struct RidgeRasterTests {
     //    none do it is clear. Zero exceptions, across the 40.98°N tile edge (the nearest tile boundary at
     //    every zoom) at z9 and z10.
     // 3. Coverage tracks IEM's own tile row by row (per IEM pixel band, ≤ max(8, 1/12)).
+#if canImport(CoreGraphics)
     @Test func noSeamAt41N() throws {
         let r = try Self.raster()
         let seamRow = (41.01 - r.lat0) / r.dLat
@@ -207,6 +231,7 @@ struct RidgeRasterTests {
             y = e
         }
     }
+#endif
 
     @Test func tilesOutsideTheRasterAreEmpty() throws {
         let r = try Self.raster()

@@ -1,3 +1,4 @@
+#if canImport(Compression)
 import Compression
 import Foundation
 import Testing
@@ -120,3 +121,4 @@ struct PalettePNGFuzzTests {
         #expect(PalettePNG.decode(try RidgeRasterTests.fixture("OKX_N0B_202610161748", "png")) != nil)
     }
 }
+#endif

@@ -71,16 +71,52 @@ public enum RadarQCMask {
         return out
     }
 
-    /// Clears every RGBA pixel of display tile `t` whose spot in the (dilated) mask is 0.
+    /// Coverage of display pixel (x, y) in mask space. Pixel centres are sampled bilinearly so a mask
+    /// fetched at z≤6 (4–16 display pixels per mask pixel) feathers instead of stamping hard squares
+    /// onto light rain. Samples past the mask tile repeat the edge pixel: a fully-on mask does not fade
+    /// the tile border, and a fully-off neighbour does not turn the border on.
+    static func coverage(mask: [UInt8], scale: Int, offsetX: Int, offsetY: Int, x: Int, y: Int) -> Double {
+        let n = RadarQC.tileSize
+        let s = Double(max(scale, 1))
+        let mx = min(Double(n - 1), max(0, Double(offsetX) + (Double(x) + 0.5) / s - 0.5))
+        let my = min(Double(n - 1), max(0, Double(offsetY) + (Double(y) + 0.5) / s - 0.5))
+        let x0 = min(n - 1, max(0, Int(mx.rounded(.down))))
+        let y0 = min(n - 1, max(0, Int(my.rounded(.down))))
+        let x1 = min(n - 1, x0 + 1), y1 = min(n - 1, y0 + 1)
+        let fx = x0 == n - 1 ? 0 : mx - Double(x0)
+        let fy = y0 == n - 1 ? 0 : my - Double(y0)
+        let v00 = Double(mask[y0 * n + x0]), v10 = Double(mask[y0 * n + x1])
+        let v01 = Double(mask[y1 * n + x0]), v11 = Double(mask[y1 * n + x1])
+        let top = v00 * (1 - fx) + v10 * fx
+        let bot = v01 * (1 - fx) + v11 * fx
+        return top * (1 - fy) + bot * fy
+    }
+
+    /// Scales every RGBA pixel of display tile `t` by its bilinear mask coverage. Fully inside stays
+    /// as drawn; fully outside is cleared. The feather (a mask-pixel edge) quantizes alpha to a multiple
+    /// of 32 so the extra partial pixels stay a small PNG. Scale 1 samples pixel centres exactly, so a
+    /// mask at the display zoom is still a hard on/off.
     public static func apply(rgba: inout [UInt8], tile t: TileID, mask: [UInt8]) {
         let n = RadarQC.tileSize
         guard rgba.count == n * n * 4, mask.count == n * n else { return }
         let m = maskTile(for: t)
         for y in 0..<n {
-            let my = m.offsetY + y / m.scale
-            for x in 0..<n where mask[my * n + m.offsetX + x / m.scale] == 0 {
+            for x in 0..<n {
+                let w = coverage(mask: mask, scale: m.scale, offsetX: m.offsetX, offsetY: m.offsetY, x: x, y: y)
                 let p = (y * n + x) * 4
-                rgba[p] = 0; rgba[p + 1] = 0; rgba[p + 2] = 0; rgba[p + 3] = 0
+                let oldA = Int(rgba[p + 3])
+                if w >= 0.999 || oldA == 0 { continue }
+                if w <= 0.001 {
+                    rgba[p] = 0; rgba[p + 1] = 0; rgba[p + 2] = 0; rgba[p + 3] = 0
+                    continue
+                }
+                var a = Int((Double(oldA) * w).rounded())
+                let q = Int((Double(a) / 32).rounded()) * 32
+                a = min(oldA, max(32, q))
+                rgba[p] = UInt8(Int(rgba[p]) * a / oldA)
+                rgba[p + 1] = UInt8(Int(rgba[p + 1]) * a / oldA)
+                rgba[p + 2] = UInt8(Int(rgba[p + 2]) * a / oldA)
+                rgba[p + 3] = UInt8(a)
             }
         }
     }
