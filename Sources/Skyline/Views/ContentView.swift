@@ -11,13 +11,13 @@ struct ContentView: View {
             if store.isMainWindowOpen {
                 windowContent
             } else {
-                // Window closed (menu bar only): nothing heavy stays alive. SwiftUI keeps the closed
-                // window and this root view; the map, radar layers and backgrounds are rebuilt on reopen.
+                // Fallback while the closed window is released. Reopen builds this view again.
                 Color.black
             }
         }
         .background(WindowVisibilityReader(onChange: { visible in store.setMainWindowVisible(visible) },
                                            onOpenChange: { open in store.setMainWindowOpen(open) }))
+        .background(MainWindowRelease())
         .onAppear {
             let open = openWindow
             AppActions.openMainWindow = { open(id: SceneID.main) }

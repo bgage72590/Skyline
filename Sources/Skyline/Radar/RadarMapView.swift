@@ -274,20 +274,35 @@ final class RadarMapContainer: NSView {
     /// The SwiftUI view went away (window closed, radar hidden): give everything heavy back now rather
     /// than when (if) AppKit lets the container go. Idempotent.
     func teardown() {
-        guard !isTornDown, let map = ownedMap else { return }
+        guard !isTornDown else { return }
         isTornDown = true
-        map.delegate = nil
-        radar.releaseAll()
-        alertOverlay.detachClickRecognizer(from: map)
-        map.removeOverlays(map.overlays)
-        map.removeAnnotations(map.annotations)
-        // Break key-view links: AppKit's previous-key-view table holds views strongly.
-        for view in [self, map, radar, rangeRings, stormOverlay, alertOverlay, pin] as [NSView] { view.nextKeyView = nil }
-        superview?.nextKeyView = nil
-        radar.removeFromSuperview()
-        map.removeFromSuperview()
-        ownedMap = nil
-        Self.liveMaps -= 1
+        let host = window
+        breakKeyViewTree()
+        if let map = ownedMap {
+            map.delegate = nil
+            radar.releaseAll()
+            alertOverlay.detachClickRecognizer(from: map)
+            map.removeOverlays(map.overlays)
+            map.removeAnnotations(map.annotations)
+            map.removeFromSuperview()
+            ownedMap = nil
+            Self.liveMaps -= 1
+        }
+        subviews.forEach { $0.removeFromSuperview() }
+        layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
+        wantsLayer = false
+        removeFromSuperview()
+        host?.recalculateKeyViewLoop()
+    }
+
+    /// `previousKeyView` is what kept empty radar shells in AppKit's key-view table after dismantle.
+    private func breakKeyViewTree() {
+        func each(_ view: NSView) {
+            view.breakKeyViewLink()
+            view.subviews.forEach { each($0) }
+        }
+        each(self)
+        superview?.breakKeyViewLink()
     }
 
     private(set) var overscan: CGFloat = 0
@@ -1085,6 +1100,7 @@ final class RadarLayerView: NSView {
         }
         fade.show(target, at: CACurrentMediaTime(), animated: animated)
         shownFrame = target
+        rememberShown(g, target)
         if animated, onScreen, Self.crossfadeEnabled, let map, bounds.width > 1 {
             startFade(g, target, token: token, images: images, visible: map.visibleMapRect)
         } else {
@@ -1099,6 +1115,17 @@ final class RadarLayerView: NSView {
             }
         }
         expandAhead()
+    }
+
+    /// The frame on screen is the one reopen should decode first, so its PNG bytes stay newest in the
+    /// 4 MB closed-window set.
+    private func rememberShown(_ g: Generation, _ i: Int) {
+        guard g.frames.indices.contains(i) else { return }
+        let frame = g.frames[i]
+        for (key, tile) in g.tiles[i] where key.z == zoom {
+            guard let bytes = tile.encodedBytes, let url = frame.url(z: key.z, x: key.x, y: key.y) else { continue }
+            RadarImageCache.shared.rememberEncoded(url, bytes)
+        }
     }
 
     // MARK: Simultaneous crossfade (build 52, reviews M1 / QA X1)
@@ -1566,6 +1593,10 @@ final class RadarLayerView: NSView {
         guard !replacing || g.provisional[i].contains(key), key.z == zoom else { return }
         if provisional { g.provisional[i].insert(key) } else { g.provisional[i].remove(key) }
         g.tiles[i][key] = image
+        if g === active, i == shownFrame, let bytes = image.encodedBytes,
+           let url = g.frames[i].url(z: key.z, x: key.x, y: key.y) {
+            RadarImageCache.shared.rememberEncoded(url, bytes)
+        }
         if !replacing { Self.liveTiles += 1 }
         Self.addedTiles += 1
         if g === active, i == shownFrame { refreshShown(key) }

@@ -589,9 +589,9 @@ final class WeatherStore {
         if visible { Task { await refreshDue() } }
     }
 
-    /// Window closed → menu bar only: stop radar playback, drop the window content (ContentView swaps it
-    /// for an empty view, deallocating the map and layers), trim radar caches, and slow the refresh loop.
-    /// Reopened → rebuild and refresh. Called on the main queue's next turn (never inside layout).
+    /// Window closed → menu bar only: stop radar playback, release the window, trim radar caches, and
+    /// slow the refresh loop. Reopened → a new window, radar prewarmed, then refresh.
+    /// Called on the main queue's next turn (never inside layout).
     func setMainWindowOpen(_ open: Bool) {
         guard open != isMainWindowOpen else { return }
         isMainWindowOpen = open
@@ -601,7 +601,7 @@ final class WeatherStore {
             setMainWindowVisible(false)
             radar.setPlaying(false)
             isScrubbing = false
-            RadarImageCache.shared.trim()
+            RadarImageCache.shared.closeForMenuBar()
             MemoryRelief.soon(after: 5) // after SwiftUI has deallocated the window content
             // MapKit/VectorKit tear their engine down asynchronously; relieve again once that is done.
             DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
@@ -609,6 +609,8 @@ final class WeatherStore {
             }
             // Window gone: retries are only for the menu-bar location.
             for (id, task) in retryTasks where id != menuBarLocation?.id { task.cancel(); retryTasks[id] = nil }
+        } else {
+            RadarImageCache.shared.reopen(frames: radar.frames, shownIndex: radar.index)
         }
         startRefreshLoop() // re-arms with the cadence for the new state (and refreshes what's due now)
     }

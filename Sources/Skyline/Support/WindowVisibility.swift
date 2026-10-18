@@ -94,3 +94,87 @@ struct WindowVisibilityReader: NSViewRepresentable {
         }
     }
 }
+
+/// Releases the main window when it closes, instead of leaving the NSWindow, its hosting view, and
+/// the backing store alive behind an empty root. Reopen goes through `openWindow` and builds a new
+/// one. The menu-bar item, the dropdown panel, and Settings are not this window.
+struct MainWindowRelease: NSViewRepresentable {
+    func makeNSView(context: Context) -> Probe { Probe() }
+    func updateNSView(_ view: Probe, context: Context) { view.arm() }
+
+    static func isMain(_ window: NSWindow) -> Bool {
+        if window is NSPanel { return false }
+        if window.frameAutosaveName.contains("com_apple_SwiftUI_Settings") || window.title.hasPrefix("Settings") {
+            return false
+        }
+        return window.identifier?.rawValue.hasPrefix(SceneID.main) == true || window.title == "Skyline"
+    }
+
+    /// Drops radar shells (including ones AppKit's key-view table is holding), the hosting view's
+    /// layer tree, and the content view. `isReleasedWhenClosed` lets AppKit free the NSWindow.
+    static func strip(_ window: NSWindow) {
+        guard isMain(window), !window.isVisible else { return }
+        window.isReleasedWhenClosed = true
+        var containers: [RadarMapContainer] = []
+        func collect(_ view: NSView?) {
+            guard let view else { return }
+            if let container = view as? RadarMapContainer { containers.append(container) }
+            view.subviews.forEach { collect($0) }
+        }
+        collect(window.contentView)
+        containers.forEach { $0.teardown() }
+        window.initialFirstResponder = nil
+        if let content = window.contentView {
+            func releaseLayers(_ view: NSView) {
+                view.breakKeyViewLink()
+                view.layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
+                view.wantsLayer = false
+                view.subviews.forEach { releaseLayers($0) }
+            }
+            releaseLayers(content)
+            content.subviews.forEach { $0.removeFromSuperview() }
+        }
+        window.recalculateKeyViewLoop()
+        window.contentViewController = nil
+        window.contentView = NSView(frame: .zero)
+    }
+
+    final class Probe: NSView {
+        private var observer: NSObjectProtocol?
+
+        func arm() {
+            guard let window, MainWindowRelease.isMain(window) else { return }
+            window.isReleasedWhenClosed = true
+            guard observer == nil else { return }
+            observer = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak window] _ in
+                MainActor.assumeIsolated {
+                    window?.isReleasedWhenClosed = true
+                    // After the close notification and the empty-root swap, drop whatever is left.
+                    DispatchQueue.main.async {
+                        DispatchQueue.main.async { [weak window] in
+                            guard let window else { return }
+                            MainWindowRelease.strip(window)
+                        }
+                    }
+                }
+            }
+        }
+
+        deinit {
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+        }
+    }
+}
+
+extension NSView {
+    /// AppKit's key-view table retains `previousKeyView` strongly, which is what kept empty radar
+    /// containers alive after the map was torn down.
+    func breakKeyViewLink() {
+        let sel = Selector(("previousKeyView"))
+        if responds(to: sel), let previous = perform(sel)?.takeUnretainedValue() as? NSView, previous.nextKeyView === self {
+            previous.nextKeyView = nil
+        }
+        nextKeyView = nil
+    }
+}
