@@ -101,7 +101,7 @@ struct RadarQCTests {
         #expect(rgba[(10 * 256 + 32) * 4 + 3] == 64)
         #expect(rgba[(10 * 256 + 80) * 4 + 3] == 0 && rgba[(255 * 256 + 255) * 4 + 3] == 0)
         // A fully-on mask does not fade the display tile's border (edge samples repeat the edge pixel).
-        var full = [UInt8](repeating: 1, count: 256 * 256)
+        let full = [UInt8](repeating: 1, count: 256 * 256)
         var edge = [UInt8](repeating: 180, count: 256 * 256 * 4)
         RadarQCMask.apply(rgba: &edge, tile: T(z: 8, x: 72, y: 92), mask: full)
         #expect(edge[3] == 180 && edge[(255 * 256 + 255) * 4 + 3] == 180)
