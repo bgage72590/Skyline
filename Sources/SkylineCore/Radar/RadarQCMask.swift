@@ -140,6 +140,46 @@ public enum RadarProvisionalRetry {
     public static func shouldRetry(attempts: Int) -> Bool { attempts < maxAttempts }
 }
 
+/// Dilated QC masks are mostly zeros. RLE keeps 96 of them under half a megabyte, so a reopen
+/// can apply the mask without the nine MRMS fetches that used to miss and back off.
+enum MaskRLE {
+    static func compress(_ bytes: [UInt8]) -> Data {
+        if bytes.allSatisfy({ $0 == 0 }) { return Data([0]) }
+        if bytes.allSatisfy({ $0 == 1 }) { return Data([1]) }
+        var out = Data([2])
+        var i = 0
+        while i < bytes.count {
+            let v = bytes[i]
+            var n = 1
+            let limit = min(bytes.count, i + 65535)
+            while i + n < limit, bytes[i + n] == v { n += 1 }
+            out.append(v)
+            out.append(UInt8(n & 0xFF))
+            out.append(UInt8((n >> 8) & 0xFF))
+            i += n
+        }
+        return out
+    }
+
+    static func decompress(_ data: Data, count: Int = RadarQC.tileSize * RadarQC.tileSize) -> [UInt8]? {
+        guard count > 0, let first = data.first else { return nil }
+        if first == 0 { return [UInt8](repeating: 0, count: count) }
+        if first == 1 { return [UInt8](repeating: 1, count: count) }
+        guard first == 2 else { return nil }
+        var out: [UInt8] = []
+        out.reserveCapacity(count)
+        let b = [UInt8](data)
+        var i = 1
+        while i + 2 < b.count, out.count < count {
+            let n = Int(b[i + 1]) | (Int(b[i + 2]) << 8)
+            if n == 0 || out.count + n > count { return nil }
+            out.append(contentsOf: repeatElement(b[i], count: n))
+            i += 3
+        }
+        return out.count == count ? out : nil
+    }
+}
+
 public actor RadarQCMaskStore {
     public typealias Fetch = @Sendable (URL) async -> [UInt8]?
 
@@ -150,31 +190,57 @@ public actor RadarQCMaskStore {
     private var rawOrder: [String] = []
     private var inFlight: [String: Task<[UInt8]?, Never>] = [:]
     private var rawInFlight: [String: Task<[UInt8]?, Never>] = [:]
-    private let maxMasks: Int, maxRaw: Int
+    private var packed: [String: Data] = [:]
+    private var packedOrder: [String] = []
+    private var packedBytes = 0
+    private let maxMasks: Int, maxRaw: Int, compressedBudget: Int
     public private(set) var fetches = 0
+    /// Half a megabyte of RLE masks. The decoded copies are what `cachedCount` reports.
+    public static let defaultCompressedBudget = 512 * 1024
+    public var compressedBytes: Int { packedBytes }
 
-    /// ~64 KB per entry: 96 dilated masks + 160 raw tiles ≈ 16 MB at most.
-    /// Window closed: drop the cached masks and raw alpha tiles (re-fetched on demand).
+    /// Window closed: drop decoded masks and raw alpha (~64 KB each). The RLE copies stay, so the
+    /// next ask does not refetch the 3×3 neighbourhood.
     public func purge() {
         masks = [:]; maskOrder = []
         raw = [:]; rawOrder = []
     }
     public var cachedCount: Int { masks.count + raw.count }
 
-    public init(maxMasks: Int = 96, maxRaw: Int = 160, fetchAlpha: @escaping Fetch) {
-        self.fetchAlpha = fetchAlpha; self.maxMasks = maxMasks; self.maxRaw = maxRaw
+    /// Decode retained masks back into the hot cache. `template` limits that to one frame's masks.
+    public func prewarm(template: String?) {
+        for key in packedOrder where template == nil || key.hasPrefix((template ?? "") + "|") {
+            guard masks[key] == nil, let data = packed[key], let bytes = MaskRLE.decompress(data) else { continue }
+            remember(&masks, &maskOrder, key, bytes, limit: maxMasks)
+        }
+    }
+
+    public init(maxMasks: Int = 96, maxRaw: Int = 160, compressedBudget: Int = RadarQCMaskStore.defaultCompressedBudget,
+                fetchAlpha: @escaping Fetch) {
+        self.fetchAlpha = fetchAlpha
+        self.maxMasks = maxMasks
+        self.maxRaw = maxRaw
+        self.compressedBudget = compressedBudget
     }
 
     /// The dilated mask for `maskTemplate` (`…/{z}/{x}/{y}.png`) at mask tile `t`, or nil (fail open).
     public func mask(template: String, tile t: RadarQCMask.TileID) async -> [UInt8]? {
         let key = "\(template)|\(t.z)/\(t.x)/\(t.y)"
         if let m = masks[key] { return m }
+        if let data = packed[key], let m = MaskRLE.decompress(data) {
+            remember(&masks, &maskOrder, key, m, limit: maxMasks)
+            touchPacked(key)
+            return m
+        }
         if let task = inFlight[key] { return await task.value }
         let task = Task { await self.build(template: template, tile: t) }
         inFlight[key] = task
         let m = await task.value
         inFlight[key] = nil
-        if let m { remember(&masks, &maskOrder, key, m, limit: maxMasks) }
+        if let m {
+            remember(&masks, &maskOrder, key, m, limit: maxMasks)
+            storePacked(key, m)
+        }
         return m
     }
 
@@ -222,5 +288,29 @@ public actor RadarQCMaskStore {
         if dict[k] == nil { order.append(k) }
         dict[k] = v
         while order.count > limit { dict[order.removeFirst()] = nil }
+    }
+
+    private func storePacked(_ key: String, _ mask: [UInt8]) {
+        guard mask.count == RadarQC.tileSize * RadarQC.tileSize else { return }
+        let data = MaskRLE.compress(mask)
+        guard data.count <= compressedBudget else { return }
+        if let old = packed.removeValue(forKey: key) {
+            packedBytes -= old.count
+            packedOrder.removeAll { $0 == key }
+        }
+        while packedBytes + data.count > compressedBudget, !packedOrder.isEmpty {
+            let oldest = packedOrder.removeFirst()
+            if let old = packed.removeValue(forKey: oldest) { packedBytes -= old.count }
+        }
+        guard packedBytes + data.count <= compressedBudget else { return }
+        packed[key] = data
+        packedOrder.append(key)
+        packedBytes += data.count
+    }
+
+    private func touchPacked(_ key: String) {
+        guard packed[key] != nil else { return }
+        packedOrder.removeAll { $0 == key }
+        packedOrder.append(key)
     }
 }
