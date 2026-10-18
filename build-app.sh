@@ -58,10 +58,12 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 cp "$ROOT/scripts/install-verified.sh" "$APP/Contents/Resources/install-verified.sh"
 chmod +x "$APP/Contents/Resources/install-verified.sh"
 # VERSION.txt inside the app too (QA, build 94: /Applications/Skyline.app had none), so the installed
-# copy says which build and commit it is. Written before signing, so the signature covers it.
+# copy says which build and commit it is. Same three lines as the iCloud copy ("published", not a
+# second timestamp). Written before signing, so both normal and --no-zip builds include it, and the
+# signature covers it. The in-app updater reads Skyline.version (the build number), not this file.
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 DIRTY="$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null | grep -q . && echo ' (uncommitted changes)' || true)"
-printf 'Skyline build %s\ncommit %s%s\nbuilt %s\n' "$GIT_REV" "$COMMIT" "$DIRTY" "$(date '+%Y-%m-%d %H:%M %Z')" \
+printf 'Skyline build %s\ncommit %s%s\npublished %s\n' "$GIT_REV" "$COMMIT" "$DIRTY" "$(date '+%Y-%m-%d %H:%M %Z')" \
   > "$APP/Contents/Resources/VERSION.txt"
 
 # Widget extension (T22): Contents/PlugIns/SkylineWidget.appex, a sandboxed WidgetKit extension that
