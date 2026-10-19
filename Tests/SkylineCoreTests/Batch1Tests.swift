@@ -116,7 +116,7 @@ final class Batch1Tests: XCTestCase {
         let om = try OpenMeteoResponse.decode(try Fixture.data("om_nyc"))
         let nws = try NWSPeriod.decodeList(try Fixture.data("nws_forecast"))
         let daily = ForecastBlender.blendDaily(openMeteo: om, nwsPeriods: nws, timeZone: ny)
-        XCTAssertEqual(daily[0].high, wmean([(18.4, 3), (16.1, 1.5), (14.9, 1), (fToC(66), 2.5)]), accuracy: 1e-6)
+        XCTAssertEqual(daily[0].high, wmean([(18.4, 3), (16.1, 1.5), (14.9, 1.5), (fToC(66), 2.5)]), accuracy: 1e-6)
         let noaaRows = daily[0].sources.filter { $0.name.contains("NOAA") || $0.name.contains("Best Match") }
         XCTAssertEqual(noaaRows.count, 1, "\(daily[0].sources.map(\.name))")
     }

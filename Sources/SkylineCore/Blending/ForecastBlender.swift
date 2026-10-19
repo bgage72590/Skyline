@@ -8,11 +8,13 @@ import Foundation
 /// * Open-Meteo `best_match` already selects the best regional model per location, so it gets a high base weight.
 ///   In the US it resolves to the same NOAA numbers as `gfs_seamless` (and `gfs_hrrr` for ~48 h), so identical
 ///   NOAA-family values are collapsed into one sample before averaging (`dedupedFamily`): one model, one vote.
-/// * NOAA HRRR (3 km, hourly-updating, radar-assimilating) dominates the first ~18 h in the US, then fades
-///   out by 36 h where its skill drops to global-model level.
+/// * NOAA HRRR (3 km, hourly-updating, radar-assimilating) dominates the first ~18 h for wind and precip,
+///   fading to 0.5 by 36 h. Temperature (and apparent temperature, dew point, daily high/low) keeps full
+///   weight only through 12 h, then fades to 0.5 by 30 h.
 /// * The NWS gridded forecast (forecaster-edited National Blend of Models) gets the highest steady weight in
 ///   the US because it is bias-corrected against local observations.
-/// * ECMWF IFS gets more weight than GFS/ICON: it has the best verified global skill in the medium range.
+/// * ECMWF IFS gets more weight than GFS. ICON's temperature weight is 1.5 in the US and 1.0 elsewhere;
+///   inside a narrow Sint Maarten box its wind and gust weight is 6.0.
 /// Categorical fields (weather code, sunrise...) are not averaged: they come from the best available single
 /// source and are then reconciled with the blended precipitation probability so icons and numbers agree.
 public enum ForecastBlender {
@@ -30,11 +32,29 @@ public enum ForecastBlender {
         case .model(.ecmwf): return 1.5
         case .model(.gfs): return 1.0
         case .model(.icon): return 1.0
-        case .model(.hrrr):
-            if leadHours <= 18 { return 3.0 }
-            if leadHours >= 36 { return 0.5 }
-            return 3.0 - (leadHours - 18) / 18 * 2.5
+        case .model(.hrrr): return hrrrWindWeight(leadHours: leadHours)
         }
+    }
+
+    /// HRRR wind (and the precip-amount tail): full weight through 18 h, linear to 0.5 at 36 h.
+    public static func hrrrWindWeight(leadHours: Double) -> Double {
+        if leadHours <= 18 { return 3.0 }
+        if leadHours >= 36 { return 0.5 }
+        return 3.0 - (leadHours - 18) / 18 * 2.5
+    }
+
+    /// HRRR temperature, apparent temperature, dew point, and daily high/low: full weight through 12 h,
+    /// linear to 0.5 at 30 h, then held at 0.5. Daily highs/lows evaluate this at lead `day * 24 + 12`.
+    public static func hrrrTemperatureWeight(leadHours: Double) -> Double {
+        if leadHours <= 12 { return 3.0 }
+        if leadHours >= 30 { return 0.5 }
+        return 3.0 - (leadHours - 12) / 18 * 2.5
+    }
+
+    /// Sint Maarten / Saint Martin and the immediately adjacent small islands. Not the wider Caribbean.
+    public static func isSmallIslandWindGate(_ coordinate: Coordinate) -> Bool {
+        coordinate.latitude >= 17.0 && coordinate.latitude <= 18.6
+            && coordinate.longitude >= -63.5 && coordinate.longitude <= -62.5
     }
 
     /// Base weight for precipitation (probability and amount). In the first hours rain is a nowcasting
@@ -59,11 +79,30 @@ public enum ForecastBlender {
     }
 
     /// Base weight for a variable (precipitation uses the short-range specialist weights).
-    public static func weight(_ source: Source, variable: String, leadHours: Double) -> Double {
+    /// `coordinate` selects the US ICON temperature weight and the narrow-island ICON wind weight.
+    /// Omit it and those location rules stay at the global defaults (ICON 1.0).
+    public static func weight(_ source: Source, variable: String, leadHours: Double, coordinate: Coordinate? = nil) -> Double {
         switch variable {
-        case "precipitation_probability", "precipitation", "snowfall": precipitationWeight(source, leadHours: leadHours)
-        default: weight(source, leadHours: leadHours)
+        case "precipitation_probability", "precipitation", "snowfall",
+             "precipitation_probability_max", "precipitation_sum", "snowfall_sum":
+            return precipitationWeight(source, leadHours: leadHours)
+        default:
+            return locationWeight(source, variable: variable, leadHours: leadHours, coordinate: coordinate)
         }
+    }
+
+    /// Temperature-type HRRR curve, US ICON temperature, and the Sint Maarten ICON wind/gust bump.
+    /// Wind and precip HRRR stay on `hrrrWindWeight` / `precipitationWeight`.
+    static func locationWeight(_ source: Source, variable: String, leadHours: Double, coordinate: Coordinate?) -> Double {
+        let kind = BlendWeights.kind(of: variable)
+        if case .model(.hrrr) = source, kind == .temperature {
+            return hrrrTemperatureWeight(leadHours: leadHours)
+        }
+        if case .model(.icon) = source, let coordinate {
+            if kind == .temperature, coordinate.isLikelyInNWSCoverage { return 1.5 }
+            if kind == .wind, isSmallIslandWindGate(coordinate) { return 6.0 }
+        }
+        return weight(source, leadHours: leadHours)
     }
 
     /// How much the 15-minute nowcast counts in an hour's precipitation (amount and probability):
@@ -94,6 +133,7 @@ public enum ForecastBlender {
                                    minutely: [MinutelyPrecipitation] = []) -> [HourlyForecast] {
         let times = om.hourlyTimes
         guard !times.isEmpty else { return [] }
+        let coordinate = Coordinate(latitude: om.latitude, longitude: om.longitude)
         let models = om.modelsWithData
         let nwsByHour = Dictionary(nwsHourly.map { (hourKey($0.startTime), $0) }, uniquingKeysWith: { a, _ in a })
         // Open-Meteo's precipitation fields at time T cover the *preceding* hour (T-1, T]; the NWS hourly
@@ -129,7 +169,7 @@ public enum ForecastBlender {
             let nwsPrecip = nwsByEndHour[hourKey(time)]
 
             func w(_ source: Source, _ variable: String) -> Double {
-                weight(source, variable: variable, leadHours: lead)
+                weight(source, variable: variable, leadHours: lead, coordinate: coordinate)
                     * learned.multiplier(variable: variable, VerificationSource(source), leadHours: lead)
             }
             func samples(_ variable: String, nwsValue: Double? = nil) -> [(value: Double?, weight: Double)] {
@@ -318,6 +358,7 @@ public enum ForecastBlender {
             }
         }
         let isUS = !nwsPeriods.isEmpty
+        let coordinate = Coordinate(latitude: om.latitude, longitude: om.longitude)
 
         func col(_ v: String, _ m: ForecastModel) -> [Double?] { om.dailyColumn(v, model: m) ?? [] }
         func at(_ c: [Double?], _ i: Int) -> Double? { i < c.count ? c[i] : nil }
@@ -339,14 +380,24 @@ public enum ForecastBlender {
             }
             return best
         }
-        func baseDailyWeight(_ m: ForecastModel, _ dayIndex: Int) -> Double {
-            if m == .hrrr { return dayIndex == 0 ? 3.0 : (dayIndex == 1 ? 1.0 : 0) } // later days are truncated
-            return weight(.model(m), leadHours: Double(dayIndex) * 24 + 12)
+        func baseDailyWeight(_ m: ForecastModel, _ dayIndex: Int, _ kind: BlendWeights.Kind) -> Double {
+            let lead = Double(dayIndex) * 24 + 12
+            if m == .hrrr {
+                // Wind and precip keep today's step (3 / 1 / 0). Temperature uses the 12 h → 30 h curve
+                // at this day's representative lead.
+                if kind == .temperature { return hrrrTemperatureWeight(leadHours: lead) }
+                return dayIndex == 0 ? 3.0 : (dayIndex == 1 ? 1.0 : 0)
+            }
+            if m == .icon {
+                if kind == .temperature, coordinate.isLikelyInNWSCoverage { return 1.5 }
+                if kind == .wind, isSmallIslandWindGate(coordinate) { return 6.0 }
+            }
+            return weight(.model(m), leadHours: lead)
         }
         // Day 0 is scored like the 6–24 h bucket, day 1 like day 2, later days like day 3+.
         func learnedLead(_ dayIndex: Int) -> Double { dayIndex == 0 ? 12 : Double(dayIndex) * 24 + 12 }
         func dailyWeight(_ m: ForecastModel, _ dayIndex: Int, _ kind: BlendWeights.Kind = .temperature) -> Double {
-            baseDailyWeight(m, dayIndex) * learned.multiplier(kind, VerificationSource(m), leadHours: learnedLead(dayIndex))
+            baseDailyWeight(m, dayIndex, kind) * learned.multiplier(kind, VerificationSource(m), leadHours: learnedLead(dayIndex))
         }
         var copyCache: [String: Bool] = [:]
         func columnCopy(_ v: String) -> Bool {
@@ -458,8 +509,14 @@ public enum ForecastBlender {
                 sunrise: firstValue("sunrise", i).map { Date(timeIntervalSince1970: $0) },
                 sunset: firstValue("sunset", i).map { Date(timeIntervalSince1970: $0) },
                 uvIndexMax: firstValue("uv_index_max", i),
-                windSpeedMax: weightedMean(models.map { (value: at(col("wind_speed_10m_max", $0), i), weight: dailyWeight($0, i, .wind)) }),
-                windGustMax: weightedMean(models.map { (value: at(col("wind_gusts_10m_max", $0), i), weight: dailyWeight($0, i, .wind)) }),
+                // Same NOAA de-dup as highs, and HRRR left out: its daily wind only covers part of the day
+                // (the same reason `precipitation_sum` skips it). NWS wind is not a daily input.
+                windSpeedMax: weightedMean(dedupedFamily(models.filter { $0 != .hrrr }.map {
+                    (model: $0, value: at(col("wind_speed_10m_max", $0), i), weight: dailyWeight($0, i, .wind))
+                }, bestMatchIsCopy: bmCopy("wind_speed_10m_max"))),
+                windGustMax: weightedMean(dedupedFamily(models.filter { $0 != .hrrr }.map {
+                    (model: $0, value: at(col("wind_gusts_10m_max", $0), i), weight: dailyWeight($0, i, .wind))
+                }, bestMatchIsCopy: bmCopy("wind_gusts_10m_max"))),
                 windDirectionDominant: firstValue("wind_direction_10m_dominant", i),
                 summary: (highP ?? lowP).map { $0.detailedForecast.isEmpty ? $0.shortForecast : $0.detailedForecast },
                 highSpread: highValues.count > 1 ? highValues.max()! - highValues.min()! : nil)
