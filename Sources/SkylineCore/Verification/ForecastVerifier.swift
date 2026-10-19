@@ -123,14 +123,14 @@ public actor ForecastVerifier {
     }
 
     /// Fetches observations for due forecasts (hourly at most) and pairs them.
-    public func verifyIfDue(key: String, stationsURL: URL?) async {
+    public func verifyIfDue(key: String, stationsURL: URL?, near forecastPoint: Coordinate? = nil) async {
         load()
         let t = now()
         if let last = meta[key]?.lastObsCheck, t.timeIntervalSince(last) < Self.observationInterval { return }
         let due = pending.filter { $0.loc == key && $0.valid <= t.addingTimeInterval(-20 * 60) }
         guard !due.isEmpty else { return }
         meta[key, default: Meta()].lastObsCheck = t
-        guard let station = await station(for: key, stationsURL: stationsURL) else { saveMeta(); return }
+        guard let station = await station(for: key, stationsURL: stationsURL, near: forecastPoint) else { saveMeta(); return }
         let start = max(due.map(\.valid).min()!.addingTimeInterval(-70 * 60), t.addingTimeInterval(-3 * 86400))
         guard let url = Self.observationsURL(station: station, start: start),
               let data = try? await client.get(url, headers: ["Accept": "application/geo+json"]),
@@ -298,15 +298,15 @@ public actor ForecastVerifier {
         return s
     }
 
-    private func station(for key: String, stationsURL: URL?) async -> String? {
+    private func station(for key: String, stationsURL: URL?, near forecastPoint: Coordinate?) async -> String? {
         if let id = meta[key]?.stationID, let fetched = meta[key]?.stationFetched,
            now().timeIntervalSince(fetched) < 7 * 86400 { return id }
         guard let stationsURL, let data = try? await client.get(stationsURL, headers: ["Accept": "application/geo+json"]),
-              let first = try? NWSObservationParser.firstStation(data) else { return meta[key]?.stationID }
-        meta[key, default: Meta()].stationID = first.id
-        meta[key]?.stationName = first.name
+              let chosen = try? NWSObservationParser.verificationStation(data, near: forecastPoint) else { return meta[key]?.stationID }
+        meta[key, default: Meta()].stationID = chosen.id
+        meta[key]?.stationName = chosen.name
         meta[key]?.stationFetched = now()
-        return first.id
+        return chosen.id
     }
 
     static func observationsURL(station: String, start: Date) -> URL? {

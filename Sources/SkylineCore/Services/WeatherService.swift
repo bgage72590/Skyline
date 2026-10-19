@@ -278,7 +278,7 @@ public actor WeatherService {
                                                           nwsHourly: nwsHourly, blended: hourly)
                     await verifier.record(records, key: key)
                 }
-                await verifier.verifyIfDue(key: key, stationsURL: stations)
+                await verifier.verifyIfDue(key: key, stationsURL: stations, near: coord)
             }
         }
 

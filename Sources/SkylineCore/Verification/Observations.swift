@@ -57,14 +57,83 @@ public enum NWSObservationParser {
         .sorted { $0.time < $1.time }
     }
 
-    /// First station id from a gridpoint `/stations` list.
+    struct GridpointStation {
+        var id: String
+        var name: String?
+        var provider: String?
+        var coordinate: Coordinate?
+    }
+
+    /// First station id from a gridpoint `/stations` list. Kept for the no-ASOS fallback.
     public static func firstStation(_ data: Data) throws -> (id: String, name: String?)? {
+        let list = try gridpointStations(data)
+        return list.first.map { ($0.id, $0.name) }
+    }
+
+    /// Nearest ASOS airport on the gridpoint list (great-circle to `point`).
+    /// An ASOS airport has an ICAO-style METAR id, an NWS provider of `ASOS` / `ASOS-…`, and an airport name.
+    /// When none is present, returns the first station — the previous behavior.
+    public static func verificationStation(_ data: Data, near point: Coordinate?) throws -> (id: String, name: String?)? {
+        let list = try gridpointStations(data)
+        guard let first = list.first else { return nil }
+        let airports = list.filter { isASOSAirport($0) }
+        guard let point, !airports.isEmpty else { return (first.id, first.name) }
+        let located = airports.filter { $0.coordinate != nil }
+        let pool = located.isEmpty ? airports : located
+        let best = pool.min { a, b in
+            guard let ac = a.coordinate, let bc = b.coordinate else { return false }
+            return NexradStation.distanceKm(point, ac) < NexradStation.distanceKm(point, bc)
+        }
+        let chosen = best ?? first
+        return (chosen.id, chosen.name)
+    }
+
+    /// ICAO-style METAR id (`KNYC`, `KLGA`, `K12N`) whose NWS `provider` is ASOS and whose name is an airport.
+    /// Central Park (`KNYC`, ASOS, not an airport) and HADS/RAWS ids (`SFOC1`) do not qualify.
+    public static func isASOSAirport(id: String, provider: String?, name: String?) -> Bool {
+        let ident = id.uppercased()
+        guard ident.range(of: "^[A-Z][A-Z0-9]{3}$", options: .regularExpression) != nil else { return false }
+        let prov = (provider ?? "").uppercased()
+        guard prov == "ASOS" || prov.hasPrefix("ASOS-") || prov.hasPrefix("ASOS ") else { return false }
+        return isAirportName(name ?? "")
+    }
+
+    static func isASOSAirport(_ station: GridpointStation) -> Bool {
+        isASOSAirport(id: station.id, provider: station.provider, name: station.name)
+    }
+
+    /// Airport wording used by api.weather.gov station names (plus naval air stations and airparks).
+    static func isAirportName(_ name: String) -> Bool {
+        let n = name.lowercased()
+        let phrases = ["airport", "airpark", "airfield", "air field", "air force", "air station", "airbase", "air base", "flight"]
+        if phrases.contains(where: { n.contains($0) }) { return true }
+        let words = n.split { !$0.isLetter }.map(String.init)
+        return words.contains("field") || words.contains("afb") || words.contains("aaf")
+    }
+
+    static func gridpointStations(_ data: Data) throws -> [GridpointStation] {
         struct List: Decodable {
-            struct F: Decodable { struct P: Decodable { var stationIdentifier: String; var name: String? }; var properties: P }
+            struct Geom: Decodable { var coordinates: [Double]? }
+            struct F: Decodable {
+                struct P: Decodable {
+                    var stationIdentifier: String?
+                    var name: String?
+                    var provider: String?
+                }
+                var properties: P
+                var geometry: Geom?
+            }
             var features: [F]
         }
         let list = try JSONDecoder().decode(List.self, from: data)
-        return list.features.first.map { ($0.properties.stationIdentifier, $0.properties.name) }
+        return list.features.compactMap { f in
+            guard let id = f.properties.stationIdentifier, !id.isEmpty else { return nil }
+            var coordinate: Coordinate?
+            if let c = f.geometry?.coordinates, c.count >= 2 {
+                coordinate = Coordinate(latitude: c[1], longitude: c[0])
+            }
+            return GridpointStation(id: id, name: f.properties.name, provider: f.properties.provider, coordinate: coordinate)
+        }
     }
 }
 
