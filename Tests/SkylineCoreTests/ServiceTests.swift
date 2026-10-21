@@ -29,6 +29,8 @@ final class ServiceTests: XCTestCase {
         // Batch 5: same stop rule as the rain notification (first dry quarter followed by 30 dry minutes).
         XCTAssertEqual(report.nowcastSummary, "Rain stopping in about 90 min")
         XCTAssertTrue(client.requests.contains { $0.absoluteString.contains("models=best_match,gfs_hrrr") })
+        XCTAssertTrue(client.requests.contains { $0.absoluteString.contains("minutely_15") }, "OM pair half B")
+        XCTAssertEqual(report.forecastMode, .blend)
     }
 
     func testNonUSReportSkipsNWS() async throws {
@@ -51,7 +53,7 @@ final class ServiceTests: XCTestCase {
 
         _ = try await service.report(for: nyc)
         let firstCount = client.requests.count
-        XCTAssertEqual(firstCount, 8) // OM, AQ, points, forecast, hourly, alerts, SPC day 1 + 2 (batch 5)
+        XCTAssertEqual(firstCount, 9) // OM A+B, AQ, points, forecast, hourly, alerts, SPC day 1 + 2
 
         _ = try await service.report(for: nyc)
         XCTAssertEqual(client.requests.count, firstCount, "second call within TTL must be served from cache")
@@ -99,10 +101,12 @@ final class ServiceTests: XCTestCase {
     }
 
     func testEndpointsAreKeyless() {
-        let url = Endpoints.openMeteoForecast(Coordinate(latitude: 40.71234567, longitude: -74.0), models: [.bestMatch, .ecmwf])
+        let url = Endpoints.openMeteoForecastA(Coordinate(latitude: 40.71234567, longitude: -74.0), models: [.bestMatch, .ecmwf])
         XCTAssertTrue(url.absoluteString.contains("latitude=40.7123"))
         XCTAssertTrue(url.absoluteString.contains("timeformat=unixtime"))
         XCTAssertFalse(url.absoluteString.lowercased().contains("key"))
+        let urlB = Endpoints.openMeteoForecastB(Coordinate(latitude: 40.71234567, longitude: -74.0))
+        XCTAssertTrue(urlB.absoluteString.contains("minutely_15"))
         XCTAssertEqual(Endpoints.nwsPoint(Coordinate(latitude: 40.71, longitude: -74.01)).absoluteString,
                        "https://api.weather.gov/points/40.7100,-74.0100")
     }

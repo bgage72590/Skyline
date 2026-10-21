@@ -21,6 +21,15 @@ public enum DataAge {
         Double(max(30, refreshMinutes + 15)) * 60
     }
 
+    /// Fresh-cadence cities keep `staleAfter(refreshMinutes:)`. Background cities use background TTL + 15 min
+    /// so a row isn't dimmed at 30 min while its OM pair is still within `TTL.background`.
+    public static func staleAfter(refreshMinutes: Int, role: RefreshPlanner.Role) -> TimeInterval {
+        switch role {
+        case .freshCadence: return staleAfter(refreshMinutes: refreshMinutes)
+        case .background: return WeatherService.TTL.background + 15 * 60
+        }
+    }
+
     /// Older than this, even data already on screen is withdrawn (the forecast offline-cache cap).
     public static let maxDisplayAge: TimeInterval = WeatherService.MaxStale.forecast
 }

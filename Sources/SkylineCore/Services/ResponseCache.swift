@@ -97,6 +97,14 @@ public actor ResponseCache {
         }
     }
 
+    /// Drops a key from memory and disk (quota markers, tests). Does not change the on-disk format.
+    public func remove(_ key: String) {
+        memory[key] = nil
+        if let i = recency.firstIndex(of: key) { recency.remove(at: i) }
+        guard let url = fileURL(key) else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
     private func entry(_ key: String) -> Entry? {
         if let e = memory[key] { touch(key); return e }
         guard let url = fileURL(key), let raw = try? Data(contentsOf: url),

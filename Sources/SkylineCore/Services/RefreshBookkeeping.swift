@@ -17,13 +17,28 @@ public enum RefreshBookkeeping {
         public var notBefore: Date?
         public var clearError: Bool
         /// Seconds to the first retry when it should come sooner than the ladder (nil = ladder).
-        public var quickRetry: TimeInterval? = nil
+        public var quickRetry: TimeInterval?
+        /// False while daily-limited for non-retry-owner cities (no per-city retry storm).
+        public var scheduleRetry: Bool
+
+        public init(message: String, notBefore: Date?, clearError: Bool,
+                    quickRetry: TimeInterval? = nil, scheduleRetry: Bool = true) {
+            self.message = message; self.notBefore = notBefore; self.clearError = clearError
+            self.quickRetry = quickRetry; self.scheduleRetry = scheduleRetry
+        }
     }
 
     /// Saved data on screen. A live host back-off schedules the retry at `until` and says when.
+    /// Daily-limit cause uses the quota message and only the retry owner gets `notBefore`.
     public static func afterReport(isOfflineFallback: Bool, cause: FallbackCause? = nil, backoffUntil: Date?,
                                    now: Date = Date(), timeZone: TimeZone = .current,
-                                   locale: Locale = .autoupdatingCurrent) -> FollowUp {
+                                   locale: Locale = .autoupdatingCurrent,
+                                   dailyLimitUntil: Date? = nil, dailyLimitMessage: String? = nil,
+                                   isDailyLimitRetryOwner: Bool = false) -> FollowUp {
+        if cause == .dailyLimit, let message = dailyLimitMessage {
+            return FollowUp(message: message, notBefore: isDailyLimitRetryOwner ? (dailyLimitUntil ?? nil) : nil,
+                            clearError: false, scheduleRetry: isDailyLimitRetryOwner)
+        }
         guard isOfflineFallback else {
             return FollowUp(message: "", notBefore: nil, clearError: true)
         }
@@ -38,15 +53,23 @@ public enum RefreshBookkeeping {
 
     /// A thrown refresh failure (including force during a long back-off).
     public static func afterFailure(_ error: Error, now: Date = Date(), timeZone: TimeZone = .current,
-                                    locale: Locale = .autoupdatingCurrent) -> FollowUp {
-        FollowUp(message: UserFacingError.message(error, now: now, timeZone: timeZone, locale: locale),
-                 notBefore: notBefore(error, now: now), clearError: false)
+                                    locale: Locale = .autoupdatingCurrent,
+                                    dailyLimitUntil: Date? = nil, isDailyLimitRetryOwner: Bool = false) -> FollowUp {
+        if case HTTPError.dailyLimit = error {
+            let until = dailyLimitUntil ?? OpenMeteoQuota.until(after: now, jitter: 0)
+            let message = OpenMeteoQuota.noDataMessage(until: until, now: now, timeZone: timeZone, locale: locale)
+            return FollowUp(message: message, notBefore: isDailyLimitRetryOwner ? until : nil,
+                            clearError: false, scheduleRetry: isDailyLimitRetryOwner)
+        }
+        return FollowUp(message: UserFacingError.message(error, now: now, timeZone: timeZone, locale: locale),
+                        notBefore: notBefore(error, now: now), clearError: false)
     }
 
     public static func notBefore(_ error: Error, now: Date = Date()) -> Date? {
         switch error {
         case HTTPError.throttled(_, _, let after): return after.map { now.addingTimeInterval($0) }
         case HTTPError.backingOff(_, let until): return until
+        case HTTPError.dailyLimit: return nil // callers pass the quota `until` explicitly
         default: return nil
         }
     }
@@ -65,12 +88,15 @@ public enum RefreshBookkeeping {
 
     /// Banner sentence. A scheduled back-off replaces "showing data from …" with the retry clock time.
     /// `offline` = `isReallyOffline`; any other failure says the update failed, not that the Mac is offline.
+    /// Daily-limit messages (OpenMeteoQuota prefix) are returned verbatim.
     public static func bannerLine(offline: Bool, error: String?, dataTime: String) -> String {
+        if let error, error.hasPrefix(OpenMeteoQuota.messagePrefix) { return error }
         if let error, error.contains("retrying at") { return error }
         if offline { return "Offline · showing data from " + dataTime }
         if error != nil { return "Couldn’t update · showing data from " + dataTime }
         return "Showing data from " + dataTime
     }
+
 }
 
 /// Why a report is showing saved data (`WeatherReport.fallbackCause`).
@@ -79,12 +105,16 @@ public enum FallbackCause: String, Codable, Sendable, Equatable {
     case offline
     /// The host said slow down, or Skyline is waiting out its Retry-After.
     case busy
+    /// Open-Meteo free-tier daily request limit.
+    case dailyLimit
     /// Anything else: a dropped connection, a timeout, a server error, unreadable data.
     case unreachable
 
     public init(_ error: Error) {
         if let u = error as? URLError, [.notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff].contains(u.code) {
             self = .offline
+        } else if let h = error as? HTTPError, case .dailyLimit = h {
+            self = .dailyLimit
         } else if let h = error as? HTTPError, case .throttled = h {
             self = .busy
         } else if let h = error as? HTTPError, case .backingOff = h {
@@ -100,7 +130,13 @@ public enum FallbackCause: String, Codable, Sendable, Equatable {
         if let u = error as? URLError {
             return [.networkConnectionLost, .badServerResponse, .cannotConnectToHost, .secureConnectionFailed].contains(u.code)
         }
-        if let h = error as? HTTPError, case .status(let code, _) = h { return code >= 500 }
+        if let h = error as? HTTPError {
+            switch h {
+            case .status(let code, _): return code >= 500
+            case .dailyLimit: return false
+            default: return false
+            }
+        }
         return false
     }
 }
@@ -128,6 +164,7 @@ public enum FetchRetryPolicy {
         if let h = error as? HTTPError {
             switch h {
             case .throttled, .backingOff: return true
+            case .dailyLimit: return false
             case .status(let code, _): return code >= 500
             default: return false
             }

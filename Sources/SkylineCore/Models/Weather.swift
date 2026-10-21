@@ -288,6 +288,12 @@ public struct AirQuality: Codable, Hashable, Sendable {
     }
 }
 
+/// How `WeatherService` assembled the forecast (additive; older snapshots decode with nil).
+public enum ForecastMode: String, Codable, Sendable, Equatable {
+    case blend
+    case nwsOnly
+}
+
 /// Everything the UI needs for one location, produced by `WeatherService`.
 public struct WeatherReport: Codable, Hashable, Sendable {
     public var location: WeatherLocation
@@ -320,6 +326,8 @@ public struct WeatherReport: Codable, Hashable, Sendable {
     public var severeOutlooks: [SevereOutlook] = []
     /// Each model's hourly temperature next to the blend, for the model comparison chart (L18).
     public var modelSeries: [ModelSeries] = []
+    /// How the forecast was assembled. Nil in build-124 snapshots (optional/defaulted).
+    public var forecastMode: ForecastMode? = nil
 
     public init(location: WeatherLocation, fetchedAt: Date, timeZoneIdentifier: String,
                 current: CurrentConditions, hourly: [HourlyForecast], daily: [DailyForecast],

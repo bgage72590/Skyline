@@ -14,7 +14,10 @@ final class FetchReliabilityTests: XCTestCase {
         var holdFirst: Duration = .milliseconds(300)
         var order: [String] { lock.lock(); defer { lock.unlock() }; return _order }
         private func note(_ url: URL) -> Int? {
+            // Count A half only (pair = one forecast unit); B has minutely_15 / current=.
             guard url.host == "api.open-meteo.com" else { return nil }
+            let s = url.absoluteString
+            if s.contains("minutely_15") || s.contains("current=") { return nil }
             let lat = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
                 .first { $0.name == "latitude" }?.value ?? "?"
             lock.lock(); defer { lock.unlock() }
@@ -49,7 +52,10 @@ final class FetchReliabilityTests: XCTestCase {
         private var _order: [String] = []
         var order: [String] { lock.lock(); defer { lock.unlock() }; return _order }
         private func note(_ url: URL) -> Int? {
+            // Count A half only (pair = one forecast unit); B has minutely_15 / current=.
             guard url.host == "api.open-meteo.com" else { return nil }
+            let s = url.absoluteString
+            if s.contains("minutely_15") || s.contains("current=") { return nil }
             let lat = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
                 .first { $0.name == "latitude" }?.value ?? "?"
             lock.lock(); defer { lock.unlock() }
@@ -123,6 +129,7 @@ final class FetchReliabilityTests: XCTestCase {
             private var n = 0, _max = 0
             var maxInFlight: Int { lock.lock(); defer { lock.unlock() }; return _max }
             private func begin(_ u: URL) -> Bool {
+                // Serialize both A and B under the same OM turn; either half counts as in-flight.
                 guard u.host == "api.open-meteo.com" else { return false }
                 lock.lock(); n += 1; _max = max(_max, n); lock.unlock(); return true
             }

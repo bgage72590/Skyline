@@ -84,7 +84,8 @@ public enum PlaceSearch {
     public static func errorMessage(_ error: Error) -> String {
         switch error {
         case is TimedOut: return "Couldn’t search: the place search didn’t answer."
-        case HTTPError.throttled, HTTPError.backingOff: return "Couldn’t search: the place search is busy. Try again in a minute."
+        case HTTPError.throttled, HTTPError.backingOff, HTTPError.dailyLimit:
+            return "Couldn’t search: the place search is busy. Try again in a minute."
         default: return "Couldn’t search. " + UserFacingError.message(error)
         }
     }

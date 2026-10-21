@@ -36,7 +36,15 @@ final class MockHTTPClient: HTTPClient, @unchecked Sendable {
         let name: String
         if s.contains("air-quality-api.open-meteo.com") { name = "om_aqi" }
         else if s.contains("geocoding-api.open-meteo.com") { name = "om_geo" }
-        else if s.contains("api.open-meteo.com") { name = s.contains("latitude=48.") ? "om_paris" : "om_nyc" }
+        else if s.contains("api.open-meteo.com") {
+            // A/B pair: serve the matching half of the multi-model fixture (CR M1).
+            let fixture = s.contains("latitude=48.") ? "om_paris" : "om_nyc"
+            let full = try OpenMeteoResponse.decode(Fixture.data(fixture))
+            let halves = full.splitPairHalves()
+            let isB = s.contains("minutely_15") || s.contains("current=")
+                || (s.contains("models=best_match") && !s.contains("models=best_match,"))
+            return try OpenMeteoResponse.encode(isB ? halves.b : halves.a)
+        }
         else if s.contains("api.weather.gov/points") { name = "nws_points" }
         else if s.contains("forecast/hourly") { name = "nws_hourly" }
         else if s.contains("api.weather.gov/gridpoints") { name = "nws_forecast" }
@@ -59,6 +67,41 @@ final class TestClock: @unchecked Sendable {
     var now: Date {
         get { lock.lock(); defer { lock.unlock() }; return _now }
         set { lock.lock(); _now = newValue; lock.unlock() }
+    }
+}
+
+/// Records every requested URL, then delegates to a handler (quota / planner tests).
+final class RecordingHTTPClient: HTTPClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _urls: [URL] = []
+    var handler: @Sendable (URL) async throws -> Data
+
+    init(handler: @escaping @Sendable (URL) async throws -> Data) {
+        self.handler = handler
+    }
+
+    var urls: [URL] {
+        lock.lock(); defer { lock.unlock() }
+        return _urls
+    }
+
+    func resetURLs() {
+        lock.lock(); _urls = []; lock.unlock()
+    }
+
+    private func record(_ url: URL) {
+        lock.lock(); defer { lock.unlock() }
+        _urls.append(url)
+    }
+
+    func get(_ url: URL, headers: [String: String]) async throws -> Data {
+        record(url)
+        return try await handler(url)
+    }
+
+    /// Open-Meteo forecast host GETs only (A + B halves).
+    var openMeteoForecastURLs: [URL] {
+        urls.filter { $0.host?.lowercased() == OpenMeteoQuota.forecastHost }
     }
 }
 

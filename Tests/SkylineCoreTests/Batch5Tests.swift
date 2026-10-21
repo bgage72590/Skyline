@@ -313,7 +313,7 @@ final class Batch5Tests: XCTestCase {
     }
 
     func testSnowIsRequestedBlendedAndShown() throws {
-        let url = Endpoints.openMeteoForecast(nyc.coordinate, models: [.bestMatch]).absoluteString
+        let url = Endpoints.openMeteoForecastA(nyc.coordinate, models: [.bestMatch]).absoluteString
         XCTAssertTrue(url.contains("snowfall") && url.contains("snowfall_sum"))
         let days = (0..<2).map { Double($0) * 86400 + 1_790_000_000 }
         let hours = (0..<3).map { 1_790_000_000 + Double($0) * 3600 }
