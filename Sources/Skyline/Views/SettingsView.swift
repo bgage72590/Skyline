@@ -280,6 +280,7 @@ struct SyncSection: View {
 struct SyncSectionBody: View {
     var store: WeatherStore
     var sync: SyncCoordinator
+    private let updates = UpdateActivity.shared
 
     var body: some View {
         Section("Sync & updates") {
@@ -304,7 +305,8 @@ struct SyncSectionBody: View {
             HStack {
                 Text("Build \(Updater.installedBuild)").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("Update Skyline…") { Updater.checkForUpdates() }
+                Button(updates.downloadingTitle ?? "Update Skyline…") { Updater.checkForUpdates() }
+                    .disabled(updates.isPending)
             }
         }
     }

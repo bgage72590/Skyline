@@ -76,6 +76,7 @@ struct MenuBarLabel: View {
 
 struct MenuBarContentView: View {
     @Environment(WeatherStore.self) private var store
+    private let updates = UpdateActivity.shared
     /// The other-cities list starts collapsed (Brian, Oct 17: keep it, but collapsed).
     @AppStorage("menuCitiesExpanded") private var citiesExpanded = false
 
@@ -198,7 +199,8 @@ struct MenuBarContentView: View {
                         // SettingsLink is inert in the ⌃⌥W HotkeyPanel, so Settings opens the AppKit way (QA #3).
                         // Each item also closes the ⌃⌥W hotkey panel (QA build-41 F1).
                         Button("Settings…") { GlobalHotkey.closePanel(); AppExit.openSettings() }
-                        Button("Check for Updates…") { GlobalHotkey.closePanel(); Updater.checkForUpdates() }
+                        Button(updates.downloadingTitle ?? "Check for Updates…") { GlobalHotkey.closePanel(); Updater.checkForUpdates() }
+                            .disabled(updates.isPending)
                         Divider()
                         Button("Quit Skyline") { GlobalHotkey.closePanel(); AppExit.perform(.menuBarQuit) }
                     } label: {
