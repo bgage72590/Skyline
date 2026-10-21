@@ -139,7 +139,35 @@ public struct VerifiedRecord: Codable, Hashable, Sendable {
 public enum AccuracyMeasurement {
     public static let defaultsKey = "SkylineAccuracyMeasurement"
     public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
-        defaults.object(forKey: defaultsKey) as? Bool ?? true
+        DefaultsFlag.value(defaults, defaultsKey, default: true)
+    }
+}
+
+/// Reads a hidden boolean switch. A `-Key NO` launch argument arrives in the argument domain as the
+/// *string* "NO" (not a Bool), so `object(forKey:) as? Bool` would silently fall back to the default.
+/// PR 2 review fix H3.
+public enum DefaultsFlag {
+    public static func value(_ defaults: UserDefaults, _ key: String, default fallback: Bool) -> Bool {
+        guard let raw = defaults.object(forKey: key) else { return fallback }
+        if let s = raw as? String {
+            switch s.trimmingCharacters(in: .whitespaces).lowercased() {
+            case "no", "false", "0", "off": return false
+            case "yes", "true", "1", "on": return true
+            default: return fallback
+            }
+        }
+        if let b = raw as? Bool { return b }
+        if let n = raw as? NSNumber { return n.boolValue }
+        return fallback
+    }
+}
+
+/// Kill switch for Accuracy PR 2 bias correction + METAR→weights merge (default ON per lock §10).
+/// Hidden defaults / `-SkylineAccuracyCorrection NO`. Alias of `BiasCorrection.Switch`.
+public enum SkylineAccuracyCorrection {
+    public static let defaultsKey = BiasCorrection.Switch.defaultsKey
+    public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        BiasCorrection.Switch.isEnabled(defaults: defaults)
     }
 }
 
@@ -209,11 +237,17 @@ public struct DailyForecastIssue: Codable, Hashable, Sendable {
     public var timeZoneIdentifier: String
     public var highs: [String: Double]
     public var lows: [String: Double]
+    /// Raw-blend hourly max over the local day (learning; never the corrected series).
+    public var rawHourlyMaxC: Double?
+    /// Raw-blend hourly min over the local day (learning; never the corrected series).
+    public var rawHourlyMinC: Double?
 
     public init(loc: String, issued: Date, localDay: Date, timeZoneIdentifier: String,
-                highs: [String: Double], lows: [String: Double]) {
+                highs: [String: Double], lows: [String: Double],
+                rawHourlyMaxC: Double? = nil, rawHourlyMinC: Double? = nil) {
         self.loc = loc; self.issued = issued; self.localDay = localDay
         self.timeZoneIdentifier = timeZoneIdentifier; self.highs = highs; self.lows = lows
+        self.rawHourlyMaxC = rawHourlyMaxC; self.rawHourlyMinC = rawHourlyMinC
     }
 }
 

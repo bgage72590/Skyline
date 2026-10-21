@@ -36,6 +36,8 @@ public struct OpenMeteoResponse: Decodable, Sendable {
     public var longitude: Double
     public var timezone: String
     public var utcOffsetSeconds: Int
+    /// Terrain elevation (m). Optional; fixtures without it still decode. Accuracy PR 2 narrow amendment.
+    public var elevation: Double?
     public var current: Current?
     public var hourly: [String: [Double?]]?
     public var daily: [String: [Double?]]?
@@ -60,7 +62,7 @@ public struct OpenMeteoResponse: Decodable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case latitude, longitude, timezone, current, hourly, daily
+        case latitude, longitude, timezone, elevation, current, hourly, daily
         case utcOffsetSeconds = "utc_offset_seconds"
         case minutely15 = "minutely_15"
     }

@@ -54,6 +54,16 @@ public actor BenchmarkStore {
     private var summaries: [String: BenchmarkSummary] = [:]
     /// Hourly Skyline/NWS/Best Match/MET Norway temps recorded for benchmark MAE (isolated).
     private var hourlyBench: [BenchmarkHourlyPair] = []
+    /// Compact training rows (Accuracy PR 2). Cap 200/city×target, 180 d, 2 MB hard ceiling.
+    private var training: [TrainingRow] = []
+    private var lastTrainingPruneAt: Date?
+    /// METAR→AdaptiveWeighting pairs (non-US only; never written to verified.jsonl).
+    private var metarVerified: [VerifiedRecord] = []
+    /// Eagerly-loaded correction state (tiny); must not pull large jsonl history.
+    private var correctionsFile = CorrectionsFile()
+    private var correctionsLoaded = false
+    /// Test seam: bytes written since last reset of the counter (append path only).
+    private var bytesWrittenSeam = 0
 
     public init(directory: URL = BenchmarkStore.defaultDirectory(), client: HTTPClient = URLSessionHTTPClient(),
                 now: @escaping @Sendable () -> Date = { Date() }) {
@@ -95,6 +105,22 @@ public actor BenchmarkStore {
         return METARClient.asStationObservations(metars.filter { $0.loc == key })
     }
 
+    /// Persist NWS temperatures (already fetched by verifyIfDue) so US daily high/low can reach 20 distinct hours.
+    public func recordNWSTemps(key: String, stationID: String?, obs: [StationObservation]) {
+        load()
+        assertOffMain()
+        let have = Set(metars.filter { $0.loc == key }.map(\.time))
+        var seen = have
+        let rows = obs.compactMap { o -> MetarObservationRecord? in
+            guard let t = o.temperatureC, seen.insert(o.time).inserted else { return nil }
+            return MetarObservationRecord(loc: key, stationID: stationID ?? "NWS", time: o.time, temperatureC: t, windKmh: o.windKmh, wet: o.precipitating)
+        }
+        guard !rows.isEmpty else { return }
+        metars.append(contentsOf: rows)
+        append(rows, to: "metars.jsonl")
+        pruneIfDue()
+    }
+
     public func dailyObsCount(for key: String) -> Int {
         load()
         return dailyObs.filter { $0.loc == key }.count
@@ -108,11 +134,87 @@ public actor BenchmarkStore {
     public func totalByteSize() -> Int {
         load()
         let names = ["metars.jsonl", "daily-issues.jsonl", "daily-obs.jsonl", "hourly.jsonl",
-                     "met-cache.json", "meta.json", "global.json", "summaries.json"]
+                     "met-cache.json", "meta.json", "global.json", "summaries.json",
+                     "training.jsonl", "corrections.json", "metar-verified.jsonl"]
         return names.reduce(0) { sum, name in
             let url = directory.appendingPathComponent(name)
             let n = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0
             return sum + n
+        }
+    }
+
+    /// Bytes appended via `append` since the last `resetBytesWrittenSeam()` (B3 test seam).
+    public func bytesWrittenSinceSeamReset() -> Int { bytesWrittenSeam }
+    public func resetBytesWrittenSeam() { bytesWrittenSeam = 0 }
+
+    public func trainingCount(for key: String) -> Int {
+        load(); loadCorrectionsOnly()
+        return training.filter { $0.loc == key }.count
+    }
+
+    public func trainingRows(for key: String, target: CorrectionTarget? = nil) -> [TrainingRow] {
+        load()
+        return training.filter { $0.loc == key && (target == nil || $0.target == target) }
+    }
+
+    public func metarVerifiedCount(for key: String) -> Int {
+        load()
+        return metarVerified.filter { $0.r.loc == key }.count
+    }
+
+    public func metarVerifiedRecords(for key: String) -> [VerifiedRecord] {
+        load()
+        return metarVerified.filter { $0.r.loc == key }
+    }
+
+    public func distinctMetarDays(for key: String) -> Int {
+        load()
+        let days = Set(metars.filter { $0.loc == key }.map { Int($0.time.timeIntervalSince1970 / 86400) })
+        return days.count
+    }
+
+    /// Eager corrections.json only — never loads large jsonl (B16).
+    public func loadCorrectionsOnly() {
+        guard !correctionsLoaded else { return }
+        correctionsLoaded = true
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if let data = try? Data(contentsOf: directory.appendingPathComponent("corrections.json")),
+           let f = try? Self.decoder.decode(CorrectionsFile.self, from: data) {
+            correctionsFile = f
+        }
+    }
+
+    public func correctionsSnapshot() -> CorrectionsFile {
+        loadCorrectionsOnly()
+        return correctionsFile
+    }
+
+    public func correctionEntry(loc: String, target: CorrectionTarget) -> CorrectionEntry? {
+        loadCorrectionsOnly()
+        return correctionsFile.entry(loc: loc, target: target)
+    }
+
+    public func saveCorrections(_ file: CorrectionsFile) {
+        assertOffMain()
+        loadCorrectionsOnly()
+        correctionsFile = file
+        guard let d = try? Self.encoder.encode(file), d.count <= BiasCorrection.correctionsMaxBytes else { return }
+        try? d.write(to: directory.appendingPathComponent("corrections.json"), options: .atomic)
+    }
+
+    /// Clears every benchmark / correction / training file (B15).
+    public func reset() {
+        assertOffMain()
+        metars = []; dailyIssues = []; dailyObs = []; hourlyBench = []
+        training = []; metarVerified = []; metCache = [:]; summaries = [:]
+        meta = [:]; global = GlobalMeta()
+        correctionsFile = CorrectionsFile(); correctionsLoaded = true; loaded = true
+        lastPruneAt = nil; lastTrainingPruneAt = nil; bytesWrittenSeam = 0
+        let names = ["metars.jsonl", "daily-issues.jsonl", "daily-obs.jsonl", "hourly.jsonl",
+                     "met-cache.json", "meta.json", "global.json", "summaries.json",
+                     "training.jsonl", "corrections.json", "metar-verified.jsonl"]
+        for name in names {
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
         }
     }
 
@@ -332,6 +434,192 @@ public actor BenchmarkStore {
         recomputeSummaries()
     }
 
+    public func seedTraining(_ rows: [TrainingRow]) {
+        load()
+        recordTrainingRows(rows)
+    }
+
+    public func seedMetarVerified(_ rows: [VerifiedRecord]) {
+        load()
+        recordMetarVerified(rows)
+    }
+
+    public func seedCityElevation(_ m: Double?, key: String) {
+        load()
+        meta[key, default: Meta()].cityElevationM = m
+        saveMeta()
+    }
+
+    // MARK: Accuracy PR 2 — training / METAR-verified / learn
+
+    /// Append-only, idempotent on (loc, localDay, target). Prune at most once per day (B1 / B3 / c1).
+    public func recordTrainingRows(_ rows: [TrainingRow]) {
+        load()
+        assertOffMain()
+        var seen = Set(training.map(\.key))
+        let fresh = rows.filter { seen.insert($0.key).inserted }
+        guard !fresh.isEmpty else { return }
+        training.append(contentsOf: fresh)
+        append(fresh, to: "training.jsonl")
+        pruneTrainingIfDue()
+    }
+
+    /// METAR-verified records for AdaptiveWeighting inputs. Key (loc, issued, valid). Never verified.jsonl.
+    public func recordMetarVerified(_ rows: [VerifiedRecord]) {
+        load()
+        assertOffMain()
+        struct K: Hashable { var loc: String; var issued: Date; var valid: Date }
+        var seen = Set(metarVerified.map { K(loc: $0.r.loc, issued: $0.r.issued, valid: $0.r.valid) })
+        let fresh = rows.filter {
+            $0.r.leadHours >= BiasCorrection.minLeadHoursForLearning
+                && seen.insert(K(loc: $0.r.loc, issued: $0.r.issued, valid: $0.r.valid)).inserted
+        }
+        guard !fresh.isEmpty else { return }
+        metarVerified.append(contentsOf: fresh)
+        append(fresh, to: "metar-verified.jsonl")
+        pruneIfDue()
+    }
+
+    /// Build compact training rows from completed local days (uncorrected only). Idempotent.
+    public func learnTraining(key: String, timeZoneIdentifier: String) {
+        load()
+        assertOffMain()
+        guard let tz = TimeZone(identifier: timeZoneIdentifier) else { return }
+        let t = now()
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        var newRows: [TrainingRow] = []
+
+        // Hourly targets from skyline benchmark pairs (learningForecastC = uncorrected).
+        let sky = hourlyBench.filter { $0.loc == key && $0.kind == .skyline
+            && $0.valid.timeIntervalSince($0.issued) / 3600 >= BiasCorrection.minLeadHoursForLearning }
+        let byDay = Dictionary(grouping: sky) { cal.startOfDay(for: $0.valid) }
+        let today = cal.startOfDay(for: t)
+        for (day, pairs) in byDay where day < today {
+            let w = LocalDayAggregator.window(forDay: day, timeZone: tz)
+            guard LocalDayAggregator.isComplete(w, now: t) else { continue }
+            // Dedupe on the lock's key (loc, kind, issued, valid) — loc/kind are fixed above — so every
+            // lead bucket keeps its own pairs for the same valid hour (review fix M4, B1/B2).
+            struct PairKey: Hashable { var issued: Date; var valid: Date }
+            var seenPairs = Set<PairKey>()
+            let deduped = pairs.filter { seenPairs.insert(PairKey(issued: $0.issued, valid: $0.valid)).inserted }
+            let byBucket = Dictionary(grouping: deduped) { CorrectionTarget(bucket: LeadBucket(leadHours: $0.valid.timeIntervalSince($0.issued) / 3600)) }
+            for (target, rows) in byBucket {
+                let sumE = rows.reduce(0.0) { $0 + ($1.learningForecastC - $1.observedC) }
+                newRows.append(TrainingRow(loc: key, localDay: day, target: target,
+                                           sumE: sumE, n: rows.count, distinct: Set(rows.map { Int($0.valid.timeIntervalSince1970 / 3600) }).count))
+            }
+        }
+
+        // Daily high/low: D+1 issue raw hourly max/min vs observed hourly-slot max/min (B2).
+        let temps = metars.filter { $0.loc == key }.compactMap { r -> (Date, Double)? in
+            guard let c = r.temperatureC else { return nil }
+            return (r.time, c)
+        }
+        for obs in dailyObs where obs.loc == key {
+            guard let slots = BiasCorrection.hourlySlotExtremes(temps: temps, day: obs.localDay,
+                                                                timeZone: tz, now: t) else { continue }
+            let issue = dailyIssues.filter {
+                $0.loc == key && abs($0.localDay.timeIntervalSince(obs.localDay)) < 1 && $0.issued < obs.localDay
+            }.max(by: { $0.issued < $1.issued })
+            guard let issue else { continue }
+            if let rawHi = issue.rawHourlyMaxC {
+                newRows.append(TrainingRow(loc: key, localDay: obs.localDay, target: .dailyHigh,
+                                           sumE: rawHi - slots.high, n: 1))
+            }
+            if let rawLo = issue.rawHourlyMinC {
+                newRows.append(TrainingRow(loc: key, localDay: obs.localDay, target: .dailyLow,
+                                           sumE: rawLo - slots.low, n: 1))
+            }
+        }
+        if !newRows.isEmpty { recordTrainingRows(newRows) }
+    }
+
+    /// Recompute applied offsets for a city (rate limit, auto-off). Returns offsets to apply (0 if gated off).
+    /// `qaOverrideC` comes from the launch arguments only (ForecastVerifier), never from defaults or data.
+    public func refreshCorrections(key: String, timeZoneIdentifier: String,
+                                   sitingOK: Bool, qaOverrideC: Double? = nil) -> [CorrectionTarget: Double] {
+        load()
+        loadCorrectionsOnly()
+        assertOffMain()
+        let switchOn = BiasCorrection.Switch.isEnabled()
+        let measurementOn = AccuracyMeasurement.isEnabled()
+        guard let tz = TimeZone(identifier: timeZoneIdentifier) else { return [:] }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        let t = now()
+        let localDay = cal.startOfDay(for: t)
+        var file = correctionsFile
+        var out: [CorrectionTarget: Double] = [:]
+
+        if let qaRaw = qaOverrideC, qaRaw.isFinite {
+            let qa = BiasCorrection.clamp(qaRaw)
+            // QA override: force applied offset for gated targets; never write corrections.json.
+            for target in CorrectionTarget.allCases {
+                let rows = training.filter { $0.loc == key && $0.target == target && $0.localDay < localDay }
+                let gated = BiasCorrection.gate(rows: rows, target: target, sitingOK: sitingOK,
+                                                switchOn: switchOn, measurementOn: measurementOn)
+                out[target] = gated ? qa : 0
+            }
+            return out
+        }
+
+        var changed = false
+        for target in CorrectionTarget.allCases {
+            let rows = training.filter { $0.loc == key && $0.target == target && $0.localDay < localDay }
+            var entry = file.entry(loc: key, target: target)
+                ?? CorrectionEntry(loc: key, target: target)
+            let (eval, log) = BiasCorrection.evaluateAutoOff(entry: entry, rows: rows, asOf: t)
+            entry = eval
+            if let log {
+                var l = log; l.loc = key; l.target = target
+                file.appendLog(l)
+                changed = true
+            }
+            let gated = BiasCorrection.gate(rows: rows, target: target, sitingOK: sitingOK,
+                                            switchOn: switchOn, measurementOn: measurementOn)
+            let forceZero = !switchOn || !measurementOn || !sitingOK || entry.autoOff || !gated
+            let (est, n) = BiasCorrection.estimate(rows: rows, asOf: localDay)
+            // Applied correction = −bias (warm forecasts get a negative offset).
+            let targetC = forceZero ? 0 : -est
+            let sameDay = entry.appliedOn.map { cal.isDate($0, inSameDayAs: localDay) } ?? false
+            let applied = BiasCorrection.rateLimited(previous: entry.appliedC, targetC: targetC,
+                                                     sameLocalDay: sameDay && !forceZero, forceZero: forceZero)
+            if abs(applied - entry.appliedC) > 1e-12 || entry.targetC != targetC || entry.n != n
+                || entry.autoOff != eval.autoOff {
+                changed = true
+            }
+            entry.appliedC = applied
+            entry.targetC = targetC
+            entry.n = n
+            if !sameDay || forceZero { entry.appliedOn = localDay }
+            file.upsert(entry)
+            out[target] = (gated && !forceZero) ? applied : 0
+        }
+        if changed { saveCorrections(file) }
+        else { correctionsFile = file }
+        return out
+    }
+
+    public func sitingOK(for key: String) -> Bool {
+        sitingOK(for: key, cityElevationM: nil)
+    }
+
+    /// Persists city elevation when provided, then evaluates the c2 siting rule.
+    public func sitingOK(for key: String, cityElevationM: Double?) -> Bool {
+        load()
+        if let cityElevationM {
+            meta[key, default: Meta()].cityElevationM = cityElevationM
+            saveMeta()
+        }
+        let m = meta[key]
+        let station = m?.station
+        let cityZ = m?.cityElevationM ?? cityElevationM
+        return BiasCorrection.sitingPasses(distanceKm: station?.distanceKm,
+                                           stationElevationM: station?.elevationM,
+                                           cityElevationM: cityZ)
+    }
+
     // MARK: Internals
 
     private func recomputeSummaries() {
@@ -368,10 +656,12 @@ public actor BenchmarkStore {
         dailyIssues = capped(dailyIssues.filter { $0.issued >= cutoff }, perCity: \.loc, time: \.issued)
         dailyObs = capped(dailyObs.filter { $0.localDay >= cutoff }, perCity: \.loc, time: \.localDay)
         hourlyBench = capped(hourlyBench.filter { $0.valid >= cutoff }, perCity: \.loc, time: \.valid)
+        metarVerified = capped(metarVerified.filter { $0.r.valid >= cutoff }, perCity: { $0.r.loc }, time: { $0.r.valid })
         writeAll(metars, to: "metars.jsonl")
         writeAll(dailyIssues, to: "daily-issues.jsonl")
         writeAll(dailyObs, to: "daily-obs.jsonl")
         writeAll(hourlyBench, to: "hourly.jsonl")
+        writeAll(metarVerified, to: "metar-verified.jsonl")
         // Hard size ceiling, one pass per file (review fix: the old loop re-encoded and rewrote the whole
         // file once per distinct timestamp). Oldest rows go first, hourly pairs before METARs as before.
         var excess = totalByteSize() - Self.maxTotalBytes
@@ -430,6 +720,8 @@ public actor BenchmarkStore {
         dailyIssues = readAll(DailyForecastIssue.self, from: "daily-issues.jsonl")
         dailyObs = readAll(DailyObservedExtremes.self, from: "daily-obs.jsonl")
         hourlyBench = readAll(BenchmarkHourlyPair.self, from: "hourly.jsonl")
+        training = dedupeTraining(readAll(TrainingRow.self, from: "training.jsonl"))
+        metarVerified = dedupeMetarVerified(readAll(VerifiedRecord.self, from: "metar-verified.jsonl"))
         if let data = try? Data(contentsOf: directory.appendingPathComponent("meta.json")),
            let m = try? Self.decoder.decode([String: Meta].self, from: data) { meta = m }
         if let data = try? Data(contentsOf: directory.appendingPathComponent("global.json")),
@@ -439,6 +731,45 @@ public actor BenchmarkStore {
         if let data = try? Data(contentsOf: directory.appendingPathComponent("summaries.json")),
            let s = try? Self.decoder.decode([String: BenchmarkSummary].self, from: data) { summaries = s }
         prune()
+        pruneTrainingIfDue(force: true)
+    }
+
+    private func dedupeTraining(_ rows: [TrainingRow]) -> [TrainingRow] {
+        var seen = Set<String>()
+        return rows.filter { seen.insert($0.key).inserted }
+    }
+
+    private func dedupeMetarVerified(_ rows: [VerifiedRecord]) -> [VerifiedRecord] {
+        struct K: Hashable { var loc: String; var issued: Date; var valid: Date }
+        var seen = Set<K>()
+        return rows.filter { seen.insert(K(loc: $0.r.loc, issued: $0.r.issued, valid: $0.r.valid)).inserted }
+    }
+
+    /// Training prune at most once per day, one pass (B3 / c1).
+    private func pruneTrainingIfDue(force: Bool = false) {
+        if !force, let last = lastTrainingPruneAt, now().timeIntervalSince(last) < 86400,
+           fileSize("training.jsonl") <= BiasCorrection.trainingMaxBytes { return }
+        lastTrainingPruneAt = now()
+        let cutoff = now().addingTimeInterval(-BiasCorrection.trainingRetentionDays * 86400)
+        var kept: [TrainingRow] = []
+        let groups = Dictionary(grouping: training.filter { $0.localDay >= cutoff }) {
+            "\($0.loc)|\($0.target.rawValue)"
+        }
+        for (_, rows) in groups {
+            let sorted = rows.sorted { $0.localDay < $1.localDay }
+            kept.append(contentsOf: sorted.suffix(BiasCorrection.trainingCapPerCityTarget))
+        }
+        training = dedupeTraining(kept)
+        writeAll(training, to: "training.jsonl")
+        // Hard 2 MB ceiling inside the 10 MB total — drop oldest across all cities in one pass.
+        let excess = fileSize("training.jsonl") - BiasCorrection.trainingMaxBytes
+        if excess > 0, !training.isEmpty {
+            training.sort { $0.localDay < $1.localDay }
+            let size = max(1, fileSize("training.jsonl"))
+            let drop = min(training.count, Int(Double(excess) / Double(size) * Double(training.count)) + 1)
+            training.removeFirst(drop)
+            writeAll(training, to: "training.jsonl")
+        }
     }
 
     private static let encoder: JSONEncoder = {
@@ -466,6 +797,7 @@ public actor BenchmarkStore {
     private func append<T: Encodable>(_ items: [T], to name: String) {
         let url = directory.appendingPathComponent(name)
         let data = lines(items)
+        bytesWrittenSeam += data.count
         if let h = try? FileHandle(forWritingTo: url) {
             defer { try? h.close() }
             _ = try? h.seekToEnd()
@@ -512,10 +844,16 @@ public struct BenchmarkHourlyPair: Codable, Hashable, Sendable {
     public var kind: BenchmarkForecastKind
     public var forecastC: Double
     public var observedC: Double
+    /// Uncorrected blend temperature used for learning (B5). Falls back to `forecastC` when nil (PR 1 rows).
+    public var uncorrectedC: Double?
 
     public init(loc: String, issued: Date, valid: Date, kind: BenchmarkForecastKind,
-                forecastC: Double, observedC: Double) {
+                forecastC: Double, observedC: Double, uncorrectedC: Double? = nil) {
         self.loc = loc; self.issued = issued; self.valid = valid
         self.kind = kind; self.forecastC = forecastC; self.observedC = observedC
+        self.uncorrectedC = uncorrectedC
     }
+
+    /// Value learning must use — never the corrected display temperature.
+    public var learningForecastC: Double { uncorrectedC ?? forecastC }
 }
