@@ -102,47 +102,23 @@ final class OpenMeteoQuotaTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         let clock = TestClock(fixtureTime)
         let cache = ResponseCache(directory: dir, now: { clock.now })
-        let s1 = WeatherService(client: MockHTTPClient(), cache: cache, now: { clock.now })
-        await s1.noteDailyLimit(host: host)
-        let until1 = await s1.dailyLimit(for: host)
-        XCTAssertNotNil(until1)
-
-        let s2 = WeatherService(client: MockHTTPClient(), cache: ResponseCache(directory: dir, now: { clock.now }),
-                                now: { clock.now })
-        // Trigger marker load via a limited fetch path.
-        await s2.setDailyLimitForTesting(host, until: .distantPast) // will be overwritten by load
-        // Clear in-memory and force reload: new service hasn't loaded yet.
-        let s3 = WeatherService(client: MockHTTPClient(), cache: ResponseCache(directory: dir, now: { clock.now }),
-                                now: { clock.now })
-        do {
-            _ = try await s3.report(for: paris, allowNetwork: false)
-        } catch {
-            // Expected if no Paris cache yet — load still ran for the host on pair path.
-        }
-        // Re-load: ask for dailyLimit after touching OM via note on s1's marker.
-        let entry = await ResponseCache(directory: dir, now: { clock.now })
-            .entry(OpenMeteoQuota.markerKey(host: host), maxAge: .infinity)
-        let marker = try XCTUnwrap(OpenMeteoQuota.decode(try XCTUnwrap(entry?.data)))
-        XCTAssertEqual(marker.until, until1)
-        XCTAssertGreaterThanOrEqual(marker.jitter, 0)
-        XCTAssertLessThanOrEqual(marker.jitter, 180)
-
-        // Second service on same dir sees the same until after a report that loads the marker.
-        let client = MockHTTPClient()
-        let s4 = WeatherService(client: client, cache: ResponseCache(directory: dir, now: { clock.now }),
-                                now: { clock.now })
-        // Prime NYC cache first without limit, then reload limited service.
-        let seedCache = ResponseCache(directory: dir, now: { clock.now })
-        let seeder = WeatherService(client: MockHTTPClient(), cache: seedCache, now: { clock.now })
-        await seeder.clearDailyLimit(host: host)
+        let seeder = WeatherService(client: MockHTTPClient(), cache: cache, now: { clock.now })
         _ = try await seeder.report(for: nyc)
         await seeder.noteDailyLimit(host: host)
         let untilSeeded = await seeder.dailyLimit(for: host)
+        XCTAssertNotNil(untilSeeded)
+        let entry = await cache.entry(OpenMeteoQuota.markerKey(host: host), maxAge: .infinity)
+        let marker = try XCTUnwrap(OpenMeteoQuota.decode(try XCTUnwrap(entry?.data)))
+        XCTAssertEqual(marker.until, untilSeeded)
+        XCTAssertGreaterThanOrEqual(marker.jitter, 0)
+        XCTAssertLessThanOrEqual(marker.jitter, 180)
 
-        let s5 = WeatherService(client: MockHTTPClient(), cache: ResponseCache(directory: dir, now: { clock.now }),
+        let s2 = WeatherService(client: MockHTTPClient(),
+                                cache: ResponseCache(directory: dir, now: { clock.now }),
                                 now: { clock.now })
-        _ = try? await s5.report(for: nyc, allowNetwork: false)
-        XCTAssertEqual(await s5.dailyLimit(for: host), untilSeeded)
+        _ = try await s2.report(for: nyc, allowNetwork: false)
+        let until2 = await s2.dailyLimit(for: host)
+        XCTAssertEqual(until2, untilSeeded)
     }
 
     func testMarkerSanityAndClearOn200() async throws {
@@ -164,7 +140,8 @@ final class OpenMeteoQuotaTests: XCTestCase {
         await cache.store(try OpenMeteoQuota.encode(past), for: OpenMeteoQuota.markerKey(host: host))
         let s = WeatherService(client: MockHTTPClient(), cache: cache, now: { clock.now })
         _ = try await s.report(for: nyc)
-        XCTAssertNil(await s.dailyLimit(for: host))
+        let pastLimit = await s.dailyLimit(for: host)
+        XCTAssertNil(pastLimit)
 
         // Far-future until — discarded.
         let far = OpenMeteoQuota.Marker(until: now.addingTimeInterval(OpenMeteoQuota.sanityHorizon + 120),
@@ -173,15 +150,18 @@ final class OpenMeteoQuotaTests: XCTestCase {
         let s2 = WeatherService(client: MockHTTPClient(), cache: ResponseCache(directory: dir, now: { clock.now }),
                                 now: { clock.now })
         _ = try await s2.report(for: nyc)
-        XCTAssertNil(await s2.dailyLimit(for: host))
+        let farLimit = await s2.dailyLimit(for: host)
+        XCTAssertNil(farLimit)
 
         // 200 clears an active limit.
         await s2.noteDailyLimit(host: host)
-        XCTAssertNotNil(await s2.dailyLimit(for: host))
+        let active = await s2.dailyLimit(for: host)
+        XCTAssertNotNil(active)
         // Advance past until so mayProbe allows, then successful GET clears.
-        clock.now = (await s2.dailyLimit(for: host))!.addingTimeInterval(1)
+        clock.now = active!.addingTimeInterval(1)
         _ = try await s2.report(for: nyc, forceRefresh: true)
-        XCTAssertNil(await s2.dailyLimit(for: host))
+        let cleared = await s2.dailyLimit(for: host)
+        XCTAssertNil(cleared)
     }
 
     func testResumePhraseAmericaNewYorkAndTokyoTomorrow() {
@@ -196,10 +176,8 @@ final class OpenMeteoQuotaTests: XCTestCase {
         XCTAssertFalse(same.lowercased().contains("tomorrow"))
         XCTAssertEqual(same, UserFacingError.clockTime(untilSameDay, timeZone: ny, locale: locale, roundUp: false))
 
-        // Tokyo: late evening now, until is next UTC morning → next local calendar day.
+        // Tokyo: until clearly on the next local calendar day.
         let nowTokyo = Date(timeIntervalSince1970: 1_729_533_600) // 2024-10-22 06:00 JST
-        let untilNext = Date(timeIntervalSince1970: 1_729_585_500) // 2024-10-22 20:25 JST? pick carefully
-        // Use until clearly on the next Tokyo day.
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = tokyo
         let start = cal.startOfDay(for: nowTokyo)
@@ -289,7 +267,8 @@ final class OpenMeteoQuotaTests: XCTestCase {
         let fresh = WeatherService(client: MockHTTPClient(),
                                    cache: ResponseCache(directory: dir, now: { clock.now }),
                                    now: { clock.now })
-        XCTAssertNil(await fresh.dailyLimit(for: host))
+        let freshLimit = await fresh.dailyLimit(for: host)
+        XCTAssertNil(freshLimit)
         let report = try await fresh.report(for: nyc)
         XCTAssertEqual(report.forecastMode, .blend)
         XCTAssertFalse(report.isOfflineFallback)
@@ -314,7 +293,8 @@ final class OpenMeteoQuotaTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: vDir) }
         let verifier = ForecastVerifier(directory: vDir, client: recording, now: { clock.now },
                                         launchArguments: ["Skyline", "-SkylineCorrectionQAOverride", "1.0"])
-        XCTAssertTrue(verifier.isQAOverrideActive)
+        let qaOn = await verifier.isQAOverrideActive
+        XCTAssertTrue(qaOn)
 
         let service = WeatherService(client: recording, cache: ResponseCache(directory: nil, now: { clock.now }),
                                      verifier: verifier, history: history, now: { clock.now })
@@ -325,17 +305,19 @@ final class OpenMeteoQuotaTests: XCTestCase {
         XCTAssertEqual(report.fallbackCause, .dailyLimit)
         XCTAssertFalse(report.isOfflineFallback)
         XCTAssertTrue(report.sources.allSatisfy { $0.hasPrefix("NWS") })
-        XCTAssertEqual(await history.count(VerificationKey.key(for: nyc)), 0)
+        let histCount = await history.count(VerificationKey.key(for: nyc))
+        XCTAssertEqual(histCount, 0)
 
         // Same path without QA override — temperatures match (correction never applied in NWS-only).
-        let v2 = ForecastVerifier(directory: tempDir("v-nws2"), client: recording, now: { clock.now },
+        let v2Dir = tempDir("v-nws2")
+        defer { try? FileManager.default.removeItem(at: v2Dir) }
+        let v2 = ForecastVerifier(directory: v2Dir, client: recording, now: { clock.now },
                                   launchArguments: ["Skyline"])
         let s2 = WeatherService(client: recording, cache: ResponseCache(directory: nil, now: { clock.now }),
                                 verifier: v2, now: { clock.now })
         await s2.setDailyLimitForTesting(host, until: clock.now.addingTimeInterval(3600), lastProbeAt: clock.now)
         let r2 = try await s2.report(for: nyc)
         XCTAssertEqual(report.current.temperature, r2.current.temperature, accuracy: 1e-9)
-        _ = body
     }
 
     // MARK: §6.6 Non-US Paris
@@ -347,7 +329,6 @@ final class OpenMeteoQuotaTests: XCTestCase {
         let live = try await seeder.report(for: paris)
         XCTAssertEqual(live.forecastMode, .blend)
 
-        let body = try dailyBody()
         let recording = RecordingHTTPClient { url in
             if OpenMeteoQuota.exactHosts.contains(url.host?.lowercased() ?? "") {
                 throw HTTPError.dailyLimit(host: url.host ?? "")
@@ -362,7 +343,8 @@ final class OpenMeteoQuotaTests: XCTestCase {
         XCTAssertTrue(fallback.isOfflineFallback)
         XCTAssertEqual(fallback.fallbackCause, .dailyLimit)
         XCTAssertFalse(RefreshBookkeeping.isReallyOffline(cause: fallback.fallbackCause, error: nil))
-        let until = try XCTUnwrap(await service.dailyLimit(for: host))
+        let untilOpt = await service.dailyLimit(for: host)
+        let until = try XCTUnwrap(untilOpt)
         let msg = OpenMeteoQuota.cachedMessage(dataTime: fallback.dataAsOf, until: until, now: clock.now,
                                                timeZone: TimeZone(identifier: "Europe/Paris")!,
                                                locale: Locale(identifier: "en_US_POSIX"))
@@ -415,7 +397,6 @@ final class OpenMeteoQuotaTests: XCTestCase {
         let coord = nyc.coordinate.rounded
         let models = ForecastModel.models(inCONUS: true)
         let urlA = Endpoints.openMeteoForecastA(coord, models: models)
-        let urlB = Endpoints.openMeteoForecastB(coord)
         let beforeA = await cache.entry(urlA.absoluteString, maxAge: .infinity)
 
         clock.now = clock.now.addingTimeInterval(WeatherService.TTL.forecast + 10)
@@ -473,7 +454,8 @@ final class OpenMeteoQuotaTests: XCTestCase {
         XCTAssertEqual(report.forecastAsOf, liveAsOf)
         XCTAssertEqual(report.dataAsOf, min(liveAsOf ?? report.dataAsOf, report.dataAsOf))
         // history.record skipped on fallback
-        XCTAssertEqual(await history.count(VerificationKey.key(for: nyc)), 0)
+        let histCount = await history.count(VerificationKey.key(for: nyc))
+        XCTAssertEqual(histCount, 0)
     }
 
     // MARK: §6.8 Merge M2
@@ -558,8 +540,7 @@ final class OpenMeteoQuotaTests: XCTestCase {
             let hourlyFull = ForecastBlender.blendHourly(openMeteo: full, nwsHourly: nwsHourly, now: current.time)
             let dailyFull = ForecastBlender.blendDaily(openMeteo: full, nwsPeriods: nwsP, timeZone: tz,
                                                        hourly: hourlyFull)
-            let enc = JSONEncoder()
-            enc.outputFormatting = [.sortedKeys]
+            let enc = Self.sortedEncoder()
             XCTAssertEqual(try enc.encode(hourlyMerged), try enc.encode(hourlyFull), name)
             XCTAssertEqual(try enc.encode(dailyMerged), try enc.encode(dailyFull), name)
 
@@ -593,8 +574,7 @@ final class OpenMeteoQuotaTests: XCTestCase {
                                  now: { clock.now })
         let report = try await svc.report(for: nyc)
         let w = await svc.verifier!.weights(VerificationKey.key(for: nyc))
-        let enc = JSONEncoder()
-        enc.outputFormatting = [.sortedKeys]
+        let enc = Self.sortedEncoder()
         struct Slice: Codable {
             var hourly: Data; var daily: Data; var current: Data; var modelSeries: Data; var weights: Data
         }
@@ -604,6 +584,13 @@ final class OpenMeteoQuotaTests: XCTestCase {
         XCTAssertEqual(try enc.encode(report.current), golden.current)
         XCTAssertEqual(try enc.encode(report.modelSeries), golden.modelSeries)
         XCTAssertEqual(try enc.encode(w), golden.weights)
+    }
+
+    private static func sortedEncoder() -> JSONEncoder {
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .secondsSince1970
+        e.outputFormatting = [.sortedKeys]
+        return e
     }
 
     // MARK: §6.13 Accuracy guard
@@ -633,7 +620,8 @@ final class OpenMeteoQuotaTests: XCTestCase {
         offline.offline = true
         let vStale = ForecastVerifier(directory: dirStale, client: offline, now: { clock.now })
         let sStale = WeatherService(client: offline, cache: cache, verifier: vStale, now: { clock.now })
-        XCTAssertTrue(await vStale.wantsIssuance(VerificationKey.key(for: nyc)))
+        let wants = await vStale.wantsIssuance(VerificationKey.key(for: nyc))
+        XCTAssertTrue(wants)
         _ = try await sStale.report(for: nyc)
         try await Task.sleep(for: .milliseconds(400))
         let pendingStale = dirStale.appendingPathComponent("pending.jsonl")

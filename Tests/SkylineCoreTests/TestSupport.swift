@@ -89,8 +89,13 @@ final class RecordingHTTPClient: HTTPClient, @unchecked Sendable {
         lock.lock(); _urls = []; lock.unlock()
     }
 
+    private func record(_ url: URL) {
+        lock.lock(); defer { lock.unlock() }
+        _urls.append(url)
+    }
+
     func get(_ url: URL, headers: [String: String]) async throws -> Data {
-        lock.lock(); _urls.append(url); lock.unlock()
+        record(url)
         return try await handler(url)
     }
 
