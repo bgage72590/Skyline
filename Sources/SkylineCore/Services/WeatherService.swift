@@ -245,21 +245,40 @@ public actor WeatherService {
             if let verifier { Task.detached(priority: .utility) { _ = await verifier.weights(key) } } // load for next time
         }
         let minutely = om.minutelyPrecipitation()
-        let hourly = ForecastBlender.blendHourly(openMeteo: om, nwsHourly: nws?.hourly ?? [], now: current.time,
+        var hourly = ForecastBlender.blendHourly(openMeteo: om, nwsHourly: nws?.hourly ?? [], now: current.time,
                                                  weights: learned, minutely: minutely)
-        let daily = ForecastBlender.blendDaily(openMeteo: om, nwsPeriods: nws?.periods ?? [], timeZone: tz,
+        // Daily is built from the RAW hourly (lock §2); correction applies after.
+        var daily = ForecastBlender.blendDaily(openMeteo: om, nwsPeriods: nws?.periods ?? [], timeZone: tz,
                                                weights: learned, hourly: hourly)
+        // Accuracy PR 2: one apply point after blendDaily, before headline. Raw series go to measurement.
+        let rawHourly = hourly
+        let rawDaily = daily
+        let issuedNow = now()
+        if let verifier {
+            if let offsets = await verifier.correctionIfLoaded(key),
+               offsets.values.contains(where: { abs($0) > 1e-12 }) {
+                BiasCorrection.apply(hourly: &hourly, daily: &daily, current: &current,
+                                     issued: issuedNow, timeZone: tz, offsets: offsets)
+            } else {
+                Task.detached(priority: .utility) {
+                    _ = await verifier.corrections(key, timeZoneIdentifier: om.timezone,
+                                                   cityElevationM: om.elevation)
+                }
+            }
+        }
         // The headline temperature is the blend (models + NWS) at the current time, not one model's value.
-        // "Feels like" keeps its offset from the air temperature.
+        // "Feels like" keeps its offset from the air temperature. Sees corrected hourly (B8).
         if let blended = ForecastBlender.temperature(at: current.time, hourly: hourly) {
             current.apparentTemperature += blended.temperature - current.temperature
             current.temperature = blended.temperature
         }
         // The header's "Rain" agrees with the 15-minute nowcast (dropdown review S3).
+        // reconcileCurrent sees the corrected temperature (B8 knock-on).
         current.weatherCode = Nowcast.reconcileCurrent(code: current.weatherCode, minutely: minutely, now: now(),
                                                        temperature: current.temperature)
 
         // "Why the forecast changed": compare with the outlook from ~12 h ago, then save this one.
+        // history.record stores what the user saw (corrected).
         var earlier: ForecastSnapshot?
         if let history, !omEntry.isFallback {
             let t = now()
@@ -268,27 +287,28 @@ public actor WeatherService {
         }
 
         // Verification runs detached at utility priority: never delays the report.
+        // Issuance + measurement use RAW (uncorrected) hourly/daily so learning has no feedback loop (B5).
         if let verifier {
-            let issued = now()
+            let issued = issuedNow
             let nwsHourly = nws?.hourly ?? []
             let stations = nws?.point.observationStations
-            // Accuracy PR 1: pass timezone / daily / coordinate into the detached block only.
             let measureTZ = om.timezone
-            let measureDaily = daily
+            let measureDaily = rawDaily
+            let measureHourly = rawHourly
             let measureCoord = coord
             let measureIsUS = location.isLikelyInNWSCoverage
+            let measureElev = om.elevation
             Task.detached(priority: .utility) {
                 if await verifier.wantsIssuance(key) {
                     let records = ForecastSampler.records(location: key, issued: issued, openMeteo: om,
-                                                          nwsHourly: nwsHourly, blended: hourly)
+                                                          nwsHourly: nwsHourly, blended: measureHourly)
                     await verifier.record(records, key: key)
                 }
-                await verifier.verifyIfDue(key: key, stationsURL: stations, near: coord)
-                // Measurement-only: METAR / daily high-low / MET Norway benchmark (isolated store).
-                // Kill switch default ON; failures must not affect the report or Open-Meteo/NWS backoff.
+                await verifier.verifyIfDue(key: key, stationsURL: stations, near: coord,
+                                           cityElevationM: measureElev)
                 await verifier.runMeasurement(key: key, coordinate: measureCoord, timeZoneIdentifier: measureTZ,
-                                              daily: measureDaily, openMeteo: om, blended: hourly,
-                                              isUS: measureIsUS)
+                                              daily: measureDaily, openMeteo: om, blended: measureHourly,
+                                              isUS: measureIsUS, cityElevationM: measureElev)
             }
         }
 

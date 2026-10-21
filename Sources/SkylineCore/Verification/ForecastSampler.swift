@@ -57,9 +57,11 @@ public enum ForecastSampler {
 
     /// Daily high/low forecasts for local-day verification (isolated store). Includes Skyline blend,
     /// NWS and Best Match when present, and MET Norway when supplied.
+    /// `blendedHourly` is the RAW (uncorrected) blend — used only for `rawHourlyMaxC` / `rawHourlyMinC`.
     public static func dailyIssues(location key: String, issued: Date, daily: [DailyForecast],
                                    openMeteo om: OpenMeteoResponse, timeZone: TimeZone,
-                                   metNorway: [MetNorwayHour] = []) -> [DailyForecastIssue] {
+                                   metNorway: [MetNorwayHour] = [],
+                                   blendedHourly: [HourlyForecast] = []) -> [DailyForecastIssue] {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = timeZone
         let tzID = timeZone.identifier
@@ -84,8 +86,14 @@ public enum ForecastSampler {
                 highs[BenchmarkForecastKind.metNorway.rawValue] = ext.high
                 lows[BenchmarkForecastKind.metNorway.rawValue] = ext.low
             }
+            let dayHours = blendedHourly.filter {
+                $0.time >= localDay && cal.isDate($0.time, inSameDayAs: localDay)
+            }.map(\.temperature)
+            let rawMax = dayHours.max()
+            let rawMin = dayHours.min()
             out.append(DailyForecastIssue(loc: key, issued: issued, localDay: localDay,
-                                          timeZoneIdentifier: tzID, highs: highs, lows: lows))
+                                          timeZoneIdentifier: tzID, highs: highs, lows: lows,
+                                          rawHourlyMaxC: rawMax, rawHourlyMinC: rawMin))
         }
         return out
     }

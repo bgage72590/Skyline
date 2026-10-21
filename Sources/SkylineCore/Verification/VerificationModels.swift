@@ -143,6 +143,15 @@ public enum AccuracyMeasurement {
     }
 }
 
+/// Kill switch for Accuracy PR 2 bias correction + METAR→weights merge (default ON per lock §10).
+/// Hidden defaults / `-SkylineAccuracyCorrection NO`. Alias of `BiasCorrection.Switch`.
+public enum SkylineAccuracyCorrection {
+    public static let defaultsKey = BiasCorrection.Switch.defaultsKey
+    public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        BiasCorrection.Switch.isEnabled(defaults: defaults)
+    }
+}
+
 /// Forecast sources compared on the Accuracy "Skyline vs other forecasts" section.
 /// Not a `VerificationSource`: MET Norway must never enter AdaptiveWeighting / accuracy.json.
 public enum BenchmarkForecastKind: String, Codable, CaseIterable, Sendable, Comparable {
@@ -209,11 +218,17 @@ public struct DailyForecastIssue: Codable, Hashable, Sendable {
     public var timeZoneIdentifier: String
     public var highs: [String: Double]
     public var lows: [String: Double]
+    /// Raw-blend hourly max over the local day (learning; never the corrected series).
+    public var rawHourlyMaxC: Double?
+    /// Raw-blend hourly min over the local day (learning; never the corrected series).
+    public var rawHourlyMinC: Double?
 
     public init(loc: String, issued: Date, localDay: Date, timeZoneIdentifier: String,
-                highs: [String: Double], lows: [String: Double]) {
+                highs: [String: Double], lows: [String: Double],
+                rawHourlyMaxC: Double? = nil, rawHourlyMinC: Double? = nil) {
         self.loc = loc; self.issued = issued; self.localDay = localDay
         self.timeZoneIdentifier = timeZoneIdentifier; self.highs = highs; self.lows = lows
+        self.rawHourlyMaxC = rawHourlyMaxC; self.rawHourlyMinC = rawHourlyMinC
     }
 }
 

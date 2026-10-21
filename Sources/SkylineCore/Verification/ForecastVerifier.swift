@@ -79,6 +79,13 @@ public actor ForecastVerifier {
     /// Review fix: last NWS observations fetched by verifyIfDue, reused (in memory only) for the US
     /// daily high/low benchmark so it needs no extra request.
     private var lastNWSObs: [String: [StationObservation]] = [:]
+    /// Accuracy PR 2: corrections.json loaded eagerly in the background; never pulls large jsonl (B16).
+    private var correctionsReady = false
+    private var cachedOffsets: [String: [CorrectionTarget: Double]] = [:]
+    private var cachedStatuses: [String: [CorrectionStatus]] = [:]
+    /// In-memory METAR→weights inputs (never verified.jsonl). Populated by runMeasurement.
+    private var metarWeightInputs: [String: [VerifiedRecord]] = [:]
+    private var metarWeightEligible: Set<String> = []
 
     public init(directory: URL = ForecastVerifier.defaultDirectory(), client: HTTPClient = URLSessionHTTPClient(),
                 config: AdaptiveWeighting.Config = AdaptiveWeighting.Config(),
@@ -90,6 +97,10 @@ public actor ForecastVerifier {
         self.now = now
         self.benchmark = BenchmarkStore(directory: benchmarkDirectory ?? BenchmarkStore.directoryAlongside(verification: directory),
                                         client: client, now: now)
+        let store = self.benchmark
+        Task.detached(priority: .utility) {
+            await store.loadCorrectionsOnly()
+        }
     }
 
     public static func defaultDirectory() -> URL {
@@ -131,14 +142,16 @@ public actor ForecastVerifier {
     }
 
     /// Fetches observations for due forecasts (hourly at most) and pairs them.
-    public func verifyIfDue(key: String, stationsURL: URL?, near forecastPoint: Coordinate? = nil) async {
+    public func verifyIfDue(key: String, stationsURL: URL?, near forecastPoint: Coordinate? = nil,
+                            cityElevationM: Double? = nil) async {
         load()
         let t = now()
         if let last = meta[key]?.lastObsCheck, t.timeIntervalSince(last) < Self.observationInterval { return }
         let due = pending.filter { $0.loc == key && $0.valid <= t.addingTimeInterval(-20 * 60) }
         guard !due.isEmpty else { return }
         meta[key, default: Meta()].lastObsCheck = t
-        guard let station = await station(for: key, stationsURL: stationsURL, near: forecastPoint) else { saveMeta(); return }
+        guard let station = await station(for: key, stationsURL: stationsURL, near: forecastPoint,
+                                          cityElevationM: cityElevationM) else { saveMeta(); return }
         let start = max(due.map(\.valid).min()!.addingTimeInterval(-70 * 60), t.addingTimeInterval(-3 * 86400))
         guard let url = Self.observationsURL(station: station, start: start),
               let data = try? await client.get(url, headers: ["Accept": "application/geo+json"]),
@@ -185,12 +198,17 @@ public actor ForecastVerifier {
 
     /// "Reset accuracy data" in Settings (L23): forgets every saved forecast and verified pair, on disk
     /// too. Learning starts over (neutral weights until 3 days are collected again).
-    public func reset() {
+    /// Accuracy PR 2 (B15): also clears benchmark/, corrections, training, metar-verified, and caches.
+    public func reset() async {
         pending = []; verified = []; meta = [:]; cachedScores = [:]; cachedWeights = [:]
+        cachedOffsets = [:]; cachedStatuses = [:]; correctionsReady = false
+        metarWeightInputs = [:]; metarWeightEligible = []
+        lastNWSObs = [:]
         loaded = true
         for name in ["pending.jsonl", "verified.jsonl", "meta.json"] {
             try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
         }
+        await benchmark.reset()
         // The reset travels to the other Macs through accuracy.json as the next generation (H3).
         accuracyReset = AccuracyReset(generation: (accuracyReset?.generation ?? 0) + 1, at: now())
         resetNeedsPush = true
@@ -272,10 +290,67 @@ public actor ForecastVerifier {
         load()
         if let w = cachedWeights[key] { return w }
         // Learn from every member's full record (see `dedupingNOAAFamily(dropDuplicates:)`); display stays de-duplicated.
-        let learning = AccuracyScorer.score(AccuracySync.collapsedForScoring(verified.filter { $0.r.loc == key }), now: now(), dedupe: false)
+        var records = AccuracySync.collapsedForScoring(verified.filter { $0.r.loc == key })
+        // Accuracy PR 2 (B17): non-US METAR pairs feed AdaptiveWeighting inputs when gated.
+        // Formula / bounds / eligibility unchanged. US cities stay byte-identical (no merge).
+        if BiasCorrection.Switch.isEnabled(), metarWeightEligible.contains(key),
+           let extra = metarWeightInputs[key], !extra.isEmpty {
+            records = AccuracySync.collapsedForScoring(records + extra)
+        }
+        let learning = AccuracyScorer.score(records, now: now(), dedupe: false)
         let w = AdaptiveWeighting.weights(from: learning, config: config)
         cachedWeights[key] = w
         return w
+    }
+
+    /// Same as `weightsIfLoaded` for correction offsets (B16). Nil until this key's offsets are in memory.
+    public func correctionIfLoaded(_ key: String) -> [CorrectionTarget: Double]? {
+        guard correctionsReady else { return nil }
+        return cachedOffsets[key]
+    }
+
+    /// Ensures corrections are loaded / refreshed for `key`. Safe to call off-main / detached.
+    @discardableResult
+    public func corrections(_ key: String, timeZoneIdentifier: String = TimeZone.gmt.identifier,
+                            cityElevationM: Double? = nil) async -> [CorrectionTarget: Double] {
+        await benchmark.loadCorrectionsOnly()
+        correctionsReady = true
+        let siting = await benchmark.sitingOK(for: key, cityElevationM: cityElevationM)
+        let offsets = await benchmark.refreshCorrections(key: key, timeZoneIdentifier: timeZoneIdentifier,
+                                                         sitingOK: siting)
+        cachedOffsets[key] = offsets
+        cachedStatuses[key] = await buildStatuses(key: key, timeZoneIdentifier: timeZoneIdentifier,
+                                                 sitingOK: siting, offsets: offsets)
+        return offsets
+    }
+
+    public func correctionStatuses(_ key: String) -> [CorrectionStatus] {
+        cachedStatuses[key] ?? []
+    }
+
+    private func buildStatuses(key: String, timeZoneIdentifier: String, sitingOK: Bool,
+                              offsets: [CorrectionTarget: Double]) async -> [CorrectionStatus] {
+        let switchOn = BiasCorrection.Switch.isEnabled()
+        let qa = BiasCorrection.QAOverride.celsius() != nil
+        var cal = Calendar(identifier: .gregorian)
+        if let tz = TimeZone(identifier: timeZoneIdentifier) { cal.timeZone = tz }
+        let localDay = cal.startOfDay(for: now())
+        var out: [CorrectionStatus] = []
+        for target in CorrectionTarget.allCases {
+            let rows = await benchmark.trainingRows(for: key, target: target)
+                .filter { $0.localDay < localDay }
+            let nDays = Set(rows.map { Int($0.localDay.timeIntervalSince1970) }).count
+            let entry = await benchmark.correctionEntry(loc: key, target: target)
+            let gated = BiasCorrection.gate(rows: rows, target: target, sitingOK: sitingOK,
+                                            switchOn: switchOn, measurementOn: AccuracyMeasurement.isEnabled())
+            let line = BiasCorrection.statusLine(entry: entry, gated: gated, sitingOK: sitingOK,
+                                                 switchOn: switchOn, nDays: nDays,
+                                                 units: { $0 }, qaOverride: qa)
+            out.append(CorrectionStatus(loc: key, target: target, line: line,
+                                        appliedC: offsets[target] ?? 0, nDays: nDays,
+                                        gated: gated, autoOff: entry?.autoOff ?? false, sitingOK: sitingOK))
+        }
+        return out
     }
 
     public func report(_ key: String) -> AccuracyReport {
@@ -310,27 +385,33 @@ public actor ForecastVerifier {
         BenchmarkStore.directoryAlongside(verification: directory)
     }
 
-    /// Runs METAR / MET Norway / daily measurement. Failures are swallowed; never affects weights or display.
+    /// Runs METAR / MET Norway / daily measurement + PR 2 training / corrections refresh.
     public func runMeasurement(key: String, coordinate: Coordinate, timeZoneIdentifier: String,
                                daily: [DailyForecast], openMeteo om: OpenMeteoResponse,
                                blended: [HourlyForecast], isUS: Bool,
-                               nwsObservations: [StationObservation] = []) async {
+                               nwsObservations: [StationObservation] = [],
+                               cityElevationM: Double? = nil) async {
         guard AccuracyMeasurement.isEnabled() else { return }
         let nwsObservations = nwsObservations.isEmpty ? (lastNWSObs[key] ?? []) : nwsObservations
         let tz = TimeZone(identifier: timeZoneIdentifier) ?? .gmt
         let issued = now()
-        // Station pick (non-US only). US keeps NWS/ASOS via verifyIfDue unchanged.
+        let elev = cityElevationM ?? om.elevation
         if !isUS {
-            _ = await benchmark.ensureStation(key: key, near: coordinate, isUS: false)
+            _ = await benchmark.ensureStation(key: key, near: coordinate, isUS: false, cityElevationM: elev)
             _ = await benchmark.fetchMetarsIfDue(for: key)
+        } else if let elev {
+            await benchmark.seedCityElevation(elev, key: key)
         }
         let metHours = await benchmark.fetchMetNorwayIfDue(key: key, coordinate: coordinate)
+        if isUS, !nwsObservations.isEmpty {
+            await benchmark.recordNWSTemps(key: key, stationID: meta[key]?.stationID, obs: nwsObservations)
+        }
         let issues = ForecastSampler.dailyIssues(location: key, issued: issued, daily: daily, openMeteo: om,
-                                                 timeZone: tz, metNorway: metHours)
+                                                 timeZone: tz, metNorway: metHours, blendedHourly: blended)
         await benchmark.recordDailyIssues(issues)
 
-        // Pair forecasts with observations into the isolated store only — never verified.jsonl.
         var pairs: [BenchmarkHourlyPair] = []
+        var metarPairs: [VerifiedRecord] = []
         var obs = isUS ? nwsObservations : await benchmark.metarObservations(for: key)
         if obs.isEmpty, !nwsObservations.isEmpty { obs = nwsObservations }
         if !obs.isEmpty {
@@ -338,7 +419,7 @@ public actor ForecastVerifier {
                 guard let o = ObservationAggregator.observe(obs, validTime: r.valid), let ot = o.t else { continue }
                 if let bt = r.values(.blend)?.t {
                     pairs.append(BenchmarkHourlyPair(loc: key, issued: r.issued, valid: r.valid, kind: .skyline,
-                                                     forecastC: bt, observedC: ot))
+                                                     forecastC: bt, observedC: ot, uncorrectedC: bt))
                 }
                 if let nt = r.values(.nws)?.t {
                     pairs.append(BenchmarkHourlyPair(loc: key, issued: r.issued, valid: r.valid, kind: .nws,
@@ -347,6 +428,9 @@ public actor ForecastVerifier {
                 if let mt = r.values(.bestMatch)?.t {
                     pairs.append(BenchmarkHourlyPair(loc: key, issued: r.issued, valid: r.valid, kind: .bestMatch,
                                                      forecastC: mt, observedC: ot))
+                }
+                if !isUS, r.leadHours >= BiasCorrection.minLeadHoursForLearning {
+                    metarPairs.append(VerifiedRecord(r, o))
                 }
             }
             let metLeads = ForecastSampler.metNorwayLeadValues(location: key, issued: issued, hours: metHours)
@@ -358,23 +442,46 @@ public actor ForecastVerifier {
             }
         }
         if !pairs.isEmpty { await benchmark.recordHourlyPairs(pairs) }
+        if !metarPairs.isEmpty { await benchmark.recordMetarVerified(metarPairs) }
 
         let extraTemps = nwsObservations.compactMap { o -> (Date, Double)? in
             guard let t = o.temperatureC else { return nil }
             return (o.time, t)
         }
         await benchmark.scoreCompletedDays(key: key, timeZoneIdentifier: timeZoneIdentifier, extraTemps: extraTemps)
+        await benchmark.learnTraining(key: key, timeZoneIdentifier: timeZoneIdentifier)
+
+        if !isUS, BiasCorrection.Switch.isEnabled() {
+            let siting = await benchmark.sitingOK(for: key, cityElevationM: elev)
+            let days = await benchmark.distinctMetarDays(for: key)
+            if siting, days >= 7 {
+                metarWeightEligible.insert(key)
+                metarWeightInputs[key] = await benchmark.metarVerifiedRecords(for: key)
+                cachedWeights[key] = nil
+            } else {
+                metarWeightEligible.remove(key)
+                metarWeightInputs[key] = nil
+            }
+        } else {
+            metarWeightEligible.remove(key)
+            metarWeightInputs[key] = nil
+        }
+        _ = await corrections(key, timeZoneIdentifier: timeZoneIdentifier, cityElevationM: elev)
     }
 
     /// Test seam: seed the isolated store without touching verified.jsonl / weights.
     public func seedBenchmark(station: MetarStationPick? = nil, key: String,
                               metars: [MetarObservationRecord] = [],
                               hourly: [BenchmarkHourlyPair] = [],
-                              daily: [DailyObservedExtremes] = []) async {
+                              daily: [DailyObservedExtremes] = [],
+                              training: [TrainingRow] = [],
+                              cityElevationM: Double? = nil) async {
         if let station { await benchmark.seedStation(station, key: key) }
+        if let cityElevationM { await benchmark.seedCityElevation(cityElevationM, key: key) }
         if !metars.isEmpty { await benchmark.seedMetars(metars) }
         if !hourly.isEmpty { await benchmark.seedHourly(hourly) }
         if !daily.isEmpty { await benchmark.seedDailyObs(daily) }
+        if !training.isEmpty { await benchmark.seedTraining(training) }
         await benchmark.forceRecomputeSummaries()
     }
 
@@ -390,7 +497,8 @@ public actor ForecastVerifier {
         return s
     }
 
-    private func station(for key: String, stationsURL: URL?, near forecastPoint: Coordinate?) async -> String? {
+    private func station(for key: String, stationsURL: URL?, near forecastPoint: Coordinate?,
+                         cityElevationM: Double? = nil) async -> String? {
         if let id = meta[key]?.stationID, let fetched = meta[key]?.stationFetched,
            now().timeIntervalSince(fetched) < 7 * 86400 { return id }
         guard let stationsURL, let data = try? await client.get(stationsURL, headers: ["Accept": "application/geo+json"]),
@@ -398,7 +506,39 @@ public actor ForecastVerifier {
         meta[key, default: Meta()].stationID = chosen.id
         meta[key]?.stationName = chosen.name
         meta[key]?.stationFetched = now()
+        // Accuracy PR 2 c3: seed benchmark siting from the already-fetched stations list (no new request).
+        if let point = forecastPoint, let pick = Self.nwsStationPick(data: data, id: chosen.id, near: point,
+                                                                     cityElevationM: cityElevationM, at: now()) {
+            await benchmark.seedStation(pick, key: key)
+            if let cityElevationM { await benchmark.seedCityElevation(cityElevationM, key: key) }
+        }
         return chosen.id
+    }
+
+    /// Decode distance / elevation for one NWS station id from the gridpoint stations GeoJSON.
+    /// Private to ForecastVerifier (allowed file); avoids changing off-limits Observations.swift.
+    static func nwsStationPick(data: Data, id: String, near point: Coordinate,
+                               cityElevationM: Double?, at pickedAt: Date) -> MetarStationPick? {
+        struct List: Decodable {
+            struct Geom: Decodable { var coordinates: [Double]? }
+            struct Elev: Decodable { var value: Double? }
+            struct P: Decodable {
+                var stationIdentifier: String?
+                var name: String?
+                var elevation: Elev?
+            }
+            struct F: Decodable { var properties: P; var geometry: Geom? }
+            var features: [F]
+        }
+        guard let list = try? JSONDecoder().decode(List.self, from: data) else { return nil }
+        guard let f = list.features.first(where: { ($0.properties.stationIdentifier ?? "").uppercased() == id.uppercased() }),
+              let coords = f.geometry?.coordinates, coords.count >= 2 else { return nil }
+        let coord = Coordinate(latitude: coords[1], longitude: coords[0])
+        let dist = NexradStation.distanceKm(point, coord)
+        let elev = f.properties.elevation?.value
+        let delta = cityElevationM.flatMap { c in elev.map { $0 - c } }
+        return MetarStationPick(stationID: id, name: f.properties.name, coordinate: coord,
+                                elevationM: elev, distanceKm: dist, elevationDeltaM: delta, pickedAt: pickedAt)
     }
 
     static func observationsURL(station: String, start: Date) -> URL? {

@@ -256,4 +256,17 @@ public enum BenchmarkScorer {
                                 stationDistanceKm: station?.distanceKm,
                                 metNorwayAttribution: METNorwayClient.attribution)
     }
+
+    // MARK: Accuracy PR 2 — training / gate helpers
+
+    /// Deduped count of (loc, kind, issued, valid) hourly pairs (B1).
+    public static func dedupedHourlyCount(_ pairs: [BenchmarkHourlyPair]) -> Int {
+        struct K: Hashable { var loc: String; var kind: BenchmarkForecastKind; var issued: Date; var valid: Date }
+        return Set(pairs.map { K(loc: $0.loc, kind: $0.kind, issued: $0.issued, valid: $0.valid) }).count
+    }
+
+    /// Distinct local days represented in training rows for a target.
+    public static func distinctTrainingDays(_ rows: [TrainingRow]) -> Int {
+        Set(rows.map { Int($0.localDay.timeIntervalSince1970) }).count
+    }
 }

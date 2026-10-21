@@ -50,6 +50,7 @@ struct AccuracyPanel: View {
     @State private var bucket: LeadBucket?
     @State private var showDetails = false
     @State private var benchmark: BenchmarkSummary?
+    @State private var correctionLines: [CorrectionStatus] = []
 
     var body: some View {
         let r = store.accuracy[location.id]
@@ -73,6 +74,7 @@ struct AccuracyPanel: View {
                 collecting(nil)
             }
             benchmarkSection(report: r)
+            correctionSection
             Text("How it works: every few hours Skyline saves what each source predicted for this place, then compares it with what the nearest NWS weather station measured. Typical error is the mean absolute difference; rain calls count hours with ≥ 50 % chance (or ≥ 0.2 mm) against hours the station reported precipitation. Once there are \(Int(r?.minDays ?? 3))+ days of pairs, the blend gives more weight to the sources that have been most accurate here, and never drops any source entirely.")
                 .font(.caption)
                 .foregroundStyle(Glass.secondaryText)
@@ -82,6 +84,50 @@ struct AccuracyPanel: View {
             await store.refreshAccuracy(for: location)
             let key = VerificationKey.key(for: location)
             benchmark = await store.service.verifier?.benchmarkSummary(key)
+            if let v = store.service.verifier {
+                _ = await v.corrections(key, timeZoneIdentifier: location.timeZoneIdentifier ?? TimeZone.current.identifier)
+                let raw = await v.correctionStatuses(key)
+                correctionLines = raw.map { s in
+                    var copy = s
+                    // Show delta in the user's unit (×1.8 for °F, never +32) — B10.
+                    copy = CorrectionStatus(
+                        loc: s.loc, target: s.target,
+                        line: BiasCorrection.statusLine(
+                            entry: CorrectionEntry(loc: s.loc, target: s.target, appliedC: s.appliedC,
+                                                   autoOff: s.autoOff),
+                            gated: s.gated, sitingOK: s.sitingOK,
+                            switchOn: SkylineAccuracyCorrection.isEnabled(),
+                            nDays: s.nDays,
+                            units: { units.temperatureDelta($0) },
+                            qaOverride: BiasCorrection.QAOverride.celsius() != nil),
+                        appliedC: s.appliedC, nDays: s.nDays, gated: s.gated,
+                        autoOff: s.autoOff, sitingOK: s.sitingOK)
+                    return copy
+                }
+            }
+        }
+    }
+
+    /// Accuracy PR 2: one line per city × target (lock §2).
+    @ViewBuilder
+    private var correctionSection: some View {
+        if !correctionLines.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("BIAS CORRECTION")
+                    .font(.caption2.weight(.semibold)).foregroundStyle(Glass.secondaryText)
+                ForEach(correctionLines, id: \.target) { s in
+                    HStack {
+                        Text(s.target.displayName).font(.callout.weight(.semibold))
+                        Spacer()
+                        Text(s.line).font(.caption.monospacedDigit())
+                            .foregroundStyle(Glass.secondaryText)
+                    }
+                    .padding(.vertical, 1)
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
     }
 
