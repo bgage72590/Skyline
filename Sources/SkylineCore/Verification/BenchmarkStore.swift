@@ -15,11 +15,16 @@ public actor BenchmarkStore {
         var lastMetarBatch: Date?
         var lastSummaryAt: Date?
         var cityElevationM: Double?
+        /// Review fix: negative / failure cache for the AWC station search.
+        var noStationUntil: Date?
+        var lastDailyIssue: Date?
         init(station: MetarStationPick? = nil, lastMetNorwayFetch: Date? = nil, lastMetarBatch: Date? = nil,
-             lastSummaryAt: Date? = nil, cityElevationM: Double? = nil) {
+             lastSummaryAt: Date? = nil, cityElevationM: Double? = nil,
+             noStationUntil: Date? = nil, lastDailyIssue: Date? = nil) {
             self.station = station; self.lastMetNorwayFetch = lastMetNorwayFetch
             self.lastMetarBatch = lastMetarBatch; self.lastSummaryAt = lastSummaryAt
             self.cityElevationM = cityElevationM
+            self.noStationUntil = noStationUntil; self.lastDailyIssue = lastDailyIssue
         }
     }
 
@@ -120,14 +125,19 @@ public actor BenchmarkStore {
         if let s = meta[key]?.station, now().timeIntervalSince(s.pickedAt) < METARClient.stationCacheDays * 86400 {
             return s
         }
+        if let until = meta[key]?.noStationUntil, now() < until { return nil }
         let box = METARClient.searchBBox(around: point)
         let url = Endpoints.awcStationInfo(bbox: box.0, box.1, box.2, box.3)
         guard noteRequest(),
               let result = try? await client.fetch(url, headers: ["Accept": "application/json"]),
-              (200..<300).contains(result.statusCode) || result.isNoContent else { return meta[key]?.station }
-        if result.isNoContent { return nil }
-        let stations = METARClient.decodeStations(result.data)
+              (200..<300).contains(result.statusCode) || result.isNoContent else {
+            if meta[key]?.station == nil { meta[key, default: Meta()].noStationUntil = now().addingTimeInterval(6 * 3600); saveMeta() }
+            return meta[key]?.station
+        }
+        let stations = result.isNoContent ? [] : METARClient.decodeStations(result.data)
         guard let pick = METARClient.pickNearest(stations, near: point, cityElevationM: cityElevationM) else {
+            meta[key, default: Meta()].noStationUntil = now().addingTimeInterval(METARClient.stationCacheDays * 86400)
+            saveMeta()
             return nil
         }
         var m = meta[key] ?? Meta()
@@ -182,7 +192,7 @@ public actor BenchmarkStore {
         }
         if !added.isEmpty {
             append(added, to: "metars.jsonl")
-            prune()
+            pruneIfDue()
             recomputeSummaries()
         }
         return added.filter { $0.loc == key }
@@ -215,19 +225,35 @@ public actor BenchmarkStore {
     public func recordDailyIssues(_ issues: [DailyForecastIssue]) {
         load()
         assertOffMain()
-        guard !issues.isEmpty else { return }
-        dailyIssues.append(contentsOf: issues)
-        append(issues, to: "daily-issues.jsonl")
-        prune()
+        // Review fix: at most one issuance per city per 3 h, and only days that haven't started yet
+        // (a same-day "forecast" is mostly observation and makes the daily MAE meaningless).
+        var keep: [DailyForecastIssue] = []
+        for (loc, rows) in Dictionary(grouping: issues, by: \.loc) {
+            guard let issued = rows.map(\.issued).min() else { continue }
+            if let last = meta[loc]?.lastDailyIssue, issued.timeIntervalSince(last) < Self.metNorwayIssueInterval { continue }
+            let future = rows.filter { $0.localDay > $0.issued }
+            guard !future.isEmpty else { continue }
+            meta[loc, default: Meta()].lastDailyIssue = issued
+            keep.append(contentsOf: future)
+        }
+        guard !keep.isEmpty else { return }
+        saveMeta()
+        dailyIssues.append(contentsOf: keep)
+        append(keep, to: "daily-issues.jsonl")
+        pruneIfDue()
     }
 
     public func recordHourlyPairs(_ pairs: [BenchmarkHourlyPair]) {
         load()
         assertOffMain()
-        guard !pairs.isEmpty else { return }
-        hourlyBench.append(contentsOf: pairs)
-        append(pairs, to: "hourly.jsonl")
-        prune()
+        // Review fix: the same (city, source, issue, valid) pair is offered on every refresh; keep it once.
+        struct K: Hashable { var loc: String; var kind: BenchmarkForecastKind; var issued: Date; var valid: Date }
+        var seen = Set(hourlyBench.map { K(loc: $0.loc, kind: $0.kind, issued: $0.issued, valid: $0.valid) })
+        let fresh = pairs.filter { seen.insert(K(loc: $0.loc, kind: $0.kind, issued: $0.issued, valid: $0.valid)).inserted }
+        guard !fresh.isEmpty else { return }
+        hourlyBench.append(contentsOf: fresh)
+        append(fresh, to: "hourly.jsonl")
+        pruneIfDue()
         recomputeSummaries()
     }
 
@@ -324,7 +350,19 @@ public actor BenchmarkStore {
         saveSummaries()
     }
 
+    private var lastPruneAt: Date?
+    /// Review fix: full rewrite of every file at most hourly (and at load), not on every append.
+    private func pruneIfDue() {
+        if let last = lastPruneAt, now().timeIntervalSince(last) < 3600, totalByteSize() <= Self.maxTotalBytes { return }
+        prune()
+    }
+
+    private func fileSize(_ name: String) -> Int {
+        (try? FileManager.default.attributesOfItem(atPath: directory.appendingPathComponent(name).path)[.size] as? NSNumber)?.intValue ?? 0
+    }
+
     private func prune() {
+        lastPruneAt = now()
         let cutoff = now().addingTimeInterval(-Self.retentionDays * 86400)
         metars = capped(metars.filter { $0.time >= cutoff }, perCity: \.loc, time: \.time)
         dailyIssues = capped(dailyIssues.filter { $0.issued >= cutoff }, perCity: \.loc, time: \.issued)
@@ -334,17 +372,23 @@ public actor BenchmarkStore {
         writeAll(dailyIssues, to: "daily-issues.jsonl")
         writeAll(dailyObs, to: "daily-obs.jsonl")
         writeAll(hourlyBench, to: "hourly.jsonl")
-        // Hard size ceiling: drop oldest hourly/metar rows until under budget.
-        while totalByteSize() > Self.maxTotalBytes {
-            if !hourlyBench.isEmpty {
-                let oldest = hourlyBench.map(\.valid).min()!
-                hourlyBench.removeAll { $0.valid == oldest }
-                writeAll(hourlyBench, to: "hourly.jsonl")
-            } else if !metars.isEmpty {
-                let oldest = metars.map(\.time).min()!
-                metars.removeAll { $0.time == oldest }
-                writeAll(metars, to: "metars.jsonl")
-            } else { break }
+        // Hard size ceiling, one pass per file (review fix: the old loop re-encoded and rewrote the whole
+        // file once per distinct timestamp). Oldest rows go first, hourly pairs before METARs as before.
+        var excess = totalByteSize() - Self.maxTotalBytes
+        if excess > 0, !hourlyBench.isEmpty {
+            let size = max(1, fileSize("hourly.jsonl"))
+            let drop = min(hourlyBench.count, Int(Double(excess) / Double(size) * Double(hourlyBench.count)) + 1)
+            hourlyBench.sort { $0.valid < $1.valid }
+            hourlyBench.removeFirst(drop)
+            writeAll(hourlyBench, to: "hourly.jsonl")
+            excess = totalByteSize() - Self.maxTotalBytes
+        }
+        if excess > 0, !metars.isEmpty {
+            let size = max(1, fileSize("metars.jsonl"))
+            let drop = min(metars.count, Int(Double(excess) / Double(size) * Double(metars.count)) + 1)
+            metars.sort { $0.time < $1.time }
+            metars.removeFirst(drop)
+            writeAll(metars, to: "metars.jsonl")
         }
     }
 

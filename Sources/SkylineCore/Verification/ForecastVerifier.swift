@@ -76,6 +76,9 @@ public actor ForecastVerifier {
     private var cachedWeights: [String: BlendWeights] = [:]
     /// Isolated, unsynced store for METAR / MET Norway / daily benchmark (Accuracy PR 1).
     private let benchmark: BenchmarkStore
+    /// Review fix: last NWS observations fetched by verifyIfDue, reused (in memory only) for the US
+    /// daily high/low benchmark so it needs no extra request.
+    private var lastNWSObs: [String: [StationObservation]] = [:]
 
     public init(directory: URL = ForecastVerifier.defaultDirectory(), client: HTTPClient = URLSessionHTTPClient(),
                 config: AdaptiveWeighting.Config = AdaptiveWeighting.Config(),
@@ -140,6 +143,7 @@ public actor ForecastVerifier {
         guard let url = Self.observationsURL(station: station, start: start),
               let data = try? await client.get(url, headers: ["Accept": "application/geo+json"]),
               let obs = try? NWSObservationParser.decode(data) else { saveMeta(); return }
+        lastNWSObs[key] = obs
         ingest(observations: obs, key: key)
         saveMeta()
     }
@@ -312,6 +316,7 @@ public actor ForecastVerifier {
                                blended: [HourlyForecast], isUS: Bool,
                                nwsObservations: [StationObservation] = []) async {
         guard AccuracyMeasurement.isEnabled() else { return }
+        let nwsObservations = nwsObservations.isEmpty ? (lastNWSObs[key] ?? []) : nwsObservations
         let tz = TimeZone(identifier: timeZoneIdentifier) ?? .gmt
         let issued = now()
         // Station pick (non-US only). US keeps NWS/ASOS via verifyIfDue unchanged.
@@ -349,14 +354,6 @@ public actor ForecastVerifier {
                 if let o = ObservationAggregator.observe(obs, validTime: valid), let ot = o.t {
                     pairs.append(BenchmarkHourlyPair(loc: key, issued: issued, valid: valid, kind: .metNorway,
                                                      forecastC: ft, observedC: ot))
-                }
-            }
-            // Also pair current blended hours against obs for Skyline/Best Match when no pending yet.
-            if pending.filter({ $0.loc == key }).isEmpty {
-                for h in blended {
-                    guard let o = ObservationAggregator.observe(obs, validTime: h.time), let ot = o.t else { continue }
-                    pairs.append(BenchmarkHourlyPair(loc: key, issued: issued, valid: h.time, kind: .skyline,
-                                                     forecastC: h.temperature, observedC: ot))
                 }
             }
         }

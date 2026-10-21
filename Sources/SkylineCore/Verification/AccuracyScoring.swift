@@ -227,7 +227,8 @@ public enum BenchmarkScorer {
         let key = kind.rawValue
         var sum = 0.0, n = 0
         for o in obs {
-            let issue = issues.filter { $0.loc == o.loc && abs($0.localDay.timeIntervalSince(o.localDay)) < 1 }
+            // Review fix: the latest issue made before the local day began (day-ahead), never a same-day nowcast.
+            let issue = issues.filter { $0.loc == o.loc && abs($0.localDay.timeIntervalSince(o.localDay)) < 1 && $0.issued < o.localDay }
                 .max(by: { $0.issued < $1.issued })
             guard let issue else { continue }
             let forecast = high ? issue.highs[key] : issue.lows[key]

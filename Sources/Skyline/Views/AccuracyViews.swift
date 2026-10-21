@@ -85,23 +85,42 @@ struct AccuracyPanel: View {
         }
     }
 
-    /// Accuracy PR 1: measurement-only comparison. NWS / Best Match reuse existing scores; MET Norway from the isolated store.
+    /// Accuracy PR 1: measurement-only comparison. Hourly temperature MAE and daily high/low MAE are
+    /// separate lists (never mix MET daily-high with Skyline/NWS/Best Match hourly).
     @ViewBuilder
     private func benchmarkSection(report: AccuracyReport?) -> some View {
-        let rows = benchmarkRows(report: report)
-        if !rows.isEmpty {
+        let hourly = hourlyBenchmarkRows(report: report)
+        let daily = dailyBenchmarkRows()
+        if !hourly.isEmpty || !daily.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Skyline vs other forecasts")
                     .font(.title2.weight(.semibold))
                 Text("How Skyline’s forecast compares with other free forecasts at this place. Hidden until there are at least 20 verified samples.")
                     .font(.caption).foregroundStyle(Glass.secondaryText)
-                ForEach(rows, id: \.title) { row in
-                    HStack {
-                        Text(row.title).font(.callout.weight(.semibold))
-                        Spacer()
-                        Text(row.value).font(.callout.monospacedDigit())
+                if !hourly.isEmpty {
+                    Text("HOURLY TEMPERATURE (TYPICAL ERROR)")
+                        .font(.caption2.weight(.semibold)).foregroundStyle(Glass.secondaryText)
+                    ForEach(hourly, id: \.title) { row in
+                        HStack {
+                            Text(row.title).font(.callout.weight(.semibold))
+                            Spacer()
+                            Text(row.value).font(.callout.monospacedDigit())
+                        }
+                        .padding(.vertical, 2)
                     }
-                    .padding(.vertical, 2)
+                }
+                if !daily.isEmpty {
+                    Text("DAILY HIGH / LOW (TYPICAL ERROR)")
+                        .font(.caption2.weight(.semibold)).foregroundStyle(Glass.secondaryText)
+                        .padding(.top, hourly.isEmpty ? 0 : 4)
+                    ForEach(daily, id: \.title) { row in
+                        HStack {
+                            Text(row.title).font(.callout.weight(.semibold))
+                            Spacer()
+                            Text(row.value).font(.callout.monospacedDigit())
+                        }
+                        .padding(.vertical, 2)
+                    }
                 }
                 if let b = benchmark {
                     if let id = b.stationID {
@@ -124,9 +143,10 @@ struct AccuracyPanel: View {
         var value: String
     }
 
-    private func benchmarkRows(report: AccuracyReport?) -> [BenchRow] {
+    /// Hourly temperature MAE only — comparable across sources that have hourly verified pairs.
+    private func hourlyBenchmarkRows(report: AccuracyReport?) -> [BenchRow] {
         var out: [BenchRow] = []
-        // Reuse existing verified source scores for NWS and Best Match (lock §7.4).
+        // Prefer existing AccuracyReport scores for Skyline / NWS / Best Match (lock §7.4).
         if let report {
             if let s = report.overall[.blend], s.tempHours >= 20, let mae = s.tempMAE {
                 out.append(BenchRow(title: "Skyline", value: "±" + AccuracyFormat.delta(mae, units)))
@@ -140,13 +160,36 @@ struct AccuracyPanel: View {
         }
         if let b = benchmark {
             for row in b.rows where row.isVisible {
-                if row.kind == .metNorway, let mae = row.tempMAE ?? row.highMAE {
+                // Hourly temp MAE only — never fall back to daily highMAE here.
+                guard let mae = row.tempMAE, row.n >= 20 else { continue }
+                if row.kind == .metNorway {
                     out.append(BenchRow(title: "MET Norway", value: "±" + AccuracyFormat.delta(mae, units)))
                 }
-                if row.kind == .skyline, report?.overall[.blend] == nil, let mae = row.tempMAE ?? row.highMAE {
+                if row.kind == .skyline, report?.overall[.blend] == nil {
                     out.append(BenchRow(title: "Skyline", value: "±" + AccuracyFormat.delta(mae, units)))
                 }
+                if row.kind == .nws, report?.overall[.nws] == nil {
+                    out.append(BenchRow(title: "NWS", value: "±" + AccuracyFormat.delta(mae, units)))
+                }
+                if row.kind == .bestMatch, report?.overall[.bestMatch] == nil {
+                    out.append(BenchRow(title: "Best Match", value: "±" + AccuracyFormat.delta(mae, units)))
+                }
             }
+        }
+        return out
+    }
+
+    /// Daily high/low MAE from the isolated store for all four kinds (same metric, same issues).
+    private func dailyBenchmarkRows() -> [BenchRow] {
+        guard let b = benchmark else { return [] }
+        var out: [BenchRow] = []
+        for kind in BenchmarkForecastKind.allCases {
+            guard let row = b.rows.first(where: { $0.kind == kind }), row.dailyN >= 20 else { continue }
+            let high = row.highMAE.map { "H ±" + AccuracyFormat.delta($0, units) }
+            let low = row.lowMAE.map { "L ±" + AccuracyFormat.delta($0, units) }
+            let parts = [high, low].compactMap { $0 }
+            guard !parts.isEmpty else { continue }
+            out.append(BenchRow(title: kind.displayName, value: parts.joined(separator: " · ")))
         }
         return out
     }

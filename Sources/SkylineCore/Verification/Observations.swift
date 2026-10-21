@@ -202,6 +202,8 @@ public enum METARParser {
         if tokens.first == "AUTO" { tokens.removeFirst() }
 
         for tok in tokens {
+            // Review fix: remarks and trend groups describe other times/places, not the observation.
+            if tok == "RMK" || tok == "TEMPO" || tok == "BECMG" || tok == "NOSIG" { break }
             if out.windKmh == nil, let w = parseWind(tok) { out.windKmh = w }
             if out.temperatureC == nil, let t = parseTempDew(tok) { out.temperatureC = t }
             if tok == "CAVOK" { if out.wet == nil { out.wet = false } }
@@ -252,8 +254,11 @@ public enum METARParser {
 
     /// `tt/dd` with `M` for negatives; `////` → nil.
     public static func parseTempDew(_ tok: String) -> Double? {
-        let parts = tok.split(separator: "/", maxSplits: 1).map(String.init)
-        guard parts.count == 2 else { return nil }
+        // Review fix: only a real `tt/dd` group (two digits, optional M) — not `1/2SM`, RVR or `999/99`.
+        let parts = tok.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 2, parts[0].range(of: "^M?[0-9]{2}$", options: .regularExpression) != nil,
+              parts[1].isEmpty || parts[1] == "//" || parts[1].range(of: "^M?[0-9]{2}$", options: .regularExpression) != nil
+        else { return nil }
         return parseTempToken(parts[0])
     }
 
