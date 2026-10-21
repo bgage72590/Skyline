@@ -46,7 +46,8 @@ final class FalseOfflineBannerTests: XCTestCase {
         let before = client.forecastGets
         client.fail(with: [URLError(.networkConnectionLost)])
         let r = try await s.report(for: nyc, forceRefresh: true, priority: .interactive)
-        XCTAssertEqual(client.forecastGets - before, 2, "one immediate second try")
+        // A fails once, retries, succeeds; then B (pair half) — three forecast GETs total.
+        XCTAssertEqual(client.forecastGets - before, 3, "one immediate second try on A, then B")
         XCTAssertFalse(r.isOfflineFallback, "the second try worked: live data, no banner")
         XCTAssertNil(r.fallbackCause)
         XCTAssertTrue(RefreshBookkeeping.afterReport(isOfflineFallback: r.isOfflineFallback, cause: r.fallbackCause,
