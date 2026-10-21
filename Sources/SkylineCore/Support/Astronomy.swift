@@ -1,5 +1,70 @@
 import Foundation
 
+/// Civil sunrise / sunset for a lat/lon on a local calendar day (NOAA solar approximation).
+/// Accurate to a few minutes — enough for NWS-only daily rows when Open-Meteo is unavailable.
+public enum Astronomy {
+    public struct SunTimes: Hashable, Sendable {
+        public var sunrise: Date?
+        public var sunset: Date?
+        public init(sunrise: Date?, sunset: Date?) { self.sunrise = sunrise; self.sunset = sunset }
+    }
+
+    /// Sunrise and sunset for the local calendar day of `day` at `coordinate` in `timeZone`.
+    public static func sunTimes(on day: Date, coordinate: Coordinate, timeZone: TimeZone) -> SunTimes {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+        let start = cal.startOfDay(for: day)
+        let noon = start.addingTimeInterval(12 * 3600)
+        return SunTimes(sunrise: event(.rise, around: noon, latitude: coordinate.latitude,
+                                       longitude: coordinate.longitude),
+                        sunset: event(.set, around: noon, latitude: coordinate.latitude,
+                                      longitude: coordinate.longitude))
+    }
+
+    private enum Kind { case rise, set }
+
+    private static func event(_ kind: Kind, around date: Date, latitude: Double, longitude: Double) -> Date? {
+        // NOAA SPA-lite: zenith 90.833° (civil), one-pass from day-of-year at solar noon.
+        let zenith = 90.833
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(secondsFromGMT: 0)!
+        let dayOfYear = Double(cal.ordinality(of: .day, in: .year, for: date) ?? 1)
+        let lngHour = longitude / 15
+        let t: Double = kind == .rise
+            ? dayOfYear + ((6 - lngHour) / 24)
+            : dayOfYear + ((18 - lngHour) / 24)
+        let M = (0.9856 * t) - 3.289
+        var L = M + (1.916 * sin(rad(M))) + (0.020 * sin(rad(2 * M))) + 282.634
+        L = norm360(L)
+        var RA = deg(atan(0.91764 * tan(rad(L))))
+        RA = norm360(RA)
+        let Lq = floor(L / 90) * 90
+        let RAq = floor(RA / 90) * 90
+        RA = RA + (Lq - RAq)
+        RA /= 15
+        let sinDec = 0.39782 * sin(rad(L))
+        let cosDec = cos(asin(sinDec))
+        let cosH = (cos(rad(zenith)) - (sinDec * sin(rad(latitude)))) / (cosDec * cos(rad(latitude)))
+        if cosH > 1 || cosH < -1 { return nil } // polar day/night
+        var H = kind == .rise ? 360 - deg(acos(cosH)) : deg(acos(cosH))
+        H /= 15
+        let T = H + RA - (0.06571 * t) - 6.622
+        var UT = T - lngHour
+        UT = UT.truncatingRemainder(dividingBy: 24)
+        if UT < 0 { UT += 24 }
+        let start = cal.startOfDay(for: date)
+        return start.addingTimeInterval(UT * 3600)
+    }
+
+    private static func rad(_ d: Double) -> Double { d * .pi / 180 }
+    private static func deg(_ r: Double) -> Double { r * 180 / .pi }
+    private static func norm360(_ d: Double) -> Double {
+        var x = d.truncatingRemainder(dividingBy: 360)
+        if x < 0 { x += 360 }
+        return x
+    }
+}
+
 /// Moon phase from the mean synodic month (accurate to a few hours, plenty for a weather app).
 public struct MoonPhase: Hashable, Sendable {
     /// 0 = new, 0.25 = first quarter, 0.5 = full, 0.75 = last quarter.

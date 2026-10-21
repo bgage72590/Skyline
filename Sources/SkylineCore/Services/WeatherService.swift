@@ -10,6 +10,9 @@ public actor WeatherService {
     /// Cache lifetimes. Forecast data only changes when models run, so ~10 min is plenty.
     public enum TTL {
         public static let forecast: TimeInterval = 10 * 60
+        /// Background cities (not viewed / menu-bar / notify): longer OM + AQ cache. Single constant
+        /// for AQ background TTL, background stale (+15 min), RefreshPlanner, tests and QA (§4.2 D1).
+        public static let background: TimeInterval = 2 * 3600
         public static let nwsForecast: TimeInterval = 15 * 60
         public static let alerts: TimeInterval = 5 * 60
         public static let nwsPoint: TimeInterval = 7 * 24 * 3600
@@ -48,6 +51,17 @@ public actor WeatherService {
         var cause: FallbackCause? = nil
     }
 
+    /// Merged Open-Meteo A+B pair (CR M1).
+    struct OpenMeteoPairResult: Sendable {
+        var response: OpenMeteoResponse
+        /// Older of the two halves' storedAt (pair age / dataAsOf / forecastAsOf).
+        var storedAt: Date
+        var isFallback: Bool
+        var cause: FallbackCause?
+        var halfA: Fetched
+        var halfB: Fetched
+    }
+
     /// Pause before the one immediate re-try of a GET that died in flight (`FallbackCause.retriesOnce`).
     private var transientRetryDelay: TimeInterval = 0.5
     func setTransientRetryDelay(_ seconds: TimeInterval) { transientRetryDelay = seconds }
@@ -55,6 +69,8 @@ public actor WeatherService {
     private let client: HTTPClient
     private let cache: ResponseCache
     private let now: @Sendable () -> Date
+    /// When false (QA hook), never write the `om-daily-limit:<host>` ResponseCache marker.
+    private let persistQuotaMarker: Bool
     private var inFlight: [String: Task<WeatherReport, Error>] = [:]
     /// Hosts that answered 429/503: no requests to them until this time (Retry-After, else 1 → 2 → 4 … min).
     private var backoffUntil: [String: Date] = [:]
@@ -63,6 +79,11 @@ public actor WeatherService {
     /// while it was in flight: NWS requests run concurrently, and a slower success must not cancel a 503
     /// that arrived meanwhile (QA batch 2).
     private var throttleEpoch: [String: Int] = [:]
+    /// Free-tier daily limit resume time (separate from `backoffUntil`).
+    private var dailyLimitUntil: [String: Date] = [:]
+    private var nextProbeAt: [String: Date] = [:]
+    private var dailyLimitJitter: [String: TimeInterval] = [:]
+    private var dailyLimitLoaded: Set<String> = []
     /// The pause a forced refresh uses to wait out a short Retry-After. Production sleeps; tests that
     /// drive `now` jump their clock by the same interval so the suite doesn't wait on the wall clock.
     private var backoffSleep: @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) }
@@ -84,23 +105,39 @@ public actor WeatherService {
                 cache: ResponseCache = ResponseCache(directory: ResponseCache.defaultDirectory()),
                 verifier: ForecastVerifier? = nil,
                 history: ForecastHistory? = nil,
+                persistQuotaMarker: Bool = true,
                 now: @escaping @Sendable () -> Date = { Date() }) {
         self.client = client
         self.cache = cache
         self.verifier = verifier
         self.history = history
+        self.persistQuotaMarker = persistQuotaMarker
         self.now = now
     }
 
     // MARK: Public API
 
     public func report(for location: WeatherLocation, forceRefresh: Bool = false,
-                       priority: FetchPriority = .background) async throws -> WeatherReport {
+                       priority: FetchPriority = .background,
+                       allowNetwork: Bool? = nil,
+                       role: RefreshPlanner.Role? = nil) async throws -> WeatherReport {
         // The coordinate is part of the key: My Location keeps its id while it moves, and a second fix
         // during a slow load must not get the old place's report (QA #13).
-        let key = location.id + "@\(location.coordinate.latitude),\(location.coordinate.longitude)" + (forceRefresh ? "!" : "")
+        let netTag: String = {
+            switch allowNetwork {
+            case .none: return ""
+            case .some(true): return "+net"
+            case .some(false): return "+cache"
+            }
+        }()
+        let roleTag = role == .background ? "+bg" : ""
+        let key = location.id + "@\(location.coordinate.latitude),\(location.coordinate.longitude)"
+            + (forceRefresh ? "!" : "") + netTag + roleTag
         if let existing = inFlight[key] { return try await existing.value }
-        let task = Task { try await self.buildReport(for: location, forceRefresh: forceRefresh, priority: priority) }
+        let task = Task {
+            try await self.buildReport(for: location, forceRefresh: forceRefresh, priority: priority,
+                                       allowNetwork: allowNetwork, role: role)
+        }
         inFlight[key] = task
         defer { inFlight[key] = nil }
         return try await task.value
@@ -204,20 +241,106 @@ public actor WeatherService {
         return StormMotion.relevant(all, near: location)
     }
 
+    // MARK: Daily limit (Open-Meteo free tier)
+
+    /// When requests to `host` may resume after a daily-limit 429 (nil = not limited).
+    public func dailyLimit(for host: String) -> Date? {
+        let h = host.lowercased()
+        guard let until = dailyLimitUntil[h], until > now() else { return nil }
+        return until
+    }
+
+    public func isDailyLimited(host: String) -> Bool { dailyLimit(for: host) != nil }
+
+    /// Clears in-memory daily-limit state and deletes the ResponseCache marker.
+    public func clearDailyLimit(host: String) async {
+        let h = host.lowercased()
+        dailyLimitUntil[h] = nil
+        nextProbeAt[h] = nil
+        dailyLimitJitter[h] = nil
+        dailyLimitLoaded.insert(h)
+        await cache.remove(OpenMeteoQuota.markerKey(host: h))
+    }
+
+    /// Records a daily-limit hit: sets `until` (00:00 UTC + jitter) and persists the marker when allowed.
+    public func noteDailyLimit(host: String) async {
+        let h = host.lowercased()
+        await loadDailyLimitMarkerIfNeeded(h)
+        let jitter = dailyLimitJitter[h] ?? OpenMeteoQuota.drawJitter()
+        dailyLimitJitter[h] = jitter
+        let t = now()
+        let until = OpenMeteoQuota.until(after: t, jitter: jitter)
+        dailyLimitUntil[h] = until
+        nextProbeAt[h] = OpenMeteoQuota.nextProbeAt(lastProbeAt: t)
+        guard persistQuotaMarker else { return }
+        let marker = OpenMeteoQuota.Marker(until: until, lastProbeAt: t, jitter: jitter)
+        if let data = try? OpenMeteoQuota.encode(marker) {
+            await cache.store(data, for: OpenMeteoQuota.markerKey(host: h))
+        }
+    }
+
+    /// Test seam: seed daily-limit state without a network 429.
+    func setDailyLimitForTesting(_ host: String, until: Date, lastProbeAt: Date? = nil, jitter: TimeInterval = 0) {
+        let h = host.lowercased()
+        dailyLimitUntil[h] = until
+        dailyLimitJitter[h] = jitter
+        nextProbeAt[h] = OpenMeteoQuota.nextProbeAt(lastProbeAt: lastProbeAt ?? now())
+        dailyLimitLoaded.insert(h)
+    }
+
+    /// When the next probe GET is allowed for `host` (nil = not limited / unknown).
+    func nextDailyLimitProbe(for host: String) -> Date? {
+        let h = host.lowercased()
+        guard dailyLimitUntil[h] != nil else { return nil }
+        return nextProbeAt[h]
+    }
+
+    private func loadDailyLimitMarkerIfNeeded(_ host: String) async {
+        let h = host.lowercased()
+        guard !dailyLimitLoaded.contains(h) else { return }
+        dailyLimitLoaded.insert(h)
+        guard let entry = await cache.entry(OpenMeteoQuota.markerKey(host: h), maxAge: .infinity),
+              let marker = OpenMeteoQuota.decode(entry.data),
+              OpenMeteoQuota.isSane(marker, now: now()) else { return }
+        dailyLimitUntil[h] = marker.until
+        dailyLimitJitter[h] = marker.jitter
+        nextProbeAt[h] = OpenMeteoQuota.nextProbeAt(lastProbeAt: marker.lastProbeAt)
+    }
+
+    /// True when a network probe is allowed despite an active daily limit (due time or explicit allow).
+    private func mayProbeDailyLimit(host: String, force: Bool, allowNetwork: Bool?) -> Bool {
+        let h = host.lowercased()
+        guard let until = dailyLimitUntil[h], until > now() else { return true }
+        if allowNetwork == true || force { return true }
+        if let probe = nextProbeAt[h], now() >= probe { return true }
+        return false
+    }
+
     // MARK: Assembly
 
     private func buildReport(for location: WeatherLocation, forceRefresh force: Bool,
-                             priority: FetchPriority = .background) async throws -> WeatherReport {
+                             priority: FetchPriority = .background,
+                             allowNetwork: Bool? = nil,
+                             role: RefreshPlanner.Role? = nil) async throws -> WeatherReport {
         // "My Location" goes out at ~1 km (the store already coarsens the fix; this is defense in depth).
         let coord = location.isCurrentLocation ? location.coordinate.coarse : location.coordinate.rounded
         // US-only sources (HRRR, NWS) follow the border outlines and the saved city's country (QA 4).
         let models = ForecastModel.models(inCONUS: location.isInCONUS)
+        let omTTL = (role == .background) ? TTL.background : TTL.forecast
+        let aqTTL = (role == .background) ? TTL.background : TTL.airQuality
+        let omPriority = force ? FetchPriority.interactive : priority
 
-        async let omFetch = fetchEntry(Endpoints.openMeteoForecast(coord, models: models), ttl: TTL.forecast,
-                                       force: force, maxStale: MaxStale.forecast,
-                                       priority: force ? .interactive : priority)
-        async let aqData = optionalFetch(Endpoints.openMeteoAirQuality(coord), ttl: TTL.airQuality, force: force,
-                                         maxStale: MaxStale.airQuality)
+        async let omPairFetch: Result<OpenMeteoPairResult, Error> = {
+            do {
+                return .success(try await fetchOpenMeteoPair(
+                    coord, models: models, ttl: omTTL, force: force, maxStale: MaxStale.forecast,
+                    priority: omPriority, allowNetwork: allowNetwork))
+            } catch {
+                return .failure(error)
+            }
+        }()
+        async let aqData = optionalFetch(Endpoints.openMeteoAirQuality(coord), ttl: aqTTL, force: force,
+                                         maxStale: MaxStale.airQuality, allowNetwork: allowNetwork)
         // A remembered /points 404 skips only the forecast lookup; warnings are asked for regardless (L2).
         let inNWSArea = location.isLikelyInNWSCoverage
         let inNWS = inNWSArea ? !(await nwsKnownMissing(coord)) : false
@@ -227,13 +350,31 @@ public actor WeatherService {
         async let alertsFetch = inNWSArea ? fetchAlerts(coord, force: force) : []
         async let outlooksFetch = location.isInCONUS ? fetchOutlooks(coord) : []
 
-        let omEntry = try await omFetch
-        let om = try OpenMeteoResponse.decode(omEntry.data)
-        guard var current = om.currentConditions() else { throw HTTPError.invalidResponse }
+        let pairOutcome = await omPairFetch
         let nws = await nwsBundle
         let alerts = await alertsFetch
         let air = await aqData.flatMap { try? OpenMeteoAirQualityResponse.decode($0) }
         let outlooks = await outlooksFetch
+
+        let pair: OpenMeteoPairResult?
+        switch pairOutcome {
+        case .success(let p): pair = p
+        case .failure(let error):
+            let limited = await {
+                if case HTTPError.dailyLimit = error { return true }
+                return isDailyLimited(host: OpenMeteoQuota.forecastHost)
+            }()
+            if limited {
+                return try await buildNWSOnlyOrThrow(location: location, coord: coord, nws: nws,
+                                                     alerts: alerts, air: air, outlooks: outlooks,
+                                                     error: error)
+            }
+            throw error
+        }
+
+        guard let pair else { throw HTTPError.invalidResponse }
+        let om = pair.response
+        guard var current = om.currentConditions() else { throw HTTPError.invalidResponse }
 
         let tz = TimeZone(identifier: om.timezone) ?? location.timeZone
         let key = VerificationKey.key(for: location)
@@ -282,36 +423,41 @@ public actor WeatherService {
                                                        temperature: current.temperature)
 
         // "Why the forecast changed": compare with the outlook from ~12 h ago, then save this one.
-        // history.record stores what the user saw (corrected).
+        // history.record stores what the user saw (corrected). Only when OM is live (not fallback).
         var earlier: ForecastSnapshot?
-        if let history, !omEntry.isFallback {
+        if let history, !pair.isFallback {
             let t = now()
             earlier = await history.earlier(key, now: t)
             await history.record(key, daily: daily, now: t)
         }
 
-        // Verification runs detached at utility priority: never delays the report.
-        // Issuance + measurement use RAW (uncorrected) hourly/daily so learning has no feedback loop (B5).
+        // Accuracy guard (§4.5): issuance only when neither half is fallback and pair age ≤ TTL.forecast.
+        // runMeasurement always when OM exists; empty series when not fresh. verifyIfDue ungated.
+        let pairAge = now().timeIntervalSince(pair.storedAt)
+        let halvesFresh = !pair.halfA.isFallback && !pair.halfB.isFallback
+        let issuanceOK = halvesFresh && pairAge <= TTL.forecast
+        let measureFresh = issuanceOK
         if let verifier {
             let issued = issuedNow
             let nwsHourly = nws?.hourly ?? []
             let stations = nws?.point.observationStations
             let measureTZ = om.timezone
-            let measureDaily = rawDaily
-            let measureHourly = rawHourly
+            let measureDaily = measureFresh ? rawDaily : []
+            let measureHourly = measureFresh ? rawHourly : []
             let measureCoord = coord
             let measureIsUS = location.isLikelyInNWSCoverage
             let measureElev = om.elevation
+            let omForVerify = om
             Task.detached(priority: .utility) {
-                if await verifier.wantsIssuance(key) {
-                    let records = ForecastSampler.records(location: key, issued: issued, openMeteo: om,
-                                                          nwsHourly: nwsHourly, blended: measureHourly)
+                if issuanceOK, await verifier.wantsIssuance(key) {
+                    let records = ForecastSampler.records(location: key, issued: issued, openMeteo: omForVerify,
+                                                          nwsHourly: nwsHourly, blended: rawHourly)
                     await verifier.record(records, key: key)
                 }
                 await verifier.verifyIfDue(key: key, stationsURL: stations, near: coord,
                                            cityElevationM: measureElev)
                 await verifier.runMeasurement(key: key, coordinate: measureCoord, timeZoneIdentifier: measureTZ,
-                                              daily: measureDaily, openMeteo: om, blended: measureHourly,
+                                              daily: measureDaily, openMeteo: omForVerify, blended: measureHourly,
                                               isUS: measureIsUS, cityElevationM: measureElev)
             }
         }
@@ -324,21 +470,230 @@ public actor WeatherService {
         if loc.timeZoneIdentifier == nil { loc.timeZoneIdentifier = om.timezone }
 
         // The data is as old as its oldest forecast input (a cached copy keeps its download time).
-        let dataAsOf = ([omEntry.storedAt] + (nws?.forecastStoredAt ?? [])).min() ?? omEntry.storedAt
+        let dataAsOf = ([pair.storedAt] + (nws?.forecastStoredAt ?? [])).min() ?? pair.storedAt
         var report = WeatherReport(location: loc, fetchedAt: now(), timeZoneIdentifier: om.timezone,
                              current: current, hourly: hourly, daily: daily,
                              minutely: minutely, alerts: alerts,
                              airQuality: air, sources: sources,
                              nwsOffice: nws.map { [$0.point.city, $0.point.state].compactMap { $0 }.joined(separator: ", ") },
-                             dataAsOf: dataAsOf, isOfflineFallback: omEntry.isFallback)
+                             dataAsOf: dataAsOf, isOfflineFallback: pair.isFallback)
         report.nwsGridID = nws?.point.gridID
-        report.forecastAsOf = omEntry.storedAt
-        report.fallbackCause = omEntry.isFallback ? (omEntry.cause ?? .unreachable) : nil
+        report.forecastAsOf = pair.storedAt
+        report.fallbackCause = pair.isFallback ? (pair.cause ?? .unreachable) : nil
         report.earlierOutlook = earlier
         report.severeOutlooks = outlooks
         report.modelSeries = ForecastBlender.modelSeries(openMeteo: om, nwsHourly: nws?.hourly ?? [], blended: hourly,
                                                          now: current.time)
+        report.forecastMode = .blend
         return report
+    }
+
+    /// NWS-only (or throw) when OM is unavailable due to daily limit / pair miss while limited.
+    private func buildNWSOnlyOrThrow(location: WeatherLocation, coord: Coordinate, nws: NWSBundle?,
+                                     alerts: [WeatherAlert], air: AirQuality?, outlooks: [SevereOutlook],
+                                     error: Error) async throws -> WeatherReport {
+        let until = dailyLimit(for: OpenMeteoQuota.forecastHost)
+            ?? OpenMeteoQuota.until(after: now(), jitter: dailyLimitJitter[OpenMeteoQuota.forecastHost] ?? 0)
+        if location.isLikelyInNWSCoverage,
+           let nws, !(nws.periods.isEmpty && nws.hourly.isEmpty),
+           let parts = NWSOnlyForecast.build(periods: nws.periods, hourlyPeriods: nws.hourly,
+                                             coordinate: coord, timeZone: location.timeZone, now: now()) {
+            let tzID = location.timeZoneIdentifier ?? location.timeZone.identifier
+            let dataAsOf = (nws.forecastStoredAt.min() ?? now())
+            var report = WeatherReport(location: location, fetchedAt: now(), timeZoneIdentifier: tzID,
+                                       current: parts.current, hourly: parts.hourly, daily: parts.daily,
+                                       minutely: [], alerts: alerts, airQuality: air,
+                                       sources: ["NWS \(nws.point.gridID)"],
+                                       nwsOffice: [nws.point.city, nws.point.state].compactMap { $0 }.joined(separator: ", "),
+                                       dataAsOf: dataAsOf, isOfflineFallback: false)
+            report.nwsGridID = nws.point.gridID
+            report.forecastAsOf = nil
+            report.fallbackCause = .dailyLimit
+            report.severeOutlooks = outlooks
+            report.forecastMode = .nwsOnly
+            // verifyIfDue still runs; no issuance / measurement / history / BiasCorrection (no OM).
+            if let verifier {
+                let key = VerificationKey.key(for: location)
+                let stations = nws.point.observationStations
+                Task.detached(priority: .utility) {
+                    await verifier.verifyIfDue(key: key, stationsURL: stations, near: coord,
+                                               cityElevationM: nil)
+                }
+            }
+            _ = until // store builds OpenMeteoQuota.nwsOnlyMessage from dailyLimit(for:)
+            return report
+        }
+        // Non-US (or empty NWS): no usable forecast.
+        if case HTTPError.dailyLimit = error { throw error }
+        throw HTTPError.dailyLimit(host: OpenMeteoQuota.forecastHost)
+    }
+
+    // MARK: Open-Meteo A+B pair (CR M1)
+
+    /// Fetches (or reads) the A+B forecast pair as one unit inside a single Open-Meteo turn.
+    func fetchOpenMeteoPair(_ coord: Coordinate, models: [ForecastModel], ttl: TimeInterval,
+                            force: Bool, maxStale: TimeInterval, priority: FetchPriority,
+                            allowNetwork: Bool?) async throws -> OpenMeteoPairResult {
+        let urlA = Endpoints.openMeteoForecastA(coord, models: models)
+        let urlB = Endpoints.openMeteoForecastB(coord)
+        let keyA = urlA.absoluteString
+        let keyB = urlB.absoluteString
+        let host = OpenMeteoQuota.forecastHost
+        await loadDailyLimitMarkerIfNeeded(host)
+
+        let bypassFreshness = allowNetwork == true
+        if !force, !bypassFreshness, allowNetwork != false,
+           let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: ttl) {
+            return cached
+        }
+
+        // Cache-only: never hit the network.
+        if allowNetwork == false {
+            if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                let age = now().timeIntervalSince(cached.storedAt)
+                if age >= ttl {
+                    return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
+                                               isFallback: true, cause: isDailyLimited(host: host) ? .dailyLimit : .unreachable,
+                                               halfA: cached.halfA, halfB: cached.halfB)
+                }
+                return cached
+            }
+            if isDailyLimited(host: host) { throw HTTPError.dailyLimit(host: host) }
+            throw HTTPError.invalidResponse
+        }
+
+        // Daily-limited: prefer stale pair; probe only when due / forced / allowNetwork.
+        if isDailyLimited(host: host), !mayProbeDailyLimit(host: host, force: force, allowNetwork: allowNetwork) {
+            if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
+                                           isFallback: true, cause: .dailyLimit,
+                                           halfA: fallbackHalf(cached.halfA, .dailyLimit),
+                                           halfB: fallbackHalf(cached.halfB, .dailyLimit))
+            }
+            throw HTTPError.dailyLimit(host: host)
+        }
+
+        let pairKey = "om-pair:" + keyA
+        return try await withOpenMeteoTurn(host, priority: priority, key: pairKey) {
+            // Re-check after queueing.
+            if isDailyLimited(host: host), !mayProbeDailyLimit(host: host, force: force, allowNetwork: allowNetwork) {
+                if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                    return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
+                                               isFallback: true, cause: .dailyLimit,
+                                               halfA: fallbackHalf(cached.halfA, .dailyLimit),
+                                               halfB: fallbackHalf(cached.halfB, .dailyLimit))
+                }
+                throw HTTPError.dailyLimit(host: host)
+            }
+            if let until = backoffUntil[host], until > now() {
+                if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                    return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
+                                               isFallback: true, cause: .busy,
+                                               halfA: fallbackHalf(cached.halfA, .busy),
+                                               halfB: fallbackHalf(cached.halfB, .busy))
+                }
+                throw HTTPError.backingOff(host: host, until: until)
+            }
+
+            let wasLimited = isDailyLimited(host: host)
+            let dataA: Data
+            do {
+                dataA = try await rawGet(urlA)
+            } catch HTTPError.dailyLimit(let h) {
+                await noteDailyLimit(host: h)
+                if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                    return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
+                                               isFallback: true, cause: .dailyLimit,
+                                               halfA: fallbackHalf(cached.halfA, .dailyLimit),
+                                               halfB: fallbackHalf(cached.halfB, .dailyLimit))
+                }
+                throw HTTPError.dailyLimit(host: h)
+            } catch {
+                if case HTTPError.throttled(_, _, let retryAfter) = error {
+                    noteThrottled(host, retryAfter: retryAfter)
+                }
+                if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                    return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
+                                               isFallback: true, cause: FallbackCause(error),
+                                               halfA: fallbackHalf(cached.halfA, FallbackCause(error)),
+                                               halfB: fallbackHalf(cached.halfB, FallbackCause(error)))
+                }
+                throw error
+            }
+
+            // A succeeded — only then fetch B. Do not cache A until B is also 2xx.
+            let dataB: Data
+            do {
+                dataB = try await rawGet(urlB)
+            } catch HTTPError.dailyLimit(let h) {
+                await noteDailyLimit(host: h)
+                if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                    return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
+                                               isFallback: true, cause: .dailyLimit,
+                                               halfA: fallbackHalf(cached.halfA, .dailyLimit),
+                                               halfB: fallbackHalf(cached.halfB, .dailyLimit))
+                }
+                throw HTTPError.dailyLimit(host: h)
+            } catch {
+                if case HTTPError.throttled(_, _, let retryAfter) = error {
+                    noteThrottled(host, retryAfter: retryAfter)
+                }
+                // Discard fresh A (do not cache). Fall back to cached pair if consistent.
+                if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                    return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
+                                               isFallback: true, cause: FallbackCause(error),
+                                               halfA: fallbackHalf(cached.halfA, FallbackCause(error)),
+                                               halfB: fallbackHalf(cached.halfB, FallbackCause(error)))
+                }
+                throw error
+            }
+
+            let stored = now()
+            await cache.store(dataA, for: keyA)
+            await cache.store(dataB, for: keyB)
+            if wasLimited { await clearDailyLimit(host: host) }
+            backoffUntil[host] = nil
+            backoffStrikes[host] = nil
+            let halfA = Fetched(data: dataA, storedAt: stored, isFallback: false)
+            let halfB = Fetched(data: dataB, storedAt: stored, isFallback: false)
+            let decodedA = try OpenMeteoResponse.decode(dataA)
+            let decodedB = try OpenMeteoResponse.decode(dataB)
+            let merged = OpenMeteoResponse.mergePair(a: decodedA, b: decodedB)
+            return OpenMeteoPairResult(response: merged, storedAt: stored, isFallback: false, cause: nil,
+                                       halfA: halfA, halfB: halfB)
+        }
+    }
+
+    private func fallbackHalf(_ h: Fetched, _ cause: FallbackCause) -> Fetched {
+        Fetched(data: h.data, storedAt: h.storedAt, isFallback: true, cause: cause)
+    }
+
+    /// Reads both halves from cache; returns nil when either is missing or pairConsistent fails.
+    private func readCachedPair(keyA: String, keyB: String, maxAge: TimeInterval) async -> OpenMeteoPairResult? {
+        guard let eA = await cache.entry(keyA, maxAge: maxAge),
+              let eB = await cache.entry(keyB, maxAge: maxAge),
+              let a = try? OpenMeteoResponse.decode(eA.data),
+              let b = try? OpenMeteoResponse.decode(eB.data),
+              OpenMeteoResponse.pairConsistent(a, storedAtA: eA.storedAt, b, storedAtB: eB.storedAt)
+        else { return nil }
+        let older = min(eA.storedAt, eB.storedAt)
+        let age = now().timeIntervalSince(older)
+        // Caller decides fallback vs fresh via ttl; here we only assemble.
+        let halfA = Fetched(data: eA.data, storedAt: eA.storedAt, isFallback: false)
+        let halfB = Fetched(data: eB.data, storedAt: eB.storedAt, isFallback: false)
+        _ = age
+        return OpenMeteoPairResult(response: OpenMeteoResponse.mergePair(a: a, b: b), storedAt: older,
+                                   isFallback: false, cause: nil, halfA: halfA, halfB: halfB)
+    }
+
+    /// Direct GET with one transient retry; no cache, no Open-Meteo turn (caller holds the turn).
+    private func rawGet(_ url: URL, headers: [String: String] = [:]) async throws -> Data {
+        do {
+            return try await client.get(url, headers: headers)
+        } catch let error where FallbackCause.retriesOnce(error) {
+            try await Task.sleep(for: .seconds(transientRetryDelay))
+            return try await client.get(url, headers: headers)
+        }
     }
 
     struct NWSBundle: Sendable {
@@ -446,12 +801,43 @@ public actor WeatherService {
     /// Fresh cache → network → stale cache no older than `maxStale` (offline fallback) → error.
     /// The result carries the data's real download time, so a cached copy is never passed off as new.
     func fetchEntry(_ url: URL, ttl: TimeInterval, force: Bool = false, headers: [String: String] = [:],
-                    maxStale: TimeInterval = .infinity, priority: FetchPriority = .background) async throws -> Fetched {
+                    maxStale: TimeInterval = .infinity, priority: FetchPriority = .background,
+                    allowNetwork: Bool? = nil) async throws -> Fetched {
         let key = url.absoluteString
-        if !force, let hit = await cache.entry(key, maxAge: ttl), now().timeIntervalSince(hit.storedAt) < ttl {
+        let host = (url.host ?? "").lowercased()
+        let isQuotaHost = OpenMeteoQuota.exactHosts.contains(host)
+        if isQuotaHost { await loadDailyLimitMarkerIfNeeded(host) }
+
+        let bypassFreshness = allowNetwork == true
+        if !force, !bypassFreshness, let hit = await cache.entry(key, maxAge: ttl), now().timeIntervalSince(hit.storedAt) < ttl {
             return Fetched(data: hit.data, storedAt: hit.storedAt, isFallback: false)
         }
-        let host = url.host ?? ""
+
+        if allowNetwork == false {
+            if let stale = await cache.entry(key, maxAge: maxStale) {
+                let age = now().timeIntervalSince(stale.storedAt)
+                if age < ttl {
+                    return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: false)
+                }
+                return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true,
+                               cause: isDailyLimited(host: host) ? .dailyLimit : .unreachable)
+            }
+            if isQuotaHost, isDailyLimited(host: host) { throw HTTPError.dailyLimit(host: host) }
+            throw HTTPError.invalidResponse
+        }
+
+        // Daily-limited quota host: prefer stale; only probe when due (AQ never probes).
+        if isQuotaHost, isDailyLimited(host: host) {
+            let canProbe = host == OpenMeteoQuota.forecastHost
+                && mayProbeDailyLimit(host: host, force: force, allowNetwork: allowNetwork)
+            if !canProbe {
+                if let stale = await cache.entry(key, maxAge: maxStale) {
+                    return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true, cause: .dailyLimit)
+                }
+                throw HTTPError.dailyLimit(host: host)
+            }
+        }
+
         // Non-force traffic never sleeps through a back-off; the stale copy (or the error) is enough.
         // Item 2: a first fetch (nothing cached to show) waits out a short back-off like Retry does,
         // instead of failing at once with a banner and a retry minutes later.
@@ -480,7 +866,13 @@ public actor WeatherService {
                 if let until = backoffUntil[host], until > now() {
                     throw HTTPError.backingOff(host: host, until: until)
                 }
+                if isQuotaHost, isDailyLimited(host: host),
+                   host == OpenMeteoQuota.airQualityHost
+                    || !mayProbeDailyLimit(host: host, force: force, allowNetwork: allowNetwork) {
+                    throw HTTPError.dailyLimit(host: host)
+                }
                 let epoch = throttleEpoch[host, default: 0]
+                let wasLimited = isDailyLimited(host: host)
                 let data: Data
                 do {
                     data = try await client.get(url, headers: headers)
@@ -496,10 +888,18 @@ public actor WeatherService {
                     backoffUntil[host] = nil
                     backoffStrikes[host] = nil
                 }
+                if wasLimited, isQuotaHost { await clearDailyLimit(host: host) }
                 await cache.store(data, for: key)
                 return Fetched(data: data, storedAt: now(), isFallback: false)
             } catch {
                 if waits, case HTTPError.backingOff = error { throw error }
+                if case HTTPError.dailyLimit(let h) = error {
+                    await noteDailyLimit(host: h)
+                    if let stale = await cache.entry(key, maxAge: maxStale) {
+                        return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true, cause: .dailyLimit)
+                    }
+                    throw error
+                }
                 if case HTTPError.throttled(_, _, let retryAfter) = error { noteThrottled(host, retryAfter: retryAfter) }
                 if let stale = await cache.entry(key, maxAge: maxStale) {
                     return Fetched(data: stale.data, storedAt: stale.storedAt, isFallback: true, cause: FallbackCause(error))
@@ -554,7 +954,7 @@ public actor WeatherService {
     /// Serializes `api.open-meteo.com` GETs. Other hosts run straight through.
     private func withOpenMeteoTurn<T>(_ host: String, priority: FetchPriority = .background, key: String? = nil,
                                       _ body: () async throws -> T) async throws -> T {
-        let gate = host == RefreshBookkeeping.openMeteoHost
+        let gate = host == RefreshBookkeeping.openMeteoHost || host == OpenMeteoQuota.forecastHost
         if gate { await acquireOpenMeteo(priority, key: key) }
         do {
             let value = try await body()
@@ -628,17 +1028,20 @@ public actor WeatherService {
     }
 
     func fetch(_ url: URL, ttl: TimeInterval, force: Bool = false, headers: [String: String] = [:],
-               maxStale: TimeInterval = .infinity) async throws -> Data {
-        try await fetchEntry(url, ttl: ttl, force: force, headers: headers, maxStale: maxStale).data
+               maxStale: TimeInterval = .infinity, allowNetwork: Bool? = nil) async throws -> Data {
+        try await fetchEntry(url, ttl: ttl, force: force, headers: headers, maxStale: maxStale,
+                             allowNetwork: allowNetwork).data
     }
 
     func optionalFetch(_ url: URL, ttl: TimeInterval, force: Bool, headers: [String: String] = [:],
-                       maxStale: TimeInterval = .infinity) async -> Data? {
-        try? await fetch(url, ttl: ttl, force: force, headers: headers, maxStale: maxStale)
+                       maxStale: TimeInterval = .infinity, allowNetwork: Bool? = nil) async -> Data? {
+        try? await fetch(url, ttl: ttl, force: force, headers: headers, maxStale: maxStale,
+                         allowNetwork: allowNetwork)
     }
 
     func optionalFetchEntry(_ url: URL, ttl: TimeInterval, force: Bool, headers: [String: String] = [:],
-                            maxStale: TimeInterval = .infinity) async -> Fetched? {
-        try? await fetchEntry(url, ttl: ttl, force: force, headers: headers, maxStale: maxStale)
+                            maxStale: TimeInterval = .infinity, allowNetwork: Bool? = nil) async -> Fetched? {
+        try? await fetchEntry(url, ttl: ttl, force: force, headers: headers, maxStale: maxStale,
+                              allowNetwork: allowNetwork)
     }
 }

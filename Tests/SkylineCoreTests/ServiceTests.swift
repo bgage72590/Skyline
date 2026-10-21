@@ -99,10 +99,12 @@ final class ServiceTests: XCTestCase {
     }
 
     func testEndpointsAreKeyless() {
-        let url = Endpoints.openMeteoForecast(Coordinate(latitude: 40.71234567, longitude: -74.0), models: [.bestMatch, .ecmwf])
+        let url = Endpoints.openMeteoForecastA(Coordinate(latitude: 40.71234567, longitude: -74.0), models: [.bestMatch, .ecmwf])
         XCTAssertTrue(url.absoluteString.contains("latitude=40.7123"))
         XCTAssertTrue(url.absoluteString.contains("timeformat=unixtime"))
         XCTAssertFalse(url.absoluteString.lowercased().contains("key"))
+        let urlB = Endpoints.openMeteoForecastB(Coordinate(latitude: 40.71234567, longitude: -74.0))
+        XCTAssertTrue(urlB.absoluteString.contains("minutely_15"))
         XCTAssertEqual(Endpoints.nwsPoint(Coordinate(latitude: 40.71, longitude: -74.01)).absoluteString,
                        "https://api.weather.gov/points/40.7100,-74.0100")
     }

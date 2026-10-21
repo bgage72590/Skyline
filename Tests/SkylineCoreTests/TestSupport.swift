@@ -36,7 +36,15 @@ final class MockHTTPClient: HTTPClient, @unchecked Sendable {
         let name: String
         if s.contains("air-quality-api.open-meteo.com") { name = "om_aqi" }
         else if s.contains("geocoding-api.open-meteo.com") { name = "om_geo" }
-        else if s.contains("api.open-meteo.com") { name = s.contains("latitude=48.") ? "om_paris" : "om_nyc" }
+        else if s.contains("api.open-meteo.com") {
+            // A/B pair: serve the matching half of the multi-model fixture (CR M1).
+            let fixture = s.contains("latitude=48.") ? "om_paris" : "om_nyc"
+            let full = try OpenMeteoResponse.decode(Fixture.data(fixture))
+            let halves = full.splitPairHalves()
+            let isB = s.contains("minutely_15") || s.contains("current=")
+                || (s.contains("models=best_match") && !s.contains("models=best_match,"))
+            return try OpenMeteoResponse.encode(isB ? halves.b : halves.a)
+        }
         else if s.contains("api.weather.gov/points") { name = "nws_points" }
         else if s.contains("forecast/hourly") { name = "nws_hourly" }
         else if s.contains("api.weather.gov/gridpoints") { name = "nws_forecast" }

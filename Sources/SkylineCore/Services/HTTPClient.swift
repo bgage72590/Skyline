@@ -8,6 +8,8 @@ public enum HTTPError: Error, Sendable, Equatable {
     case invalidResponse
     /// 429 or 503: the service asked us to slow down. `retryAfter` is its Retry-After (seconds), if sent.
     case throttled(Int, URL, retryAfter: TimeInterval?)
+    /// Open-Meteo free-tier daily request limit (not transient; resume after 00:00 UTC).
+    case dailyLimit(host: String)
     /// Not sent: the host asked Skyline to back off and that time hasn't passed yet.
     case backingOff(host: String, until: Date)
     /// Not sent (or not followed): the address isn't one of the known weather services (L28).
@@ -54,6 +56,11 @@ public enum UserFacingError {
             switch h {
             case .throttled(_, _, let after):
                 return "Weather service is busy. Skyline will try again" + wait(after) + "."
+            case .dailyLimit(let host):
+                // Resume time is owned by WeatherService / OpenMeteoQuota messages; this is a fallback.
+                return OpenMeteoQuota.noDataMessage(until: OpenMeteoQuota.until(after: now, jitter: 0),
+                                                    now: now, timeZone: timeZone, locale: locale)
+                    + (host.isEmpty ? "" : "")
             case .backingOff(let host, let until):
                 return busyLine(host: host, until: until, timeZone: timeZone, locale: locale)
             case .status(let code, _) where code >= 500:
@@ -215,9 +222,6 @@ public struct URLSessionHTTPClient: HTTPClient {
 
     public func get(_ url: URL, headers: [String: String]) async throws -> Data {
         let result = try await perform(url, headers: headers, allowConditional: false)
-        if result.statusCode == 429 || result.statusCode == 503 {
-            throw HTTPError.throttled(result.statusCode, url, retryAfter: result.retryAfter)
-        }
         guard (200..<300).contains(result.statusCode) else { throw HTTPError.status(result.statusCode, url) }
         return result.data
     }
@@ -246,6 +250,12 @@ public struct URLSessionHTTPClient: HTTPClient {
             // Conditional path surfaces 304/203/204/429 to the caller; other errors still throw.
             if result.statusCode == 304 || result.statusCode == 203 || result.statusCode == 204 { return result }
             if result.statusCode == 429 || result.statusCode == 503 { return result }
+        }
+        // Daily-limit detection lives here (before the generic throttled path). Tests call
+        // `OpenMeteoQuota.classify` directly because fake clients bypass `perform`.
+        if result.statusCode == 429,
+           OpenMeteoQuota.classify(status: 429, host: url.host, body: result.data) == .dailyLimit {
+            throw HTTPError.dailyLimit(host: url.host ?? "")
         }
         if result.statusCode == 429 || result.statusCode == 503 {
             throw HTTPError.throttled(result.statusCode, url, retryAfter: retry)

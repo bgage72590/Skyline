@@ -31,7 +31,7 @@ public enum ForecastModel: String, CaseIterable, Codable, Sendable {
 /// Raw Open-Meteo `/v1/forecast` response with `timeformat=unixtime` and one or more `models`.
 /// With multiple models every hourly/daily/minutely key is suffixed with `_<model>`; with a single
 /// model the keys are bare. `current` is always bare.
-public struct OpenMeteoResponse: Decodable, Sendable {
+public struct OpenMeteoResponse: Codable, Sendable {
     public var latitude: Double
     public var longitude: Double
     public var timezone: String
@@ -43,7 +43,7 @@ public struct OpenMeteoResponse: Decodable, Sendable {
     public var daily: [String: [Double?]]?
     public var minutely15: [String: [Double?]]?
 
-    public struct Current: Decodable, Sendable {
+    public struct Current: Codable, Sendable {
         public var time: Double
         public var temperature_2m: Double?
         public var relative_humidity_2m: Double?
@@ -69,6 +69,11 @@ public struct OpenMeteoResponse: Decodable, Sendable {
 
     public static func decode(_ data: Data) throws -> OpenMeteoResponse {
         try JSONDecoder().decode(OpenMeteoResponse.self, from: data)
+    }
+
+    /// Encode for MockHTTPClient pair halves and tests. Keys match Open-Meteo's wire names.
+    public static func encode(_ response: OpenMeteoResponse) throws -> Data {
+        try JSONEncoder().encode(response)
     }
 
     // MARK: Column access
@@ -126,6 +131,117 @@ public struct OpenMeteoResponse: Decodable, Sendable {
             guard let t, let v else { return nil }
             return MinutelyPrecipitation(time: Date(timeIntervalSince1970: t), precipitation: v)
         }
+    }
+
+    // MARK: A+B pair merge (CR M1 / M2)
+
+    /// Max storedAt gap for two cached halves to count as one pair.
+    public static let pairStoredAtSlack: TimeInterval = 120
+
+    /// Hourly columns taken from B as bare (best_match) keys.
+    public static let pairHourlyFromB = ["is_day", "wind_direction_10m"]
+    /// Daily columns taken from B as bare (best_match) keys.
+    public static let pairDailyFromB = ["weather_code", "sunrise", "sunset", "uv_index_max", "wind_direction_10m_dominant"]
+
+    /// True when cached halves may be merged: storedAt ≤ 120 s apart and hourly/daily `time`,
+    /// `timezone`, and `utc_offset_seconds` equal. A mismatch is a pair miss, never a decode error.
+    public static func pairConsistent(_ a: OpenMeteoResponse, storedAtA: Date,
+                                      _ b: OpenMeteoResponse, storedAtB: Date) -> Bool {
+        abs(storedAtA.timeIntervalSince(storedAtB)) <= pairStoredAtSlack
+            && a.timezone == b.timezone
+            && a.utcOffsetSeconds == b.utcOffsetSeconds
+            && a.hourly?["time"] == b.hourly?["time"]
+            && a.daily?["time"] == b.daily?["time"]
+    }
+
+    /// Merge A+B into one response. lat/lon/elevation/timezone/utc_offset from A; `current`,
+    /// `minutely_15`, and the 7 bare B columns from B (CR M2).
+    public static func mergePair(a: OpenMeteoResponse, b: OpenMeteoResponse) -> OpenMeteoResponse {
+        var hourly = a.hourly ?? [:]
+        if let bt = b.hourly?["time"] { hourly["time"] = bt }
+        for key in pairHourlyFromB {
+            if let col = Self.column(b.hourly, key, .bestMatch) { hourly[key] = col }
+        }
+        var daily = a.daily ?? [:]
+        if let bt = b.daily?["time"] { daily["time"] = bt }
+        for key in pairDailyFromB {
+            if let col = Self.column(b.daily, key, .bestMatch) { daily[key] = col }
+        }
+        return OpenMeteoResponse(
+            latitude: a.latitude, longitude: a.longitude, timezone: a.timezone,
+            utcOffsetSeconds: a.utcOffsetSeconds, elevation: a.elevation,
+            current: b.current, hourly: hourly, daily: daily, minutely15: b.minutely15)
+    }
+
+    public init(latitude: Double, longitude: Double, timezone: String, utcOffsetSeconds: Int,
+                elevation: Double? = nil, current: Current? = nil,
+                hourly: [String: [Double?]]? = nil, daily: [String: [Double?]]? = nil,
+                minutely15: [String: [Double?]]? = nil) {
+        self.latitude = latitude; self.longitude = longitude; self.timezone = timezone
+        self.utcOffsetSeconds = utcOffsetSeconds; self.elevation = elevation
+        self.current = current; self.hourly = hourly; self.daily = daily; self.minutely15 = minutely15
+    }
+
+    /// Split a multi-model fixture into A/B halves for golden-report / merge tests.
+    public func splitPairHalves() -> (a: OpenMeteoResponse, b: OpenMeteoResponse) {
+        let aHourlyKeys: Set<String> = [
+            "temperature_2m", "apparent_temperature", "precipitation_probability", "precipitation",
+            "weather_code", "uv_index", "wind_speed_10m", "relative_humidity_2m", "dew_point_2m",
+            "pressure_msl", "visibility", "wind_gusts_10m", "snowfall"
+        ]
+        let aDailyKeys: Set<String> = [
+            "temperature_2m_max", "temperature_2m_min", "precipitation_probability_max",
+            "precipitation_sum", "snowfall_sum", "wind_speed_10m_max", "wind_gusts_10m_max"
+        ]
+        var aHourly: [String: [Double?]] = [:]
+        if let hourly {
+            for (k, v) in hourly {
+                if k == "time" { aHourly[k] = v; continue }
+                if aHourlyKeys.contains(Self.stripModelSuffix(k)) { aHourly[k] = v }
+            }
+        }
+        var aDaily: [String: [Double?]] = [:]
+        if let daily {
+            for (k, v) in daily {
+                if k == "time" { aDaily[k] = v; continue }
+                if aDailyKeys.contains(Self.stripModelSuffix(k)) { aDaily[k] = v }
+            }
+        }
+        let a = OpenMeteoResponse(latitude: latitude, longitude: longitude, timezone: timezone,
+                                  utcOffsetSeconds: utcOffsetSeconds, elevation: elevation,
+                                  current: nil, hourly: aHourly, daily: aDaily, minutely15: nil)
+        var bHourly: [String: [Double?]] = ["time": hourly?["time"] ?? []]
+        for key in Self.pairHourlyFromB {
+            if let col = hourlyColumn(key, model: .bestMatch) { bHourly[key] = col }
+        }
+        var bDaily: [String: [Double?]] = ["time": daily?["time"] ?? []]
+        for key in Self.pairDailyFromB {
+            if let col = dailyColumn(key, model: .bestMatch) { bDaily[key] = col }
+        }
+        var bMinutely = minutely15
+        if var m = bMinutely, m["precipitation"] == nil,
+           let bm = Self.column(m, "precipitation", .bestMatch) {
+            m["precipitation"] = bm
+            // Drop per-model minutely columns — B is best_match only.
+            bMinutely = ["time": m["time"] ?? [], "precipitation": bm]
+        } else if let m = bMinutely {
+            bMinutely = ["time": m["time"] ?? [],
+                         "precipitation": m["precipitation"] ?? Self.column(m, "precipitation", .bestMatch) ?? []]
+        }
+        // Deliberately different lat/lon/elevation so merge-source tests prove A's win.
+        let b = OpenMeteoResponse(latitude: latitude + 0.01, longitude: longitude + 0.01,
+                                  timezone: timezone, utcOffsetSeconds: utcOffsetSeconds,
+                                  elevation: (elevation ?? 0) + 10, current: current,
+                                  hourly: bHourly, daily: bDaily, minutely15: bMinutely)
+        return (a, b)
+    }
+
+    static func stripModelSuffix(_ key: String) -> String {
+        for m in ForecastModel.allCases {
+            let suffix = "_" + m.rawValue
+            if key.hasSuffix(suffix) { return String(key.dropLast(suffix.count)) }
+        }
+        return key
     }
 }
 
