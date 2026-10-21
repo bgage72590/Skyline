@@ -687,7 +687,7 @@ final class WeatherStore {
             }
         }
         let due = RefreshPlanner.due(now: now, cities: cities, pairAges: pairAges, roles: roles,
-                                     wantsIssuance: wantsIssuance)
+                                     wantsIssuance: wantsIssuance, windowVisible: isMainWindowVisible)
         let byID = Dictionary(uniqueKeysWithValues: cities.map { ($0.id, $0) })
         let fresh = due.fresh.compactMap { byID[$0] }
         let background = due.background.compactMap { byID[$0] }

@@ -705,6 +705,19 @@ public actor WeatherService {
         }
 
         let stored = now()
+        // M1: both halves must decode and agree (time axes / tz / offset) before either is cached;
+        // a fetch straddling local midnight is a pair miss, never a skewed merge or accuracy sample.
+        guard let decodedA = try? OpenMeteoResponse.decode(dataA),
+              let decodedB = try? OpenMeteoResponse.decode(dataB),
+              OpenMeteoResponse.pairConsistent(decodedA, storedAtA: stored, decodedB, storedAtB: stored) else {
+            if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
+                                           isFallback: true, cause: .unreachable,
+                                           halfA: fallbackHalf(cached.halfA, .unreachable),
+                                           halfB: fallbackHalf(cached.halfB, .unreachable))
+            }
+            throw HTTPError.invalidResponse
+        }
         await cache.store(dataA, for: keyA)
         await cache.store(dataB, for: keyB)
         if wasLimited { await clearDailyLimit(host: host) }
@@ -712,8 +725,6 @@ public actor WeatherService {
         backoffStrikes[host] = nil
         let halfA = Fetched(data: dataA, storedAt: stored, isFallback: false)
         let halfB = Fetched(data: dataB, storedAt: stored, isFallback: false)
-        let decodedA = try OpenMeteoResponse.decode(dataA)
-        let decodedB = try OpenMeteoResponse.decode(dataB)
         let merged = OpenMeteoResponse.mergePair(a: decodedA, b: decodedB)
         return OpenMeteoPairResult(response: merged, storedAt: stored, isFallback: false, cause: nil,
                                    halfA: halfA, halfB: halfB)

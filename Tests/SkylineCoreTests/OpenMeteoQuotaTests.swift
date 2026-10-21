@@ -413,6 +413,44 @@ final class OpenMeteoQuotaTests: XCTestCase {
         XCTAssertEqual(afterA?.storedAt, beforeA?.storedAt, "fresh A must not be newly cached when B fails")
     }
 
+    /// CR PR20 B2: a fresh A/B fetch whose halves disagree (e.g. straddling local midnight) is a
+    /// pair miss: neither half is cached, the merged report is never built from skewed columns.
+    func testFreshPairMismatchIsNotCachedOrMerged() async throws {
+        let clock = TestClock(fixtureTime)
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        let seeder = WeatherService(client: MockHTTPClient(), cache: cache, now: { clock.now })
+        _ = try await seeder.report(for: nyc)
+        let coord = nyc.coordinate.rounded
+        let models = ForecastModel.models(inCONUS: true)
+        let urlA = Endpoints.openMeteoForecastA(coord, models: models)
+        let urlB = Endpoints.openMeteoForecastB(coord)
+        let beforeA = await cache.entry(urlA.absoluteString, maxAge: .infinity)
+        let beforeB = await cache.entry(urlB.absoluteString, maxAge: .infinity)
+        let halves = try OpenMeteoResponse.decode(Fixture.data("om_nyc")).splitPairHalves()
+        var shiftedB = halves.b
+        if var daily = shiftedB.daily, let t = daily["time"] {
+            daily["time"] = t.map { $0.map { $0 + 86400 } }
+            shiftedB.daily = daily
+        }
+        let dataA = try OpenMeteoResponse.encode(halves.a)
+        let dataB = try OpenMeteoResponse.encode(shiftedB)
+        let a = urlA.absoluteString, b = urlB.absoluteString
+        clock.now = clock.now.addingTimeInterval(WeatherService.TTL.forecast + 10)
+        let client = RecordingHTTPClient { url in
+            if url.absoluteString == a { return dataA }
+            if url.absoluteString == b { return dataB }
+            return try await MockHTTPClient().get(url, headers: [:])
+        }
+        let service = WeatherService(client: client, cache: cache, now: { clock.now })
+        let report = try await service.report(for: nyc)
+        XCTAssertEqual(client.openMeteoForecastURLs.count, 2)
+        XCTAssertTrue(report.isOfflineFallback, "mismatched fresh pair must fall back to the cached pair")
+        let afterA = await cache.entry(urlA.absoluteString, maxAge: .infinity)
+        let afterB = await cache.entry(urlB.absoluteString, maxAge: .infinity)
+        XCTAssertEqual(afterA?.storedAt, beforeA?.storedAt)
+        XCTAssertEqual(afterB?.storedAt, beforeB?.storedAt)
+    }
+
     func testPairConsistencyMismatchIsPairMiss() throws {
         let full = try OpenMeteoResponse.decode(Fixture.data("om_nyc"))
         let halves = full.splitPairHalves()

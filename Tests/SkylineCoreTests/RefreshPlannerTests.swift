@@ -78,6 +78,21 @@ final class RefreshPlannerTests: XCTestCase {
         XCTAssertTrue(notWanted.background.isEmpty)
     }
 
+    /// CR PR20 B1: window hidden → background cities only when they have no pair (fetch-once);
+    /// no TTL- or issuance-driven background refresh while hidden (§4.3 / budget §5).
+    func testHiddenWindowBackgroundOnlyFetchOnce() {
+        let cities = [city("menu"), city("old"), city("empty")]
+        let roles: [String: RefreshPlanner.Role] = ["menu": .freshCadence, "old": .background, "empty": .background]
+        let ages: [String: TimeInterval] = ["menu": WeatherService.TTL.forecast,
+                                            "old": WeatherService.TTL.background * 3]
+        let hidden = RefreshPlanner.due(cities: cities, pairAges: ages, roles: roles,
+                                        wantsIssuance: ["old": true], windowVisible: false)
+        XCTAssertEqual(hidden.fresh, ["menu"])
+        XCTAssertEqual(hidden.background, ["empty"])
+        let visible = RefreshPlanner.due(cities: cities, pairAges: ages, roles: roles, windowVisible: true)
+        XCTAssertEqual(visible.background, ["old", "empty"])
+    }
+
     // MARK: Stagger
 
     func testStaggerDelayAtLeast15() {

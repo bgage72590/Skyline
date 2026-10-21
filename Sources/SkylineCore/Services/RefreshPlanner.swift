@@ -44,13 +44,15 @@ public enum RefreshPlanner {
 
     /// Cities whose OM pair is due. `pairAges[id]` = age of the pair (older half); nil = no pair.
     /// `wantsIssuance[id]` = M6: due for a background refresh even inside the background TTL.
+    /// `windowVisible == false`: background cities are due only with no pair at all (fetch-once, §4.3/M3).
     public static func due(now: Date = Date(),
                            cities: [WeatherLocation],
                            pairAges: [String: TimeInterval],
                            roles: [String: Role],
                            wantsIssuance: [String: Bool] = [:],
                            forecastTTL: TimeInterval = WeatherService.TTL.forecast,
-                           backgroundTTL: TimeInterval = WeatherService.TTL.background) -> Due {
+                           backgroundTTL: TimeInterval = WeatherService.TTL.background,
+                           windowVisible: Bool = true) -> Due {
         var fresh: [String] = []
         var background: [String] = []
         var seen = Set<String>()
@@ -63,6 +65,7 @@ public enum RefreshPlanner {
             case .freshCadence:
                 if age == nil || age! >= forecastTTL { fresh.append(id) }
             case .background:
+                guard windowVisible || age == nil else { continue }
                 let ttlDue = age == nil || age! >= backgroundTTL
                 let issueDue = wantsIssuance[id] == true
                 if ttlDue || issueDue { background.append(id) }
