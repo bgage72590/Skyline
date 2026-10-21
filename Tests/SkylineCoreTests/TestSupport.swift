@@ -70,6 +70,36 @@ final class TestClock: @unchecked Sendable {
     }
 }
 
+/// Records every requested URL, then delegates to a handler (quota / planner tests).
+final class RecordingHTTPClient: HTTPClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _urls: [URL] = []
+    var handler: @Sendable (URL) async throws -> Data
+
+    init(handler: @escaping @Sendable (URL) async throws -> Data) {
+        self.handler = handler
+    }
+
+    var urls: [URL] {
+        lock.lock(); defer { lock.unlock() }
+        return _urls
+    }
+
+    func resetURLs() {
+        lock.lock(); _urls = []; lock.unlock()
+    }
+
+    func get(_ url: URL, headers: [String: String]) async throws -> Data {
+        lock.lock(); _urls.append(url); lock.unlock()
+        return try await handler(url)
+    }
+
+    /// Open-Meteo forecast host GETs only (A + B halves).
+    var openMeteoForecastURLs: [URL] {
+        urls.filter { $0.host?.lowercased() == OpenMeteoQuota.forecastHost }
+    }
+}
+
 func fToC(_ f: Double) -> Double { (f - 32) * 5 / 9 }
 
 /// Plain weighted mean for expected values in tests.

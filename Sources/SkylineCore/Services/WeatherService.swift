@@ -309,12 +309,16 @@ public actor WeatherService {
         nextProbeAt[h] = OpenMeteoQuota.nextProbeAt(lastProbeAt: marker.lastProbeAt)
     }
 
-    /// True when a network probe is allowed despite an active daily limit (due time or explicit allow).
+    /// True when a network probe is allowed despite an active daily limit.
+    /// ⌘R / force never hits OM while limited (does not consume the probe). Only the retry-owner's
+    /// non-forced load at `nextProbeAt` (or after `until`) may probe.
     private func mayProbeDailyLimit(host: String, force: Bool, allowNetwork: Bool?) -> Bool {
         let h = host.lowercased()
         guard let until = dailyLimitUntil[h], until > now() else { return true }
-        if allowNetwork == true || force { return true }
+        if force { return false }
         if let probe = nextProbeAt[h], now() >= probe { return true }
+        // Stagger after a successful clear uses allowNetwork with no active until (handled above).
+        _ = allowNetwork
         return false
     }
 
