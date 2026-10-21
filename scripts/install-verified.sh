@@ -286,6 +286,8 @@ case "$SRC" in
     SIDECAR="$(sidecar_path "$SRC")"
     if [[ -n "$SIDECAR" ]]; then
       wait_until_ready "$SIDECAR" 0
+    else
+      echo "No Skyline.sha256 next to the zip; skipping the SHA-256 check (signature still verified)."
     fi
     /bin/cp "$SRC" "$TMP/Skyline.zip" || { echo "REFUSING: could not copy the update archive aside; nothing changed." >&2; exit 1; }
     LOCAL="$TMP/Skyline.zip"
@@ -355,20 +357,27 @@ if [[ -x /usr/bin/xattr ]]; then
   /usr/bin/xattr -dr com.apple.quarantine "$STAGE" 2>/dev/null || true
 fi
 assert_lock_held
+# Ignore HUP/INT/TERM across the two renames. A signal while bash is waiting on `mv`
+# runs the exit trap before the next line; if MOVED_ASIDE is still 0 the old app is
+# left only in the hidden backup. `mv` inherits the ignore, so the rename finishes.
+trap '' HUP INT TERM
 if [[ -e "$DEST" ]]; then
   BACKUP="$stage_root/.$APP_NAME.app.previous.$$.$RANDOM"
   if [[ -e "$BACKUP" ]]; then
     echo "REFUSING: backup path $BACKUP already exists; nothing changed." >&2
     exit 1
   fi
-  mv "$DEST" "$BACKUP"
+  # Set before the rename. Cleanup still requires the destination to be gone and the
+  # backup to exist, so a failed `mv` does not restore over an app that is still there.
   MOVED_ASIDE=1
+  mv "$DEST" "$BACKUP"
 fi
 if ! mv "$STAGE" "$DEST"; then
   echo "Install failed; previous version restored." >&2
   exit 1
 fi
 MOVED_ASIDE=0
+trap - HUP INT TERM
 if [[ -n "$BACKUP" && -e "$BACKUP" ]]; then
   rm -rf "$BACKUP"
   BACKUP=""

@@ -186,8 +186,9 @@ enum Updater {
         try? fm.startDownloadingUbiquitousItem(at: sha)
     }
 
-    /// A ubiquitous item counts as local only once iCloud says the bytes are current. Anything else
-    /// (a normal file, or a ubiquitous item with no status) is local when it has a non-zero size.
+    /// A ubiquitous item counts as local only when iCloud says this copy is current.
+    /// `.downloaded` means an older copy is on disk and a newer one still has to arrive, so it is not ready.
+    /// A normal file, or a ubiquitous item with no status, is local when it has a non-zero size.
     static func zipIsLocal(_ url: URL) -> Bool {
         let keys: Set<URLResourceKey> = [
             .isRegularFileKey,
@@ -198,11 +199,7 @@ enum Updater {
         guard let values = try? url.resourceValues(forKeys: keys), values.isRegularFile == true else { return false }
         let size = values.fileSize ?? 0
         if values.isUbiquitousItem == true, let status = values.ubiquitousItemDownloadingStatus {
-            // `.current` is the downloaded state. `.notDownloaded` is still a placeholder. Any other
-            // status (including the older "downloaded") is local only when the file has bytes.
-            if status == .notDownloaded { return false }
-            if status == .current { return size > 0 }
-            return size > 0
+            return status == .current && size > 0
         }
         return size > 0
     }

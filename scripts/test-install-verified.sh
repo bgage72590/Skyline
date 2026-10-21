@@ -170,7 +170,23 @@ echo "$*" >> "${SKYLINE_TEST_OPEN_LOG:-/tmp/skyline-test-open.log}"
 exit 0
 EOF
 
-chmod +x "$FAKE/ditto" "$FAKE/codesign" "$FAKE/brctl" "$FAKE/stat" "$FAKE/osascript" "$FAKE/pgrep" "$FAKE/pkill" "$FAKE/open"
+cat > "$FAKE/mv" <<'EOF'
+#!/bin/bash
+# Pauses after the aside rename so a test can signal the installer in that window.
+# Fails the stage-to-dest rename when asked, so the exit trap's restore can be checked.
+if [[ "${SKYLINE_TEST_MV_FAIL_SWAP:-}" == 1 && "${1:-}" == *".app.new."* ]]; then
+  echo "mv: swap failed" >&2
+  exit 1
+fi
+if [[ "${SKYLINE_TEST_MV_PAUSE:-}" == aside && "${2:-}" == *".app.previous."* ]]; then
+  /bin/mv "$@"
+  : > "${SKYLINE_TEST_MV_READY:?}"
+  sleep "${SKYLINE_TEST_MV_PAUSE_SECS:-2}"
+  exit 0
+fi
+exec /bin/mv "$@"
+EOF
+chmod +x "$FAKE/ditto" "$FAKE/codesign" "$FAKE/brctl" "$FAKE/stat" "$FAKE/osascript" "$FAKE/pgrep" "$FAKE/pkill" "$FAKE/open" "$FAKE/mv"
 
 export SKYLINE_DITTO="$FAKE/ditto"
 export SKYLINE_CODESIGN="$FAKE/codesign"
@@ -184,7 +200,8 @@ export SKYLINE_OPEN="$FAKE/open"
 reset_hooks() {
   unset SKYLINE_TEST_STAGE_GATE SKYLINE_TEST_DITTO_FAIL_STAGE SKYLINE_TEST_DITTO_FAIL_EXTRACT
   unset SKYLINE_TEST_CODESIGN_REJECT_STAGE SKYLINE_TEST_DOWNLOAD_DELAY SKYLINE_TEST_BRCTL_NOOP
-  unset SKYLINE_TEST_APP_RUNNING
+  unset SKYLINE_TEST_APP_RUNNING SKYLINE_TEST_MV_PAUSE SKYLINE_TEST_MV_READY SKYLINE_TEST_MV_PAUSE_SECS
+  unset SKYLINE_TEST_MV_FAIL_SWAP
   export SKYLINE_DOWNLOAD_TIMEOUT=5
   export SKYLINE_POLL_INTERVAL=0.1
   export SKYLINE_QUIT_TIMEOUT=2
@@ -361,6 +378,8 @@ seed_old
 run_sync "$CASE/out.txt" "$ZIPDIR/Skyline.zip"
 [[ "$RC" == 0 ]] || { cat "$CASE/out.txt" >&2; fail "missing sidecar rc=$RC"; }
 grep -q "SHA-256 OK" "$CASE/out.txt" && fail "unexpected SHA-256 OK without a sidecar"
+grep -qF "No Skyline.sha256 next to the zip; skipping the SHA-256 check (signature still verified)." "$CASE/out.txt" \
+  || fail "missing sidecar notice"
 assert_installed "$CASE/out.txt"
 pass "missing sidecar still installs"
 
@@ -633,5 +652,62 @@ if kill -0 "$osa" 2>/dev/null; then
 fi
 assert_installed "$CASE/out.txt"
 pass "osascript timeout falls back to pkill"
+
+# --- HUP/TERM after the aside rename, before the new app is moved into place ---
+signal_during_swap() {
+  local sig="$1" p i
+  new_case "swap$sig"
+  prepare_zip 1
+  write_good_sha
+  seed_old
+  export SKYLINE_TEST_MV_PAUSE=aside
+  export SKYLINE_TEST_MV_READY="$CASE/mv.ready"
+  export SKYLINE_TEST_MV_PAUSE_SECS=1
+  PATH="$FAKE:$PATH" /bin/bash "$INSTALLER" "$ZIPDIR/Skyline.zip" >"$CASE/out.txt" 2>&1 &
+  p=$!
+  PIDS="$PIDS $p"
+  i=0
+  while [[ ! -f "$CASE/mv.ready" ]]; do
+    i=$((i + 1))
+    if (( i > 100 )); then
+      cat "$CASE/out.txt" >&2 || true
+      fail "swap never reached the aside rename ($sig)"
+    fi
+    if ! kill -0 "$p" 2>/dev/null; then
+      cat "$CASE/out.txt" >&2 || true
+      fail "installer exited before the aside rename ($sig)"
+    fi
+    sleep 0.05
+  done
+  [[ ! -e "$DEST" ]] || fail "destination still present when $sig was sent"
+  kill -"$sig" "$p" 2>/dev/null || true
+  set +e
+  wait "$p"
+  RC=$?
+  set -e
+  [[ "$RC" == 0 ]] || { cat "$CASE/out.txt" >&2; fail "signal $sig during swap rc=$RC"; }
+  [[ -d "$DEST" ]] || fail "Skyline.app missing after $sig during swap"
+  assert_installed "$CASE/out.txt"
+  pass "signal $sig during swap leaves Skyline.app in place"
+}
+signal_during_swap TERM
+signal_during_swap HUP
+
+# --- a failed stage-to-dest rename restores the old app ---
+new_case swapfail
+prepare_zip 1
+write_good_sha
+seed_old
+export SKYLINE_TEST_MV_FAIL_SWAP=1
+set +e
+PATH="$FAKE:$PATH" /bin/bash "$INSTALLER" "$ZIPDIR/Skyline.zip" >"$CASE/out.txt" 2>&1
+RC=$?
+set -e
+[[ "$RC" == 1 ]] || { cat "$CASE/out.txt" >&2; fail "failed swap rc=$RC"; }
+grep -q "previous version restored" "$CASE/out.txt" || fail "failed swap message missing"
+[[ -f "$DEST/OLD-MARKER" ]] || fail "failed swap did not restore the old app"
+assert_no_leftovers
+assert_user_data "failed swap"
+pass "failed swap restores the old app"
 
 echo "ALL PASS"
