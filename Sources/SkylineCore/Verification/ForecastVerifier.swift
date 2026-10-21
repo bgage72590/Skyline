@@ -86,12 +86,18 @@ public actor ForecastVerifier {
     /// In-memory METAR→weights inputs (never verified.jsonl). Populated by runMeasurement.
     private var metarWeightInputs: [String: [VerifiedRecord]] = [:]
     private var metarWeightEligible: Set<String> = []
+    /// Whether `cachedWeights[key]` was computed with the METAR merge; a mismatch (e.g. switch OFF) recomputes (H2).
+    private var cachedWeightsMerged: [String: Bool] = [:]
+    /// `-SkylineCorrectionQAOverride` from the launch arguments only (never defaults or data), clamped (H1).
+    private let qaOverrideC: Double?
 
     public init(directory: URL = ForecastVerifier.defaultDirectory(), client: HTTPClient = URLSessionHTTPClient(),
                 config: AdaptiveWeighting.Config = AdaptiveWeighting.Config(),
                 now: @escaping @Sendable () -> Date = { Date() },
-                benchmarkDirectory: URL? = nil) {
+                benchmarkDirectory: URL? = nil,
+                launchArguments: [String] = ProcessInfo.processInfo.arguments) {
         self.directory = directory
+        self.qaOverrideC = BiasCorrection.QAOverride.celsius(arguments: launchArguments)
         self.client = client
         self.config = config
         self.now = now
@@ -288,24 +294,28 @@ public actor ForecastVerifier {
 
     public func weights(_ key: String) -> BlendWeights {
         load()
-        if let w = cachedWeights[key] { return w }
-        // Learn from every member's full record (see `dedupingNOAAFamily(dropDuplicates:)`); display stays de-duplicated.
-        var records = AccuracySync.collapsedForScoring(verified.filter { $0.r.loc == key })
         // Accuracy PR 2 (B17): non-US METAR pairs feed AdaptiveWeighting inputs when gated.
         // Formula / bounds / eligibility unchanged. US cities stay byte-identical (no merge).
-        if BiasCorrection.Switch.isEnabled(), metarWeightEligible.contains(key),
-           let extra = metarWeightInputs[key], !extra.isEmpty {
+        let extra = metarWeightInputs[key] ?? []
+        let merge = BiasCorrection.Switch.isEnabled() && metarWeightEligible.contains(key) && !extra.isEmpty
+        // A cache built with a different merge state (switch flipped, eligibility lost) is stale (H2).
+        if let w = cachedWeights[key], (cachedWeightsMerged[key] ?? false) == merge { return w }
+        // Learn from every member's full record (see `dedupingNOAAFamily(dropDuplicates:)`); display stays de-duplicated.
+        var records = AccuracySync.collapsedForScoring(verified.filter { $0.r.loc == key })
+        if merge {
             records = AccuracySync.collapsedForScoring(records + extra)
         }
         let learning = AccuracyScorer.score(records, now: now(), dedupe: false)
         let w = AdaptiveWeighting.weights(from: learning, config: config)
         cachedWeights[key] = w
+        cachedWeightsMerged[key] = merge
         return w
     }
 
     /// Same as `weightsIfLoaded` for correction offsets (B16). Nil until this key's offsets are in memory.
+    /// Nil whenever the kill switch or measurement is OFF, so the very next report is PR 1 (H2).
     public func correctionIfLoaded(_ key: String) -> [CorrectionTarget: Double]? {
-        guard correctionsReady else { return nil }
+        guard correctionsReady, BiasCorrection.Switch.isEnabled(), AccuracyMeasurement.isEnabled() else { return nil }
         return cachedOffsets[key]
     }
 
@@ -317,7 +327,7 @@ public actor ForecastVerifier {
         correctionsReady = true
         let siting = await benchmark.sitingOK(for: key, cityElevationM: cityElevationM)
         let offsets = await benchmark.refreshCorrections(key: key, timeZoneIdentifier: timeZoneIdentifier,
-                                                         sitingOK: siting)
+                                                         sitingOK: siting, qaOverrideC: qaOverrideC)
         cachedOffsets[key] = offsets
         cachedStatuses[key] = await buildStatuses(key: key, timeZoneIdentifier: timeZoneIdentifier,
                                                  sitingOK: siting, offsets: offsets)
@@ -331,7 +341,7 @@ public actor ForecastVerifier {
     private func buildStatuses(key: String, timeZoneIdentifier: String, sitingOK: Bool,
                               offsets: [CorrectionTarget: Double]) async -> [CorrectionStatus] {
         let switchOn = BiasCorrection.Switch.isEnabled()
-        let qa = BiasCorrection.QAOverride.celsius() != nil
+        let qa = qaOverrideC != nil
         var cal = Calendar(identifier: .gregorian)
         if let tz = TimeZone(identifier: timeZoneIdentifier) { cal.timeZone = tz }
         let localDay = cal.startOfDay(for: now())
@@ -340,7 +350,12 @@ public actor ForecastVerifier {
             let rows = await benchmark.trainingRows(for: key, target: target)
                 .filter { $0.localDay < localDay }
             let nDays = Set(rows.map { Int($0.localDay.timeIntervalSince1970) }).count
-            let entry = await benchmark.correctionEntry(loc: key, target: target)
+            var entry = await benchmark.correctionEntry(loc: key, target: target)
+            // The line shows what is actually applied (QA override is never written to corrections.json).
+            if qa {
+                entry = entry ?? CorrectionEntry(loc: key, target: target)
+                entry?.appliedC = offsets[target] ?? 0
+            }
             let gated = BiasCorrection.gate(rows: rows, target: target, sitingOK: sitingOK,
                                             switchOn: switchOn, measurementOn: AccuracyMeasurement.isEnabled())
             let line = BiasCorrection.statusLine(entry: entry, gated: gated, sitingOK: sitingOK,
@@ -459,15 +474,25 @@ public actor ForecastVerifier {
                 metarWeightInputs[key] = await benchmark.metarVerifiedRecords(for: key)
                 cachedWeights[key] = nil
             } else {
-                metarWeightEligible.remove(key)
+                if metarWeightEligible.remove(key) != nil { cachedWeights[key] = nil }
                 metarWeightInputs[key] = nil
             }
         } else {
-            metarWeightEligible.remove(key)
+            if metarWeightEligible.remove(key) != nil { cachedWeights[key] = nil }
             metarWeightInputs[key] = nil
         }
         _ = await corrections(key, timeZoneIdentifier: timeZoneIdentifier, cityElevationM: elev)
     }
+
+    /// Test seam (B17/H2): METAR→weights inputs as `runMeasurement` would set them for an eligible city.
+    func seedMetarWeightInputs(_ records: [VerifiedRecord], key: String) {
+        metarWeightEligible.insert(key)
+        metarWeightInputs[key] = records
+        cachedWeights[key] = nil
+    }
+
+    /// Whether a QA override was passed at launch (Accuracy line "(QA override)").
+    public var isQAOverrideActive: Bool { qaOverrideC != nil }
 
     /// Test seam: seed the isolated store without touching verified.jsonl / weights.
     public func seedBenchmark(station: MetarStationPick? = nil, key: String,

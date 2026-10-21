@@ -85,8 +85,10 @@ struct AccuracyPanel: View {
             let key = VerificationKey.key(for: location)
             benchmark = await store.service.verifier?.benchmarkSummary(key)
             if let v = store.service.verifier {
-                _ = await v.corrections(key, timeZoneIdentifier: location.timeZoneIdentifier ?? TimeZone.current.identifier)
+                // Read-only (L8): the panel never refreshes correction state (rate limit / appliedOn) and never
+                // falls back to the Mac's time zone. Statuses are built by the verifier in the city's zone.
                 let raw = await v.correctionStatuses(key)
+                let qaActive = await v.isQAOverrideActive
                 correctionLines = raw.map { s in
                     var copy = s
                     // Show delta in the user's unit (×1.8 for °F, never +32) — B10.
@@ -99,7 +101,7 @@ struct AccuracyPanel: View {
                             switchOn: SkylineAccuracyCorrection.isEnabled(),
                             nDays: s.nDays,
                             units: { units.temperatureDelta($0) },
-                            qaOverride: BiasCorrection.QAOverride.celsius() != nil),
+                            qaOverride: qaActive),
                         appliedC: s.appliedC, nDays: s.nDays, gated: s.gated,
                         autoOff: s.autoOff, sitingOK: s.sitingOK)
                     return copy

@@ -254,11 +254,13 @@ public actor WeatherService {
         let rawHourly = hourly
         let rawDaily = daily
         let issuedNow = now()
+        var corrected = false
         if let verifier {
             if let offsets = await verifier.correctionIfLoaded(key),
                offsets.values.contains(where: { abs($0) > 1e-12 }) {
                 BiasCorrection.apply(hourly: &hourly, daily: &daily, current: &current,
                                      issued: issuedNow, timeZone: tz, offsets: offsets)
+                corrected = true
             } else {
                 Task.detached(priority: .utility) {
                     _ = await verifier.corrections(key, timeZoneIdentifier: om.timezone,
@@ -272,6 +274,8 @@ public actor WeatherService {
             current.apparentTemperature += blended.temperature - current.temperature
             current.temperature = blended.temperature
         }
+        // Dew point never above the corrected headline temperature (B8). Only when corrected: PR 1 bytes unchanged.
+        if corrected, let dp = current.dewPoint { current.dewPoint = min(dp, current.temperature) }
         // The header's "Rain" agrees with the 15-minute nowcast (dropdown review S3).
         // reconcileCurrent sees the corrected temperature (B8 knock-on).
         current.weatherCode = Nowcast.reconcileCurrent(code: current.weatherCode, minutely: minutely, now: now(),

@@ -498,9 +498,11 @@ public actor BenchmarkStore {
         for (day, pairs) in byDay where day < today {
             let w = LocalDayAggregator.window(forDay: day, timeZone: tz)
             guard LocalDayAggregator.isComplete(w, now: t) else { continue }
-            // Dedupe within day by valid hour.
-            var seenValid = Set<Int>()
-            let deduped = pairs.filter { seenValid.insert(Int($0.valid.timeIntervalSince1970 / 3600)).inserted }
+            // Dedupe on the lock's key (loc, kind, issued, valid) — loc/kind are fixed above — so every
+            // lead bucket keeps its own pairs for the same valid hour (review fix M4, B1/B2).
+            struct PairKey: Hashable { var issued: Date; var valid: Date }
+            var seenPairs = Set<PairKey>()
+            let deduped = pairs.filter { seenPairs.insert(PairKey(issued: $0.issued, valid: $0.valid)).inserted }
             let byBucket = Dictionary(grouping: deduped) { CorrectionTarget(bucket: LeadBucket(leadHours: $0.valid.timeIntervalSince($0.issued) / 3600)) }
             for (target, rows) in byBucket {
                 let sumE = rows.reduce(0.0) { $0 + ($1.learningForecastC - $1.observedC) }
@@ -534,8 +536,9 @@ public actor BenchmarkStore {
     }
 
     /// Recompute applied offsets for a city (rate limit, auto-off). Returns offsets to apply (0 if gated off).
+    /// `qaOverrideC` comes from the launch arguments only (ForecastVerifier), never from defaults or data.
     public func refreshCorrections(key: String, timeZoneIdentifier: String,
-                                   sitingOK: Bool) -> [CorrectionTarget: Double] {
+                                   sitingOK: Bool, qaOverrideC: Double? = nil) -> [CorrectionTarget: Double] {
         load()
         loadCorrectionsOnly()
         assertOffMain()
@@ -549,7 +552,8 @@ public actor BenchmarkStore {
         var file = correctionsFile
         var out: [CorrectionTarget: Double] = [:]
 
-        if let qa = BiasCorrection.QAOverride.celsius() {
+        if let qaRaw = qaOverrideC, qaRaw.isFinite {
+            let qa = BiasCorrection.clamp(qaRaw)
             // QA override: force applied offset for gated targets; never write corrections.json.
             for target in CorrectionTarget.allCases {
                 let rows = training.filter { $0.loc == key && $0.target == target && $0.localDay < localDay }

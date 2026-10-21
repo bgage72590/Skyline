@@ -139,7 +139,26 @@ public struct VerifiedRecord: Codable, Hashable, Sendable {
 public enum AccuracyMeasurement {
     public static let defaultsKey = "SkylineAccuracyMeasurement"
     public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
-        defaults.object(forKey: defaultsKey) as? Bool ?? true
+        DefaultsFlag.value(defaults, defaultsKey, default: true)
+    }
+}
+
+/// Reads a hidden boolean switch. A `-Key NO` launch argument arrives in the argument domain as the
+/// *string* "NO" (not a Bool), so `object(forKey:) as? Bool` would silently fall back to the default.
+/// PR 2 review fix H3.
+public enum DefaultsFlag {
+    public static func value(_ defaults: UserDefaults, _ key: String, default fallback: Bool) -> Bool {
+        guard let raw = defaults.object(forKey: key) else { return fallback }
+        if let s = raw as? String {
+            switch s.trimmingCharacters(in: .whitespaces).lowercased() {
+            case "no", "false", "0", "off": return false
+            case "yes", "true", "1", "on": return true
+            default: return fallback
+            }
+        }
+        if let b = raw as? Bool { return b }
+        if let n = raw as? NSNumber { return n.boolValue }
+        return fallback
     }
 }
 

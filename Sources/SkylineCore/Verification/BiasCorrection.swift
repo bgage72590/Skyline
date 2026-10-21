@@ -41,18 +41,21 @@ public enum BiasCorrection {
     public enum Switch {
         public static let defaultsKey = "SkylineAccuracyCorrection"
         public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
-            defaults.object(forKey: defaultsKey) as? Bool ?? true
+            DefaultsFlag.value(defaults, defaultsKey, default: true)
         }
     }
 
     /// Launch-arg only, never persisted: `-SkylineCorrectionQAOverride 1.0`.
+    /// Reads the process arguments only, never UserDefaults (a `defaults write` must not enable it).
+    /// Finite values only, clamped to ±2 °C (review fix H1).
     public enum QAOverride {
+        public static let argument = "-SkylineCorrectionQAOverride"
+        /// Never read; kept so tests can prove a persisted value is ignored.
         public static let defaultsKey = "SkylineCorrectionQAOverride"
-        public static func celsius(defaults: UserDefaults = .standard) -> Double? {
-            if let d = defaults.object(forKey: defaultsKey) as? Double, d.isFinite { return d }
-            if let n = defaults.object(forKey: defaultsKey) as? NSNumber { return n.doubleValue }
-            if let s = defaults.object(forKey: defaultsKey) as? String, let d = Double(s), d.isFinite { return d }
-            return nil
+        public static func celsius(arguments: [String] = ProcessInfo.processInfo.arguments) -> Double? {
+            guard let i = arguments.lastIndex(of: argument), arguments.indices.contains(i + 1),
+                  let v = Double(arguments[i + 1].trimmingCharacters(in: .whitespaces)), v.isFinite else { return nil }
+            return clamp(v)
         }
     }
 
@@ -107,8 +110,10 @@ public enum BiasCorrection {
         return (clamp(shrunk), n)
     }
 
+    /// ±2 °C; non-finite input → 0 (review fix M5).
     public static func clamp(_ c: Double) -> Double {
-        min(max(c, -clampC), clampC)
+        guard c.isFinite else { return 0 }
+        return min(max(c, -clampC), clampC)
     }
 
     /// Applied offset moves toward `targetC` by at most 0.5 °C per city-local day.
@@ -116,10 +121,13 @@ public enum BiasCorrection {
     public static func rateLimited(previous: Double, targetC: Double, sameLocalDay: Bool,
                                    forceZero: Bool) -> Double {
         if forceZero { return 0 }
-        if sameLocalDay { return previous }
-        let delta = targetC - previous
-        if abs(delta) <= rampPerDayC { return targetC }
-        return previous + (delta > 0 ? rampPerDayC : -rampPerDayC)
+        // Inputs and output clamped: a stale/corrupt persisted `previous` can't bypass ±2 °C (M5).
+        let p = clamp(previous)
+        let t = clamp(targetC)
+        if sameLocalDay { return p }
+        let delta = t - p
+        if abs(delta) <= rampPerDayC { return t }
+        return clamp(p + (delta > 0 ? rampPerDayC : -rampPerDayC))
     }
 
     // MARK: Hourly offset with edge ramp (B8)
@@ -150,8 +158,11 @@ public enum BiasCorrection {
     /// `issued` is the report's "now" for lead-hour math. Daily offsets use local calendar days.
     public static func apply(hourly: inout [HourlyForecast], daily: inout [DailyForecast],
                              current: inout CurrentConditions, issued: Date, timeZone: TimeZone,
-                             offsets: [CorrectionTarget: Double]) {
+                             offsets rawOffsets: [CorrectionTarget: Double]) {
+        // Non-finite → 0 and every offset clamped to ±2 °C before use (M5).
+        let offsets = rawOffsets.mapValues { clamp($0) }
         guard offsets.values.contains(where: { abs($0) > 1e-12 }) else { return }
+        let rawHourly = hourly
         for i in hourly.indices {
             let lead = hourly[i].time.timeIntervalSince(issued) / 3600
             let dT = hourlyOffset(leadHours: lead, offsets: offsets)
@@ -165,22 +176,24 @@ public enum BiasCorrection {
         for i in daily.indices {
             let hi = offsets[.dailyHigh] ?? 0
             let lo = offsets[.dailyLow] ?? 0
+            let rawHigh = daily[i].high, rawLow = daily[i].low
             daily[i].high += hi
             daily[i].low += lo
-            // Keep high ≥ corrected hourly max / low ≤ corrected hourly min when PR 1 already satisfied that.
-            let dayHours = hourly.filter {
-                $0.time >= daily[i].date && cal.isDate($0.time, inSameDayAs: daily[i].date)
-            }
-            if let mx = dayHours.map(\.temperature).max(), daily[i].high < mx { daily[i].high = mx }
-            if let mn = dayHours.map(\.temperature).min(), daily[i].low > mn { daily[i].low = mn }
+            // Keep high ≥ corrected hourly max / low ≤ corrected hourly min only where PR 1 already satisfied
+            // that (lock B8), and never let low exceed high where PR 1 had low ≤ high.
+            func inDay(_ h: HourlyForecast) -> Bool { h.time >= daily[i].date && cal.isDate(h.time, inSameDayAs: daily[i].date) }
+            let rawDay = rawHourly.filter(inDay).map(\.temperature)
+            let dayHours = hourly.filter(inDay).map(\.temperature)
+            if let rmx = rawDay.max(), rawHigh >= rmx, let mx = dayHours.max(), daily[i].high < mx { daily[i].high = mx }
+            if let rmn = rawDay.min(), rawLow <= rmn, let mn = dayHours.min(), daily[i].low > mn { daily[i].low = mn }
+            if rawLow <= rawHigh, daily[i].low > daily[i].high { daily[i].low = daily[i].high }
         }
-        if let blended = hourly.min(by: { abs($0.time.timeIntervalSince(current.time)) < abs($1.time.timeIntervalSince(current.time)) }) {
-            let dT = blended.temperature - current.temperature
-            // Prefer the offset implied by the nearest corrected hour (preserves feels-like delta).
-            if abs(dT) > 1e-9 {
-                current.apparentTemperature += dT
-                current.temperature = blended.temperature
-            }
+        // Current conditions get the lead-0 offset (same as the first hours), so the headline moves by exactly
+        // the offset even when the headline line can't interpolate; feels-like keeps its offset (B8).
+        let dNow = hourlyOffset(leadHours: current.time.timeIntervalSince(issued) / 3600, offsets: offsets)
+        if abs(dNow) > 1e-12 {
+            current.temperature += dNow
+            current.apparentTemperature += dNow
         }
         if let dp = current.dewPoint { current.dewPoint = min(dp, current.temperature) }
     }

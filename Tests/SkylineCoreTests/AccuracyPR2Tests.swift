@@ -53,6 +53,7 @@ final class AccuracyPR2Tests: XCTestCase {
         XCTAssertEqual(measOff.daily, golden.daily)
         XCTAssertEqual(measOff.current, golden.current)
         XCTAssertEqual(measOff.modelSeries, golden.modelSeries)
+        XCTAssertEqual(measOff.weights, golden.weights)
     }
 
     func testGateBoundariesStayUncorrected() {
@@ -391,37 +392,13 @@ final class AccuracyPR2Tests: XCTestCase {
 
     // MARK: B12 — Switch + auto-off hysteresis + log
 
-    func testSwitchAndStickyAutoOffHysteresis() {
+    func testSwitchDefaultsOnAndOff() {
+        XCTAssertTrue(BiasCorrection.Switch.isEnabled(), "default ON (lock §10)")
         UserDefaults.standard.set(false, forKey: BiasCorrection.Switch.defaultsKey)
         XCTAssertFalse(BiasCorrection.Switch.isEnabled())
         UserDefaults.standard.set(true, forKey: BiasCorrection.Switch.defaultsKey)
         XCTAssertTrue(BiasCorrection.Switch.isEnabled())
-
-        // Build rows where correction makes things worse → auto-off.
-        var rows: [TrainingRow] = []
-        for d in 1...20 {
-            // Alternating large positive bias then near-zero so out-of-sample corrected can look worse.
-            let e = d <= 10 ? 3.0 : 0.1
-            rows.append(TrainingRow(loc: "x", localDay: t0.addingTimeInterval(Double(-d) * 86400),
-                                    target: .dailyHigh, sumE: e, n: 1))
-        }
-        var entry = CorrectionEntry(loc: "x", target: .dailyHigh)
-        let (off, log1) = BiasCorrection.evaluateAutoOff(entry: entry, rows: rows, asOf: t0)
-        // May or may not trip depending on replay; force worse case:
-        if let maes = BiasCorrection.outOfSampleMAEs(rows: rows), maes.corrected > maes.uncorrected {
-            XCTAssertTrue(off.autoOff)
-            XCTAssertNotNil(log1)
-        }
-        entry.autoOff = true
-        entry.autoOffAt = t0.addingTimeInterval(-20 * 86400)
-        entry.autoOffReason = "worse on recent days"
-        // Re-enable needs ≥7 new days AND 0.05 improvement — with flat rows, stays off.
-        let flat = (1...30).map { d in
-            TrainingRow(loc: "x", localDay: t0.addingTimeInterval(Double(-d) * 86400),
-                        target: .dailyHigh, sumE: 0.0, n: 1)
-        }
-        let (still, _) = BiasCorrection.evaluateAutoOff(entry: entry, rows: flat, asOf: t0)
-        XCTAssertTrue(still.autoOff || !still.autoOff) // exercised path
+        // Sticky auto-off with hysteresis + log: testAutoOffTripsLogsSurvivesRelaunchAndReenablesWithHysteresis.
     }
 
     // MARK: B13 — PR 1 decoder reads PR 2 files
@@ -580,31 +557,6 @@ final class AccuracyPR2Tests: XCTestCase {
         XCTAssertFalse(BiasCorrection.sitingPasses(distanceKm: 20, stationElevationM: nil, cityElevationM: nil))
     }
 
-    // MARK: QA override
-
-    func testQAOverrideForcesOffsetWithoutWriting() async throws {
-        UserDefaults.standard.set(1.0, forKey: BiasCorrection.QAOverride.defaultsKey)
-        let dir = tempDir("pr2-qa")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let store = BenchmarkStore(directory: dir, client: PR1HTTPClient(), now: { Self.t0 })
-        let key = "paris"
-        let station = MetarStationPick(stationID: "LFPG", coordinate: Coordinate(latitude: 49.01, longitude: 2.55),
-                                       elevationM: 100, distanceKm: 10, elevationDeltaM: 50, pickedAt: t0)
-        await store.seedStation(station, key: key)
-        await store.seedCityElevation(50, key: key)
-        var trains: [TrainingRow] = []
-        for d in 1...25 {
-            trains.append(TrainingRow(loc: key, localDay: t0.addingTimeInterval(Double(-d) * 86400),
-                                      target: .dailyHigh, sumE: 1.0, n: 1))
-        }
-        await store.seedTraining(trains)
-        let before = try? Data(contentsOf: dir.appendingPathComponent("corrections.json"))
-        let offsets = await store.refreshCorrections(key: key, timeZoneIdentifier: "Europe/Paris", sitingOK: true)
-        XCTAssertEqual(offsets[.dailyHigh] ?? -999, 1.0, accuracy: 1e-9)
-        let after = try? Data(contentsOf: dir.appendingPathComponent("corrections.json"))
-        XCTAssertEqual(before, after) // never writes corrections.json
-    }
-
     // MARK: Status lines
 
     func testStatusLines() {
@@ -644,7 +596,591 @@ final class AccuracyPR2Tests: XCTestCase {
         XCTAssertGreaterThan(abs(offsets[.h0to6] ?? 0), 0.01)
     }
 
+    // MARK: Review fix H1 — QA override: launch-arg only, finite, clamped, never saved, kill switch → 0
+
+    func testQAOverrideLaunchArgOnlyFiniteClampedNeverSaved() async throws {
+        typealias Q = BiasCorrection.QAOverride
+        XCTAssertEqual(Q.celsius(arguments: ["Skyline", "-SkylineCorrectionQAOverride", "1.0"]), 1.0)
+        XCTAssertEqual(Q.celsius(arguments: ["Skyline", "-SkylineCorrectionQAOverride", "50"]), 2.0)
+        XCTAssertEqual(Q.celsius(arguments: ["Skyline", "-SkylineCorrectionQAOverride", "-7.5"]), -2.0)
+        XCTAssertNil(Q.celsius(arguments: ["Skyline", "-SkylineCorrectionQAOverride", "nan"]))
+        XCTAssertNil(Q.celsius(arguments: ["Skyline", "-SkylineCorrectionQAOverride", "inf"]))
+        XCTAssertNil(Q.celsius(arguments: ["Skyline", "-SkylineCorrectionQAOverride", "abc"]))
+        XCTAssertNil(Q.celsius(arguments: ["Skyline", "-SkylineCorrectionQAOverride"]))
+        XCTAssertNil(Q.celsius(arguments: ["Skyline"]))
+
+        // A persisted value (`defaults write`) is ignored: only launch arguments count.
+        UserDefaults.standard.set(1.0, forKey: Q.defaultsKey)
+        UserDefaults.standard.set("1.0", forKey: Q.defaultsKey)
+        XCTAssertNil(Q.celsius(arguments: ["Skyline"]))
+        let dir = tempDir("pr2-qa-persist")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let v = ForecastVerifier(directory: dir, client: PR1HTTPClient(), now: { Self.t0 }, launchArguments: ["Skyline"])
+        let active = await v.isQAOverrideActive
+        XCTAssertFalse(active)
+        let key = await seedGatedNYC(v)
+        let learned = await v.corrections(key, timeZoneIdentifier: "America/New_York", cityElevationM: 27)
+        XCTAssertNotEqual(learned[.dailyHigh] ?? 0, 1.0, accuracy: 1e-6, "persisted override must not apply")
+
+        // Store level: override forces gated targets, never writes corrections.json, kill switch → 0.
+        let sdir = tempDir("pr2-qa-store")
+        defer { try? FileManager.default.removeItem(at: sdir) }
+        let store = BenchmarkStore(directory: sdir, client: PR1HTTPClient(), now: { Self.t0 })
+        let station = MetarStationPick(stationID: "LFPG", coordinate: Coordinate(latitude: 49.01, longitude: 2.55),
+                                       elevationM: 100, distanceKm: 10, elevationDeltaM: 50, pickedAt: t0)
+        await store.seedStation(station, key: "paris")
+        await store.seedCityElevation(50, key: "paris")
+        await store.seedTraining((1...25).map {
+            TrainingRow(loc: "paris", localDay: t0.addingTimeInterval(Double(-$0) * 86400), target: .dailyHigh, sumE: 1.0, n: 1)
+        })
+        let corr = sdir.appendingPathComponent("corrections.json")
+        let before = try? Data(contentsOf: corr)
+        var o = await store.refreshCorrections(key: "paris", timeZoneIdentifier: "Europe/Paris", sitingOK: true, qaOverrideC: 1.0)
+        XCTAssertEqual(o[.dailyHigh] ?? -999, 1.0, accuracy: 1e-12)
+        XCTAssertEqual(o[.h0to6] ?? -999, 0, "below-gate targets stay exactly 0 under the override")
+        o = await store.refreshCorrections(key: "paris", timeZoneIdentifier: "Europe/Paris", sitingOK: true, qaOverrideC: 50)
+        XCTAssertEqual(o[.dailyHigh] ?? -999, 2.0, accuracy: 1e-12)
+        UserDefaults.standard.set(false, forKey: BiasCorrection.Switch.defaultsKey)
+        o = await store.refreshCorrections(key: "paris", timeZoneIdentifier: "Europe/Paris", sitingOK: true, qaOverrideC: 1.0)
+        XCTAssertTrue(o.values.allSatisfy { $0 == 0 }, "kill switch beats the override")
+        UserDefaults.standard.removeObject(forKey: BiasCorrection.Switch.defaultsKey)
+        o = await store.refreshCorrections(key: "paris", timeZoneIdentifier: "Europe/Paris", sitingOK: true, qaOverrideC: 1.0)
+        let after = try? Data(contentsOf: corr)
+        XCTAssertEqual(before, after, "QA override never writes corrections.json")
+        XCTAssertNil(after)
+    }
+
+    // MARK: Review fix §7 / Option A — gated city pipeline under the launch-arg override
+
+    func testGatedPipelineLaunchArgOverridePlusOneEverywhere() async throws {
+        let golden = try loadGolden()
+        let dec = JSONDecoder(); dec.dateDecodingStrategy = .secondsSince1970
+        let gH = try dec.decode([HourlyForecast].self, from: golden.hourly)
+        let gD = try dec.decode([DailyForecast].self, from: golden.daily)
+        let gC = try dec.decode(CurrentConditions.self, from: golden.current)
+        let dir = tempDir("pr2-qa-pipe")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = PR1HTTPClient()
+        let clock = TestClock(t0)
+        let v = ForecastVerifier(directory: dir, client: client, now: { clock.now },
+                                 launchArguments: ["Skyline", "-SkylineCorrectionQAOverride", "1.0"])
+        let key = await seedGatedNYC(v)
+        let corrURL = await v.benchmarkStoreDirectory().appendingPathComponent("corrections.json")
+        let offsets = await v.corrections(key, timeZoneIdentifier: "America/New_York", cityElevationM: 27)
+        for t in CorrectionTarget.allCases { XCTAssertEqual(offsets[t] ?? 0, 1.0, accuracy: 1e-12, "\(t)") }
+        let statuses = await v.correctionStatuses(key)
+        XCTAssertEqual(statuses.count, 6)
+        XCTAssertTrue(statuses.allSatisfy { $0.line.contains("+1.0°") && $0.line.contains("(QA override)") },
+                      statuses.map(\.line).joined(separator: " | "))
+
+        let svc = WeatherService(client: client, cache: ResponseCache(directory: nil, now: { clock.now }),
+                                 verifier: v, now: { clock.now })
+        let report = try await svc.report(for: nyc)
+
+        // Hourly: +1.0 °C on temperature and feels-like, nothing else changes, dew ≤ T, no edge step.
+        XCTAssertEqual(report.hourly.count, gH.count)
+        var deltas: [Double] = []
+        for (a, g) in zip(report.hourly, gH) {
+            XCTAssertEqual(a.time, g.time)
+            XCTAssertEqual(a.temperature, g.temperature + 1.0, accuracy: 1e-9)
+            deltas.append(a.temperature - g.temperature)
+            if let ga = g.apparentTemperature { XCTAssertEqual(a.apparentTemperature ?? .nan, ga + 1.0, accuracy: 1e-9) }
+            if let dp = a.dewPoint { XCTAssertLessThanOrEqual(dp, a.temperature + 1e-9) }
+            XCTAssertEqual(a.weatherCode, g.weatherCode)
+            XCTAssertEqual(a.precipitation, g.precipitation)
+            XCTAssertEqual(a.precipitationProbability, g.precipitationProbability)
+            XCTAssertEqual(a.windSpeed, g.windSpeed)
+            XCTAssertEqual(a.humidity, g.humidity)
+            XCTAssertEqual(a.pressure, g.pressure)
+        }
+        for i in deltas.indices.dropFirst() {
+            XCTAssertLessThanOrEqual(abs(deltas[i] - deltas[i - 1]), BiasCorrection.maxEdgeStepC, "hour \(i)")
+        }
+
+        // Daily: +1.0 °C high/low (where PR 1 already had high ≥ hourly max / low ≤ hourly min).
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: report.timeZoneIdentifier)!
+        XCTAssertEqual(report.daily.count, gD.count)
+        _ = cal
+        for (a, g) in zip(report.daily, gD) {
+            // Equal offsets everywhere: every day's high/low moves by exactly +1.0 °C (invariants preserved).
+            XCTAssertEqual(a.high, g.high + 1.0, accuracy: 1e-9)
+            XCTAssertEqual(a.low, g.low + 1.0, accuracy: 1e-9)
+            XCTAssertEqual(a.precipitationProbability, g.precipitationProbability)
+            XCTAssertEqual(a.weatherCode, g.weatherCode)
+        }
+
+        // Chart: the Skyline blend line is the displayed (corrected) hourly; model lines are untouched.
+        let gS = try dec.decode([ModelSeries].self, from: golden.modelSeries)
+        XCTAssertEqual(report.modelSeries.count, gS.count)
+        for (a, g) in zip(report.modelSeries, gS) {
+            XCTAssertEqual(a.name, g.name)
+            for (x, y) in zip(a.temperatures, g.temperatures) {
+                XCTAssertEqual(x, y + (g.isBlend ? 1.0 : 0.0), accuracy: 1e-9, a.name)
+            }
+        }
+
+        // Headline + feels-like (offset preserved), dew ≤ T.
+        XCTAssertEqual(report.current.temperature, gC.temperature + 1.0, accuracy: 1e-9)
+        XCTAssertEqual(report.current.apparentTemperature, gC.apparentTemperature + 1.0, accuracy: 1e-9)
+        if let dp = report.current.dewPoint { XCTAssertLessThanOrEqual(dp, report.current.temperature + 1e-9) }
+        XCTAssertEqual(report.current.windSpeed, gC.windSpeed)
+        XCTAssertEqual(report.current.humidity, gC.humidity)
+
+        // Widget + menu bar are built from the same corrected report.
+        let snap = WidgetSnapshot(report: report, locationName: "New York", units: .metric, now: t0)
+        XCTAssertEqual(snap.temperature, gC.temperature + 1.0, accuracy: 1e-9)
+        XCTAssertEqual(snap.high ?? .nan, report.daily[0].high, accuracy: 1e-12)
+        XCTAssertEqual(snap.low ?? .nan, report.daily[0].low, accuracy: 1e-12)
+        for h in snap.hours {
+            guard let g = gH.first(where: { $0.time == h.time }) else { XCTFail("hour missing"); continue }
+            XCTAssertEqual(h.temperature, g.temperature + 1.0, accuracy: 1e-9)
+        }
+        let imperial = WidgetSnapshot(report: report, locationName: "New York", units: .imperial, now: t0)
+        XCTAssertEqual(DisplayUnits.imperial.temperature(imperial.temperature) - DisplayUnits.imperial.temperature(gC.temperature),
+                       1.8, accuracy: 1e-9)
+        XCTAssertEqual(MenuSummary.feelsLikeText(temperature: report.current.temperature,
+                                                 apparent: report.current.apparentTemperature, units: .metric),
+                       MenuSummary.feelsLikeText(temperature: gC.temperature + 1, apparent: gC.apparentTemperature + 1,
+                                                 units: .metric))
+
+        // Never writes corrections.json or accuracy.json.
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: corrURL.path))
+        let names = (FileManager.default.enumerator(atPath: dir.path)?.allObjects as? [String]) ?? []
+        XCTAssertFalse(names.contains { $0.hasSuffix("accuracy.json") }, "\(names)")
+
+        // Kill switch beats the override: next report is the PR 1 golden, byte for byte.
+        UserDefaults.standard.set(false, forKey: BiasCorrection.Switch.defaultsKey)
+        let gone = await v.correctionIfLoaded(key)
+        XCTAssertNil(gone)
+        let off = try await reportSlice(verifier: v, clock: clock, client: client)
+        assertGolden(off, golden)
+    }
+
+    // MARK: Review fix H2 — runtime switch / measurement OFF: the very next report is the golden
+
+    func testRuntimeKillSwitchAndMeasurementOffNextReportIsGolden() async throws {
+        let golden = try loadGolden()
+        for flip in [BiasCorrection.Switch.defaultsKey, AccuracyMeasurement.defaultsKey] {
+            UserDefaults.standard.removeObject(forKey: BiasCorrection.Switch.defaultsKey)
+            UserDefaults.standard.removeObject(forKey: AccuracyMeasurement.defaultsKey)
+            let dir = tempDir("pr2-runtime-off")
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let client = PR1HTTPClient()
+            let clock = TestClock(t0)
+            let v = ForecastVerifier(directory: dir, client: client, now: { clock.now }, launchArguments: ["Skyline"])
+            let key = await seedGatedNYC(v)
+            let on = await v.corrections(key, timeZoneIdentifier: "America/New_York", cityElevationM: 27)
+            XCTAssertTrue(on.values.contains { abs($0) > 0.01 }, "gated city must be corrected first: \(on)")
+            let loaded = await v.correctionIfLoaded(key)
+            XCTAssertNotNil(loaded)
+            UserDefaults.standard.set(false, forKey: flip)
+            let after = await v.correctionIfLoaded(key)
+            XCTAssertNil(after, "\(flip) OFF must stop correction immediately")
+            let slice = try await reportSlice(verifier: v, clock: clock, client: client)
+            assertGolden(slice, golden)
+        }
+    }
+
+    func testMetarWeightsMergeDropsImmediatelyOnSwitchOff() async throws {
+        let dir = tempDir("pr2-w-off")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let v = ForecastVerifier(directory: dir, client: PR1HTTPClient(), now: { Self.t0 }, launchArguments: ["Skyline"])
+        var recs: [VerifiedRecord] = []
+        for d in 0..<5 {
+            for h in 0..<24 {
+                let valid = t0.addingTimeInterval(-Double(d) * 86400 - Double(h + 1) * 3600)
+                recs.append(VerifiedRecord(
+                    ForecastRecord(loc: "paris", issued: valid.addingTimeInterval(-3 * 3600), valid: valid,
+                                   f: [VerificationSource.ecmwf.rawValue: SourceValues(t: 10.3),
+                                       VerificationSource.gfs.rawValue: SourceValues(t: 13.0),
+                                       VerificationSource.icon.rawValue: SourceValues(t: 11.0)]),
+                    ObservedHour(t: 10)))
+            }
+        }
+        await v.seedMetarWeightInputs(recs, key: "paris")
+        let enc = Self.sortedEncoder()
+        let wOn = await v.weights("paris")
+        XCTAssertFalse(wOn.isNeutral, "merged METAR inputs should move the weights")
+        UserDefaults.standard.set(false, forKey: BiasCorrection.Switch.defaultsKey)
+        let wOff = await v.weights("paris")
+        XCTAssertTrue(wOff.isNeutral, "switch OFF → PR 1 (no METAR) weights on the next call")
+        let wOffLoaded = await v.weightsIfLoaded("paris")
+        XCTAssertEqual(try enc.encode(wOffLoaded), try enc.encode(wOff))
+        UserDefaults.standard.removeObject(forKey: BiasCorrection.Switch.defaultsKey)
+        let wBack = await v.weights("paris")
+        // Recomputed with the merge again (sums iterate dictionaries, so compare state, not last-bit bytes).
+        XCTAssertFalse(wBack.isNeutral, "switch back ON → METAR merge again")
+    }
+
+    // MARK: Review fix H3 — `-Key NO` arrives as the string "NO"
+
+    func testSwitchesHonourStringNOFromArgumentDomain() {
+        let s = UserDefaults(suiteName: "pr2-flag-\(UUID().uuidString)")!
+        for key in [BiasCorrection.Switch.defaultsKey, AccuracyMeasurement.defaultsKey] {
+            func on() -> Bool {
+                key == AccuracyMeasurement.defaultsKey ? AccuracyMeasurement.isEnabled(defaults: s)
+                    : BiasCorrection.Switch.isEnabled(defaults: s)
+            }
+            s.removeObject(forKey: key); XCTAssertTrue(on(), "default ON")
+            s.set("NO", forKey: key); XCTAssertFalse(on(), "\(key) NO")
+            s.set("no", forKey: key); XCTAssertFalse(on())
+            s.set("0", forKey: key); XCTAssertFalse(on())
+            s.set("false", forKey: key); XCTAssertFalse(on())
+            s.set("YES", forKey: key); XCTAssertTrue(on())
+            s.set("garbage", forKey: key); XCTAssertTrue(on(), "unknown string keeps the default")
+            s.set(false, forKey: key); XCTAssertFalse(on())
+            s.set(true, forKey: key); XCTAssertTrue(on())
+            s.set(0, forKey: key); XCTAssertFalse(on())
+        }
+        s.set("NO", forKey: SkylineAccuracyCorrection.defaultsKey)
+        XCTAssertFalse(SkylineAccuracyCorrection.isEnabled(defaults: s))
+    }
+
+    // MARK: Review fix M4 — hourly learning keeps every lead bucket (dedupe on issued+valid)
+
+    func testHourlyLearningKeepsEveryLeadBucket() async {
+        let dir = tempDir("pr2-buckets")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tz = TimeZone(identifier: "Europe/Paris")!
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = tz
+        let day = cal.startOfDay(for: t0.addingTimeInterval(-2 * 86400))
+        let store = BenchmarkStore(directory: dir, client: PR1HTTPClient(), now: { Self.t0 })
+        var pairs: [BenchmarkHourlyPair] = []
+        for h in 0..<24 {
+            let valid = day.addingTimeInterval(Double(h) * 3600)
+            for lead in [3.0, 12.0, 36.0, 60.0] {
+                pairs.append(BenchmarkHourlyPair(loc: "paris", issued: valid.addingTimeInterval(-lead * 3600), valid: valid,
+                                                 kind: .skyline, forecastC: 12, observedC: 10, uncorrectedC: 12))
+            }
+        }
+        await store.seedHourly(pairs)
+        await store.seedHourly(pairs) // exact duplicates must not count twice
+        for _ in 0..<3 { await store.learnTraining(key: "paris", timeZoneIdentifier: tz.identifier) }
+        let rows = await store.trainingRows(for: "paris")
+        XCTAssertEqual(rows.count, 4)
+        for target in [CorrectionTarget.h0to6, .h6to24, .day2, .day3plus] {
+            let r = rows.first { $0.target == target }
+            XCTAssertEqual(r?.n, 24, "\(target)")
+            XCTAssertEqual(r?.distinct, 24, "\(target)")
+            XCTAssertEqual(r?.sumE ?? 0, 48, accuracy: 1e-9, "\(target)")
+        }
+    }
+
+    // MARK: Review fix M5 — clamp of the rate-limited output, NaN
+
+    func testClampCannotBeBypassedByPersistedPreviousOrNaN() async throws {
+        XCTAssertEqual(BiasCorrection.clamp(.nan), 0)
+        XCTAssertEqual(BiasCorrection.clamp(.infinity), 0)
+        XCTAssertEqual(BiasCorrection.rateLimited(previous: 10, targetC: 0, sameLocalDay: true, forceZero: false), 2)
+        XCTAssertEqual(BiasCorrection.rateLimited(previous: 10, targetC: 0, sameLocalDay: false, forceZero: false), 1.5)
+        XCTAssertEqual(BiasCorrection.rateLimited(previous: -10, targetC: -5, sameLocalDay: false, forceZero: false), -2)
+        XCTAssertEqual(BiasCorrection.rateLimited(previous: .nan, targetC: 1, sameLocalDay: false, forceZero: false), 0.5)
+        XCTAssertEqual(BiasCorrection.rateLimited(previous: 0, targetC: .nan, sameLocalDay: false, forceZero: false), 0)
+        XCTAssertEqual(BiasCorrection.rateLimited(previous: .nan, targetC: 1, sameLocalDay: true, forceZero: false), 0)
+        let bad = [TrainingRow(loc: "x", localDay: t0.addingTimeInterval(-86400), target: .dailyHigh, sumE: .nan, n: 1)]
+        XCTAssertTrue(BiasCorrection.estimate(rows: bad, asOf: t0).targetC.isFinite)
+
+        var hourly = [HourlyForecast(time: t0, temperature: 20, apparentTemperature: 21, weatherCode: 1, isDay: true, dewPoint: 19)]
+        var daily = [DailyForecast(date: t0, weatherCode: 1, high: 22, low: 18)]
+        var current = CurrentConditions(time: t0, temperature: 20, apparentTemperature: 21, humidity: 50, dewPoint: 19,
+                                        weatherCode: 1, isDay: true, precipitation: 0, cloudCover: nil, pressure: nil,
+                                        windSpeed: 5, windDirection: nil, windGust: nil, visibility: nil, uvIndex: nil)
+        BiasCorrection.apply(hourly: &hourly, daily: &daily, current: &current, issued: t0, timeZone: .gmt,
+                             offsets: [.h0to6: .nan, .dailyHigh: .infinity, .dailyLow: -.infinity])
+        XCTAssertEqual(hourly[0].temperature, 20); XCTAssertEqual(daily[0].high, 22); XCTAssertEqual(daily[0].low, 18)
+        BiasCorrection.apply(hourly: &hourly, daily: &daily, current: &current, issued: t0, timeZone: .gmt,
+                             offsets: [.h0to6: 9, .h6to24: 9, .day2: 9, .day3plus: 9])
+        XCTAssertEqual(hourly[0].temperature, 22, accuracy: 1e-9, "apply clamps to ±2 °C")
+
+        // End to end: a corrupt corrections.json (appliedC 10) can't push the applied value past ±2 °C.
+        let dir = tempDir("pr2-corrupt")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let enc = JSONEncoder(); enc.dateEncodingStrategy = .secondsSince1970
+        for sameDay in [false, true] {
+            let appliedOn = sameDay ? cal(for: "Europe/Paris").startOfDay(for: t0) : t0.addingTimeInterval(-3 * 86400)
+            let file = CorrectionsFile(entries: [CorrectionEntry(loc: "paris", target: .dailyHigh, appliedC: 10, targetC: 10,
+                                                                 appliedOn: appliedOn, n: 25)])
+            try enc.encode(file).write(to: dir.appendingPathComponent("corrections.json"))
+            let store = BenchmarkStore(directory: dir, client: PR1HTTPClient(), now: { Self.t0 })
+            await store.seedTraining((1...25).map {
+                TrainingRow(loc: "paris", localDay: t0.addingTimeInterval(Double(-$0) * 86400), target: .dailyHigh, sumE: 1.0, n: 1)
+            })
+            let o = await store.refreshCorrections(key: "paris", timeZoneIdentifier: "Europe/Paris", sitingOK: true)
+            XCTAssertLessThanOrEqual(abs(o[.dailyHigh] ?? 99), BiasCorrection.clampC, "sameDay=\(sameDay)")
+        }
+    }
+
+    // MARK: Wrong-temperature guards in apply (B8)
+
+    func testApplyNeverInvertsHighLowAndShiftsCurrentByExactOffset() {
+        let t = t0
+        var hourly = (0..<24).map { HourlyForecast(time: t.addingTimeInterval(Double($0) * 3600), temperature: 9.5,
+                                                   apparentTemperature: 8, weatherCode: 1, isDay: true, dewPoint: 9.4) }
+        var daily = [DailyForecast(date: Calendar(identifier: .gregorian).startOfDay(for: t), weatherCode: 1, high: 10, low: 9)]
+        // Current far outside the hourly range: headline can't interpolate, must still move by exactly the offset.
+        var current = CurrentConditions(time: t.addingTimeInterval(-6 * 3600), temperature: 7, apparentTemperature: 5,
+                                        humidity: 50, dewPoint: 6.5, weatherCode: 1, isDay: true, precipitation: 0,
+                                        cloudCover: nil, pressure: nil, windSpeed: 5, windDirection: nil, windGust: nil,
+                                        visibility: nil, uvIndex: nil)
+        var gmt = Calendar(identifier: .gregorian); gmt.timeZone = .gmt
+        daily[0].date = gmt.startOfDay(for: t)
+        // A day with no hourly data: only the low ≤ high guard can protect it.
+        daily.append(DailyForecast(date: gmt.startOfDay(for: t).addingTimeInterval(5 * 86400), weatherCode: 1, high: 10, low: 9))
+        BiasCorrection.apply(hourly: &hourly, daily: &daily, current: &current, issued: t, timeZone: .gmt,
+                             offsets: [.h0to6: -1.0, .h6to24: -1.0, .day2: -1.0, .day3plus: -1.0,
+                                       .dailyHigh: -2.0, .dailyLow: 2.0])
+        for d in daily { XCTAssertLessThanOrEqual(d.low, d.high, "low must never exceed high") }
+        XCTAssertEqual(daily[1].high, 8, accuracy: 1e-9)
+        XCTAssertEqual(current.temperature, 6.0, accuracy: 1e-9)
+        XCTAssertEqual(current.apparentTemperature, 4.0, accuracy: 1e-9)
+        XCTAssertLessThanOrEqual(current.dewPoint ?? 0, current.temperature)
+        for h in hourly { XCTAssertLessThanOrEqual(h.dewPoint ?? 0, h.temperature) }
+    }
+
+    // MARK: Review fix M6 — A1: simulated US city over 4 days gets daily high/low for every completed local day
+
+    func testA1USCityFourDaysDailyRowsEveryCompletedDayNoDuplicates() async throws {
+        let clock = TestClock(t0)
+        let client = A1NWSSimClient(clock)
+        let dir = tempDir("pr2-a1-4d")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let v = ForecastVerifier(directory: dir, client: client, now: { clock.now }, launchArguments: ["Skyline"])
+        let tz = TimeZone(identifier: "America/New_York")!
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = tz
+        let om = try OpenMeteoResponse.decode(Fixture.data("om_nyc"))
+        let stationsURL = URL(string: "https://api.weather.gov/gridpoints/OKX/33,42/stations")!
+        let pt = Coordinate(latitude: 40.75, longitude: -73.99)
+        func refresh() async {
+            let now = clock.now
+            if await v.wantsIssuance("nyc") {
+                let recs = (1...48).map { h in
+                    ForecastRecord(loc: "nyc", issued: now, valid: now.addingTimeInterval(Double(h) * 3600),
+                                   f: [VerificationSource.blend.rawValue: SourceValues(t: 11)])
+                }
+                await v.record(recs, key: "nyc")
+            }
+            await v.verifyIfDue(key: "nyc", stationsURL: stationsURL, near: pt)
+            let today = cal.startOfDay(for: now)
+            let daily = (0..<7).map {
+                DailyForecast(date: cal.date(byAdding: .day, value: $0, to: today)!, weatherCode: 0, high: 15, low: 5)
+            }
+            await v.runMeasurement(key: "nyc", coordinate: pt, timeZoneIdentifier: tz.identifier, daily: daily,
+                                   openMeteo: om, blended: [], isUS: true)
+        }
+        for i in 0..<(4 * 96) {          // 15-minute refreshes for 4 days
+            clock.now = t0.addingTimeInterval(Double(i) * 900)
+            await refresh()
+        }
+        func lines(_ name: String) -> [Substring] {
+            ((try? String(contentsOf: dir.appendingPathComponent("benchmark/\(name)"), encoding: .utf8)) ?? "")
+                .split(separator: "\n")
+        }
+        // Every local day that is complete and inside the observed span (t0 … now) must be scored; the
+        // partial first day (observations start at t0) must not be.
+        var expected: [Date] = []
+        var d = cal.startOfDay(for: t0)
+        while let next = cal.date(byAdding: .day, value: 1, to: d), next <= clock.now {
+            if d >= t0 { expected.append(d) }
+            d = next
+        }
+        XCTAssertGreaterThanOrEqual(expected.count, 3)
+        let dec = JSONDecoder(); dec.dateDecodingStrategy = .secondsSince1970
+        let obs = try lines("daily-obs.jsonl").map { try dec.decode(DailyObservedExtremes.self, from: Data($0.utf8)) }
+        XCTAssertEqual(Set(obs.map(\.localDay)), Set(expected), "daily high/low for every completed local day")
+        XCTAssertEqual(obs.count, expected.count, "one row per day")
+        for o in obs { XCTAssertGreaterThanOrEqual(o.distinctHours, 20); XCTAssertLessThan(o.lowC, o.highC) }
+        XCTAssertEqual(client.hostCount("aviationweather.gov"), 0, "US path never asks AWC")
+
+        // Re-running the same moment 20× adds no rows and no NWS requests.
+        let metarsBefore = lines("metars.jsonl").count
+        let nwsBefore = client.hostCount("api.weather.gov")
+        for _ in 0..<20 { await refresh() }
+        XCTAssertEqual(lines("daily-obs.jsonl").count, obs.count)
+        XCTAssertEqual(lines("metars.jsonl").count, metarsBefore)
+        XCTAssertEqual(client.hostCount("api.weather.gov"), nwsBefore)
+        let mc = await v.benchmarkMetarCount("nyc")
+        XCTAssertEqual(mc, metarsBefore)
+    }
+
+    // MARK: Review fix M7 — deterministic sticky auto-off with hysteresis and log
+
+    func testAutoOffTripsLogsSurvivesRelaunchAndReenablesWithHysteresis() async throws {
+        let dir = tempDir("pr2-autooff")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let utc = cal(for: "UTC")
+        let day0 = utc.startOfDay(for: t0)
+        func day(_ n: Int) -> Date { utc.date(byAdding: .day, value: n, to: day0)! }
+        func row(_ n: Int, _ e: Double) -> TrainingRow { TrainingRow(loc: "x", localDay: day(n), target: .dailyHigh, sumE: e, n: 1) }
+        let clock = TestClock(t0)
+        let station = MetarStationPick(stationID: "EGLL", coordinate: Coordinate(latitude: 51.47, longitude: -0.45),
+                                       elevationM: 25, distanceKm: 10, elevationDeltaM: 0, pickedAt: t0)
+        // 20 old days with a +2 °C bias, then 14 recent days with none: the out-of-sample correction hurts.
+        var store = BenchmarkStore(directory: dir, client: PR1HTTPClient(), now: { clock.now })
+        await store.seedStation(station, key: "x")
+        await store.seedTraining((15...34).map { row(-$0, 2.0) } + (1...14).map { row(-$0, 0.0) })
+        var o = await store.refreshCorrections(key: "x", timeZoneIdentifier: "UTC", sitingOK: true)
+        XCTAssertEqual(o[.dailyHigh], 0)
+        var e = await store.correctionEntry(loc: "x", target: .dailyHigh)
+        XCTAssertEqual(e?.autoOff, true)
+        XCTAssertEqual(e?.autoOffReason, "worse on recent days")
+        var log = await store.correctionsSnapshot().log
+        XCTAssertEqual(log.last?.state, "off")
+        XCTAssertEqual(log.last?.loc, "x")
+        XCTAssertEqual(log.last?.target, .dailyHigh)
+        XCTAssertNotNil(log.last?.correctedMAE)
+
+        // Relaunch: a new store on the same directory is still off (sticky, persisted in corrections.json).
+        store = BenchmarkStore(directory: dir, client: PR1HTTPClient(), now: { clock.now })
+        e = await store.correctionEntry(loc: "x", target: .dailyHigh)
+        XCTAssertEqual(e?.autoOff, true)
+        o = await store.refreshCorrections(key: "x", timeZoneIdentifier: "UTC", sitingOK: true)
+        XCTAssertEqual(o[.dailyHigh], 0)
+
+        // 6 new days where correction would clearly help: still off (< 7 new days).
+        await store.seedTraining((1...6).map { row($0, 2.0) })
+        clock.now = day(7).addingTimeInterval(12 * 3600)
+        o = await store.refreshCorrections(key: "x", timeZoneIdentifier: "UTC", sitingOK: true)
+        XCTAssertEqual(o[.dailyHigh], 0)
+        e = await store.correctionEntry(loc: "x", target: .dailyHigh)
+        XCTAssertEqual(e?.autoOff, true)
+
+        // ≥ 7 new days but < 0.05 °C improvement: still off (pure check of the hysteresis rule).
+        var offEntry = CorrectionEntry(loc: "y", target: .dailyHigh, autoOff: true, autoOffAt: day0)
+        let flat = (1...30).map { TrainingRow(loc: "y", localDay: day(-$0), target: .dailyHigh, sumE: 0, n: 1) }
+            + (1...10).map { TrainingRow(loc: "y", localDay: day($0), target: .dailyHigh, sumE: 0, n: 1) }
+        let (stillOff, noLog) = BiasCorrection.evaluateAutoOff(entry: offEntry, rows: flat, asOf: day(11))
+        XCTAssertTrue(stillOff.autoOff); XCTAssertNil(noLog)
+        offEntry.autoOffAt = day(5)
+        let (tooFew, _) = BiasCorrection.evaluateAutoOff(
+            entry: offEntry, rows: (1...30).map { TrainingRow(loc: "y", localDay: day(-$0), target: .dailyHigh, sumE: 2, n: 1) }
+                + (6...11).map { TrainingRow(loc: "y", localDay: day($0), target: .dailyHigh, sumE: 2, n: 1) },
+            asOf: day(12))
+        XCTAssertTrue(tooFew.autoOff, "6 new days < 7")
+
+        // 14 new days (≥ 7) and corrected clearly better: re-enables, logs "on", and ramps from 0 (≤ 0.5 °C).
+        await store.seedTraining((7...14).map { row($0, 2.0) })
+        clock.now = day(15).addingTimeInterval(12 * 3600)
+        o = await store.refreshCorrections(key: "x", timeZoneIdentifier: "UTC", sitingOK: true)
+        e = await store.correctionEntry(loc: "x", target: .dailyHigh)
+        XCTAssertEqual(e?.autoOff, false)
+        log = await store.correctionsSnapshot().log
+        XCTAssertEqual(log.last?.state, "on")
+        let applied = o[.dailyHigh] ?? 0
+        XCTAssertLessThan(applied, 0, "warm bias → negative offset")
+        XCTAssertGreaterThanOrEqual(applied, -BiasCorrection.rampPerDayC - 1e-12, "re-ramps from 0")
+        // Same local day: stable across refreshes and a relaunch.
+        store = BenchmarkStore(directory: dir, client: PR1HTTPClient(), now: { clock.now })
+        for _ in 0..<5 {
+            let again = await store.refreshCorrections(key: "x", timeZoneIdentifier: "UTC", sitingOK: true)
+            XCTAssertEqual(again[.dailyHigh] ?? 99, applied, accuracy: 1e-12)
+        }
+    }
+
+    // MARK: Lock §5 / §6(b) — held-out evaluation over a READ-ONLY copy of a Mac's benchmark/
+
+    /// Skipped unless `SKYLINE_EVAL_DIR` points at a copy of `…/verification/benchmark/`. Reads files only
+    /// (never opens a BenchmarkStore, which would prune/write). Per city × target: n, raw MAE, corrected MAE,
+    /// bias before/after (rolling out-of-sample replay, each day trained on earlier days only).
+    func testHeldOutEvaluationReadOnly() throws {
+        guard let path = ProcessInfo.processInfo.environment["SKYLINE_EVAL_DIR"], !path.isEmpty else {
+            throw XCTSkip("SKYLINE_EVAL_DIR not set")
+        }
+        let dir = URL(fileURLWithPath: path, isDirectory: true)
+        let fm = FileManager.default
+        func fingerprint() -> [String: String] {
+            var out: [String: String] = [:]
+            for name in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? [] {
+                let a = try? fm.attributesOfItem(atPath: dir.appendingPathComponent(name).path)
+                out[name] = "\((a?[.size] as? NSNumber)?.intValue ?? -1)|\((a?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1)"
+            }
+            return out
+        }
+        let before = fingerprint()
+        let dec = JSONDecoder(); dec.dateDecodingStrategy = .secondsSince1970
+        let text = (try? String(contentsOf: dir.appendingPathComponent("training.jsonl"), encoding: .utf8)) ?? ""
+        var seen = Set<String>()
+        let rows = text.split(separator: "\n").compactMap { try? dec.decode(TrainingRow.self, from: Data($0.utf8)) }
+            .filter { seen.insert($0.key).inserted }
+        // Sint Maarten: the city whose station is TNCM (Princess Juliana), or a key that names it.
+        var sxm = Set<String>()
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("meta.json")),
+           let meta = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            for (k, v) in meta where "\(v)".uppercased().contains("TNCM") { sxm.insert(k) }
+        }
+        for k in Set(rows.map(\.loc)) where ["maarten", "sxm", "philipsburg"].contains(where: k.lowercased().contains) {
+            sxm.insert(k)
+        }
+        print("EVAL rows=\(rows.count) cities=\(Set(rows.map(\.loc)).count) dir=\(dir.path)")
+        print("EVAL loc | target | n | rawMAE | correctedMAE | biasBefore | biasAfter")
+        let groups = Dictionary(grouping: rows) { "\($0.loc)|\($0.target.rawValue)" }
+        for (_, g) in groups.sorted(by: { $0.key < $1.key }) {
+            let sorted = g.sorted { $0.localDay < $1.localDay }
+            var n = 0, raw = 0.0, cor = 0.0, bBefore = 0.0, bAfter = 0.0
+            for day in sorted {
+                let prior = sorted.filter { $0.localDay < day.localDay }
+                guard !prior.isEmpty else { continue }
+                let offset = -BiasCorrection.estimate(rows: prior, asOf: day.localDay).targetC
+                let e = day.n > 0 ? day.sumE / Double(day.n) : day.sumE
+                n += 1; raw += abs(e); cor += abs(e + offset); bBefore += e; bAfter += e + offset
+            }
+            guard n > 0, let first = sorted.first else { continue }
+            let dn = Double(n)
+            let tag = sxm.contains(first.loc) && first.target == .dailyHigh ? "  <-- Sint Maarten daily high" : ""
+            print(String(format: "EVAL %@ | %@ | %d | %.3f | %.3f | %+.3f | %+.3f%@", first.loc, first.target.rawValue, n,
+                         raw / dn, cor / dn, bBefore / dn, bAfter / dn, tag))
+        }
+        if sxm.isEmpty { print("EVAL Sint Maarten: not found in this copy") }
+        XCTAssertEqual(fingerprint(), before, "evaluation must not modify the benchmark copy")
+    }
+
     // MARK: Helpers
+
+    /// Seeds a US city (NYC) past every gate with good siting; returns its verification key.
+    @discardableResult
+    private func seedGatedNYC(_ v: ForecastVerifier) async -> String {
+        let key = VerificationKey.key(for: nyc)
+        let ny = cal(for: "America/New_York")
+        let day0 = ny.startOfDay(for: t0)
+        var trains: [TrainingRow] = []
+        for d in 1...25 {
+            let day = ny.date(byAdding: .day, value: -d, to: day0)!
+            for target in CorrectionTarget.allCases {
+                trains.append(target.isDaily
+                    ? TrainingRow(loc: key, localDay: day, target: target, sumE: 1.0, n: 1)
+                    : TrainingRow(loc: key, localDay: day, target: target, sumE: 50.0, n: 50, distinct: 20))
+            }
+        }
+        let station = MetarStationPick(stationID: "KNYC", coordinate: Coordinate(latitude: 40.78, longitude: -73.97),
+                                       elevationM: 20, distanceKm: 8, elevationDeltaM: -7, pickedAt: t0)
+        await v.seedBenchmark(station: station, key: key, training: trains, cityElevationM: 27)
+        return key
+    }
+
+    private func cal(for tz: String) -> Calendar {
+        var c = Calendar(identifier: .gregorian); c.timeZone = TimeZone(identifier: tz)!; return c
+    }
+
+    private func reportSlice(verifier v: ForecastVerifier, clock: TestClock, client: PR1HTTPClient) async throws -> Slice {
+        let svc = WeatherService(client: client, cache: ResponseCache(directory: nil, now: { clock.now }),
+                                 verifier: v, now: { clock.now })
+        let report = try await svc.report(for: nyc)
+        let w = await v.weights(VerificationKey.key(for: nyc))
+        let enc = Self.sortedEncoder()
+        return Slice(hourly: try enc.encode(report.hourly), daily: try enc.encode(report.daily),
+                     current: try enc.encode(report.current), modelSeries: try enc.encode(report.modelSeries),
+                     weights: try enc.encode(w))
+    }
+
+    private func assertGolden(_ s: Slice, _ g: Slice, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(s.hourly, g.hourly, "hourly", file: file, line: line)
+        XCTAssertEqual(s.daily, g.daily, "daily", file: file, line: line)
+        XCTAssertEqual(s.current, g.current, "current", file: file, line: line)
+        XCTAssertEqual(s.modelSeries, g.modelSeries, "modelSeries", file: file, line: line)
+        XCTAssertEqual(s.weights, g.weights, "weights", file: file, line: line)
+    }
 
     private struct Slice: Codable {
         var hourly: Data; var daily: Data; var current: Data; var modelSeries: Data; var weights: Data
@@ -694,5 +1230,40 @@ final class AccuracyPR2Tests: XCTestCase {
         e.dateEncodingStrategy = .secondsSince1970
         e.outputFormatting = [.sortedKeys]
         return e
+    }
+}
+
+/// A1 test client: NWS stations + 20-minute observations up to the clock; everything else times out.
+private final class A1NWSSimClient: HTTPClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private let clock: TestClock
+    private var hosts: [String: Int] = [:]
+    init(_ clock: TestClock) { self.clock = clock }
+    func hostCount(_ host: String) -> Int { lock.lock(); defer { lock.unlock() }; return hosts[host] ?? 0 }
+    private func bump(_ host: String) { lock.lock(); hosts[host, default: 0] += 1; lock.unlock() }
+    private let stations = """
+    {"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[-73.88,40.78]},
+     "properties":{"stationIdentifier":"KLGA","name":"La Guardia","elevation":{"unitCode":"wmoUnit:m","value":3}}}]}
+    """
+    func get(_ url: URL, headers: [String: String]) async throws -> Data { try await fetch(url, headers: headers).data }
+    func fetch(_ url: URL, headers: [String: String]) async throws -> HTTPFetchResult {
+        bump(url.host ?? "?")
+        let s = url.absoluteString
+        if s.contains("/observations") {
+            let startStr = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .first { $0.name == "start" }?.value ?? ""
+            let start = ISO8601DateFormatter().date(from: startStr) ?? clock.now.addingTimeInterval(-86400)
+            let f = ISO8601DateFormatter()
+            var feats: [String] = []
+            var t = (start.timeIntervalSince1970 / 1200).rounded(.up) * 1200
+            while t <= clock.now.timeIntervalSince1970 {
+                let temp = 10 + 5 * sin(t / 86400 * 2 * .pi)
+                feats.append("{\"properties\":{\"timestamp\":\"\(f.string(from: Date(timeIntervalSince1970: t)))\",\"temperature\":{\"value\":\(temp),\"unitCode\":\"wmoUnit:degC\"}}}")
+                t += 1200
+            }
+            return HTTPFetchResult(statusCode: 200, data: Data("{\"features\":[\(feats.joined(separator: ","))]}".utf8))
+        }
+        if s.contains("/stations") { return HTTPFetchResult(statusCode: 200, data: Data(stations.utf8)) }
+        throw URLError(.timedOut)
     }
 }
