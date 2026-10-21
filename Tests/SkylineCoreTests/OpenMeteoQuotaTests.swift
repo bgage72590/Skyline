@@ -278,7 +278,6 @@ final class OpenMeteoQuotaTests: XCTestCase {
 
     func testNWSOnlyUSNoCacheNoHistoryNoCorrection() async throws {
         let clock = TestClock(fixtureTime)
-        let body = try dailyBody()
         let recording = RecordingHTTPClient { url in
             let h = url.host?.lowercased() ?? ""
             if OpenMeteoQuota.exactHosts.contains(h) {
