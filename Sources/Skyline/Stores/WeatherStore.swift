@@ -137,6 +137,11 @@ final class WeatherStore {
     @ObservationIgnored private var retryAttempts: [String: Int] = [:]
     /// One sleeping task that wakes at the next staleness deadline / alert end.
     @ObservationIgnored private var housekeepingTask: Task<Void, Never>?
+    /// Serial background network refreshes (CR M3): one task, ≥15 s + jitter between cities.
+    @ObservationIgnored private var staggerTask: Task<Void, Never>?
+    @ObservationIgnored private var staggerQueue: [WeatherLocation] = []
+    /// Bumped on cancel so a finishing worker does not clear a newer stagger task.
+    @ObservationIgnored private var staggerGeneration = 0
 
     private enum Keys {
         static let locations = "savedLocations.v1"
@@ -319,14 +324,30 @@ final class WeatherStore {
     /// without a banner (shown as "Updating…"). See `QuietRetryTracker` for when it clears.
     var quietRetries = QuietRetryTracker()
 
-    /// Data older than this is flagged as stale (see `DataAge.staleAfter`).
+    /// Data older than this is flagged as stale for fresh-cadence cities (see `DataAge.staleAfter`).
     var staleDataAge: TimeInterval { DataAge.staleAfter(refreshMinutes: refreshMinutes) }
+
+    /// Stale threshold for a city given its current refresh role (background uses TTL.background + 15 min).
+    func staleDataAge(for locationID: String) -> TimeInterval {
+        DataAge.staleAfter(refreshMinutes: refreshMinutes, role: roleFor(locationID))
+    }
+
+    /// Fresh-cadence = viewed (window visible) ∪ menu-bar ∪ notify. Computed per call; never stored.
+    private func roleFor(_ id: String) -> RefreshPlanner.Role {
+        let viewedID = isMainWindowVisible ? selectedLocation?.id : nil
+        let notifyIDs = notifyIDsForPlanner()
+        return RefreshPlanner.role(for: id, viewedID: viewedID, menuBarID: menuBarLocation?.id, notifyIDs: notifyIDs)
+    }
+
+    private func notifyIDsForPlanner() -> Set<String> {
+        (notificationPrefs.alerts || notificationPrefs.rain) ? Set(allLocations.filter(notifies).map(\.id)) : []
+    }
 
     /// True when the report's data is old, came from the offline cache, or its last refresh failed.
     /// Reads `staleTick`, so callers re-render when the report goes stale with no other change.
     func isStale(_ report: WeatherReport, now: Date = Date()) -> Bool {
         _ = staleTick
-        return hasRefreshProblem(report) || report.dataAge(at: now) > staleDataAge
+        return hasRefreshProblem(report) || report.dataAge(at: now) > staleDataAge(for: report.location.id)
     }
 
     /// True when the last refresh for this report's location failed (network or service error).
@@ -343,17 +364,23 @@ final class WeatherStore {
 
     // MARK: Loading
 
-    func load(_ location: WeatherLocation, force: Bool = false) async {
-        if !force, let existing = reports[location.id], errors[location.id] == nil, !existing.isOfflineFallback,
+    func load(_ location: WeatherLocation, force: Bool = false,
+              allowNetwork: Bool? = nil, role: RefreshPlanner.Role? = nil) async {
+        let resolvedRole = role ?? roleFor(location.id)
+        // 10-min store guard: only fresh-cadence with no explicit allowNetwork (CR M3).
+        if !force, RefreshPlanner.appliesStoreGuard(role: role, allowNetwork: allowNetwork),
+           let existing = reports[location.id], errors[location.id] == nil, !existing.isOfflineFallback,
            Date().timeIntervalSince(existing.fetchedAt) < staleAfter,
            existing.location.coordinate == location.coordinate {
             return
         }
+        let wasDailyLimited = await service.isDailyLimited(host: OpenMeteoQuota.forecastHost)
         loadingIDs.insert(location.id)
         defer { loadingIDs.remove(location.id) }
         do {
             let priority = FetchRetryPolicy.priority(force: force, hasReport: reports[location.id] != nil)
-            var report = try await service.report(for: location, forceRefresh: force, priority: priority)
+            var report = try await service.report(for: location, forceRefresh: force, priority: priority,
+                                                  allowNetwork: allowNetwork, role: resolvedRole)
             // My Location moved while this was loading: this answer is for the old place (L4).
             if location.isCurrentLocation,
                !CurrentLocationGuard.isCurrent(location.coordinate, current: currentLocation?.coordinate) {
@@ -365,10 +392,38 @@ final class WeatherStore {
             if defaults.bool(forKey: "SkylineDemoRain") { report.minutely = Self.demoRain(from: report.current.time) }
             reports[location.id] = report
             publishWidget()
-            let until = report.isOfflineFallback
-                ? await service.backoff(for: RefreshBookkeeping.openMeteoHost) : nil
-            let follow = RefreshBookkeeping.afterReport(isOfflineFallback: report.isOfflineFallback,
+
+            // Cache-only warm-up (launch): keep whatever was on disk without an offline banner (§4.3).
+            if allowNetwork == false {
+                if errors[location.id] != nil { errors[location.id] = nil }
+                quietRetries.succeeded(location.id)
+                scheduleHousekeeping()
+                await refreshAccuracy(for: location)
+                return
+            }
+
+            let dailyUntil = await service.dailyLimit(for: OpenMeteoQuota.forecastHost)
+            let stillLimited = dailyUntil != nil
+                || report.fallbackCause == .dailyLimit
+                || report.forecastMode == .nwsOnly
+            let follow: RefreshBookkeeping.FollowUp
+            if stillLimited {
+                let until = dailyUntil ?? OpenMeteoQuota.until(after: Date(), jitter: 0)
+                let message = dailyLimitMessage(for: report, until: until)
+                let owner = RefreshPlanner.retryOwner(
+                    viewed: isMainWindowVisible ? selectedLocation : nil, menuBar: menuBarLocation)
+                let isRetryOwner = location.id == owner?.id
+                // afterReport's daily-limit branch keys off cause == .dailyLimit (even for nwsOnly).
+                follow = RefreshBookkeeping.afterReport(
+                    isOfflineFallback: report.isOfflineFallback, cause: .dailyLimit,
+                    backoffUntil: nil, dailyLimitUntil: until, dailyLimitMessage: message,
+                    isDailyLimitRetryOwner: isRetryOwner)
+            } else {
+                let until = report.isOfflineFallback
+                    ? await service.backoff(for: RefreshBookkeeping.openMeteoHost) : nil
+                follow = RefreshBookkeeping.afterReport(isOfflineFallback: report.isOfflineFallback,
                                                         cause: report.fallbackCause, backoffUntil: until)
+            }
             if follow.clearError {
                 if errors[location.id] != nil { errors[location.id] = nil }
                 quietRetries.succeeded(location.id)
@@ -383,9 +438,16 @@ final class WeatherStore {
                 setError(follow.message, for: location.id)
                 // A one-off failure (not offline, not throttled) is retried in 15 s the first time, so a
                 // "Couldn’t update" banner after Refresh clears on its own within seconds.
-                let quick = retryAttempts[location.id, default: 0] == 0 ? follow.quickRetry : nil
-                scheduleRetry(location, notBefore: follow.notBefore,
-                              delay: quick.map { $0 + FetchRetryPolicy.jitter(for: location.id) })
+                if follow.scheduleRetry {
+                    let quick = retryAttempts[location.id, default: 0] == 0 ? follow.quickRetry : nil
+                    scheduleRetry(location, notBefore: follow.notBefore,
+                                  delay: quick.map { $0 + FetchRetryPolicy.jitter(for: location.id) })
+                }
+            }
+            // Probe success cleared the daily limit: enqueue due background cities on the stagger.
+            if wasDailyLimited, !stillLimited,
+               report.forecastMode != .nwsOnly, report.fallbackCause != .dailyLimit {
+                await enqueueDueBackground()
             }
             scheduleHousekeeping()
             if !report.isOfflineFallback { considerNotifications(report, for: location) }
@@ -394,9 +456,19 @@ final class WeatherStore {
             // Deferred #5 note: a cancelled load must not leave "Updating…" up unless a retry is pending.
             if retryTasks[location.id] == nil { quietRetries.abandoned(location.id) }
         } catch {
+            // Cache-only miss: leave empty for the stagger; no banner yet.
+            if allowNetwork == false {
+                if retryTasks[location.id] == nil { quietRetries.abandoned(location.id) }
+                return
+            }
             // Force during a long back-off throws `backingOff` immediately (no multi-minute sleep, so
             // `loadingIDs` clears and Refresh stays usable). The banner keeps the saved report.
-            let follow = RefreshBookkeeping.afterFailure(error)
+            let owner = RefreshPlanner.retryOwner(
+                viewed: isMainWindowVisible ? selectedLocation : nil, menuBar: menuBarLocation)
+            let isRetryOwner = location.id == owner?.id
+            let dailyUntil = await service.dailyLimit(for: OpenMeteoQuota.forecastHost)
+            let follow = RefreshBookkeeping.afterFailure(error, dailyLimitUntil: dailyUntil,
+                                                         isDailyLimitRetryOwner: isRetryOwner)
             if errors[location.id] == nil,
                followUpQuietly(location, error: error,
                                backoffUntil: await service.backoff(for: RefreshBookkeeping.openMeteoHost)) {
@@ -408,9 +480,23 @@ final class WeatherStore {
             if let existing = reports[location.id], existing.dataAge() > DataAge.maxDisplayAge {
                 reports[location.id] = nil
             }
-            scheduleRetry(location, notBefore: follow.notBefore)
+            if follow.scheduleRetry {
+                scheduleRetry(location, notBefore: follow.notBefore)
+            }
             scheduleHousekeeping()
         }
+    }
+
+    /// Banner copy while Open-Meteo's free daily limit is in effect.
+    private func dailyLimitMessage(for report: WeatherReport, until: Date) -> String {
+        if report.forecastMode == .nwsOnly {
+            return OpenMeteoQuota.nwsOnlyMessage(until: until)
+        }
+        if report.forecastAsOf != nil || (report.isOfflineFallback && report.fallbackCause == .dailyLimit) {
+            let dataTime = report.forecastAsOf ?? report.dataAsOf
+            return OpenMeteoQuota.cachedMessage(dataTime: dataTime, until: until)
+        }
+        return OpenMeteoQuota.noDataMessage(until: until)
     }
 
     /// Item 2: schedules a quiet quick retry when the policy allows; false = show the error as before.
@@ -463,7 +549,7 @@ final class WeatherStore {
         let now = Date()
         var deadlines: [Date] = []
         for report in reports.values {
-            let staleAt = report.dataAsOf.addingTimeInterval(staleDataAge)
+            let staleAt = report.dataAsOf.addingTimeInterval(staleDataAge(for: report.location.id))
             if staleAt > now { deadlines.append(staleAt) }
             deadlines += report.alerts.compactMap(\.endTime).filter { $0 > now }
         }
@@ -486,11 +572,20 @@ final class WeatherStore {
         }
     }
 
-    /// The real service, or (QA hook `-SkylineSimulateOffline YES|cold`) one whose network always fails:
-    /// `YES` keeps the on-disk cache (offline fallback, stale banner), `cold` starts with an empty cache
-    /// (error states). Nothing is recorded for verification in either mode.
+    /// The real service, or a QA hook whose network is synthetic:
+    /// `-SkylineSimulateOMDailyLimit YES` → Open-Meteo hosts answer daily-limit 429 (no verifier/history;
+    ///   quota marker not persisted so a relaunch without the flag resumes at once).
+    /// `-SkylineSimulateOffline YES|cold` → every request fails; `YES` keeps the on-disk cache (offline
+    ///   fallback, stale banner), `cold` starts with an empty cache (error states). Nothing is recorded
+    ///   for verification in either offline mode.
     nonisolated static func makeService() -> WeatherService {
-        let mode = UserDefaults.standard.string(forKey: "SkylineSimulateOffline")?.lowercased()
+        let defaults = UserDefaults.standard
+        let omLimit = defaults.bool(forKey: "SkylineSimulateOMDailyLimit")
+            || ["yes", "1", "true"].contains(defaults.string(forKey: "SkylineSimulateOMDailyLimit")?.lowercased() ?? "")
+        if omLimit {
+            return WeatherService(client: QuotaLimitHTTPClient(), persistQuotaMarker: false)
+        }
+        let mode = defaults.string(forKey: "SkylineSimulateOffline")?.lowercased()
         switch mode {
         case "yes", "1", "true":
             return WeatherService(client: OfflineHTTPClient())
@@ -507,7 +602,8 @@ final class WeatherStore {
 
     /// The dropdown (or hotkey panel) opened. While it's raining or rain is due and the data is a few
     /// minutes old, refetch now (forced: past the 10-minute guard and the HTTP cache), otherwise the
-    /// usual guarded load. Other cities' rows that went stale are brought up to date too (at most 5).
+    /// usual guarded load. Other cities' rows that went stale are brought up to date on the stagger
+    /// queue (at most 5), never via a task-group sweep.
     func dropdownOpened() async {
         let now = Date()
         if let last = lastDropdownOpen, now.timeIntervalSince(last) < 2 { return } // `.task` + became-key on one open
@@ -516,34 +612,148 @@ final class WeatherStore {
         if let report = reports[location.id], !isLoading(location),
            MenuSummary.refreshOnOpen(report, now: now, lastForcedAttempt: lastForcedOpen[location.id]) {
             lastForcedOpen[location.id] = now // set before the fetch: a failure counts too
-            await load(location, force: true)
+            await load(location, force: true, role: .freshCadence)
         } else {
-            await load(location)
+            await load(location, role: .freshCadence)
         }
         let stale = allLocations.filter { $0.id != location.id }.prefix(5)
-            .filter { reports[$0.id].map { MenuSummary.primaryForecastAge($0, now: now) >= staleDataAge } ?? true }
-        if !stale.isEmpty { await refresh(locations: Array(stale), force: false) }
+            .filter { loc in
+                reports[loc.id].map { MenuSummary.primaryForecastAge($0, now: now) >= staleDataAge(for: loc.id) } ?? true
+            }
+        if !stale.isEmpty { enqueueStagger(Array(stale)) }
     }
 
     func refreshAll(force: Bool) async {
         locationProvider.refresh()
-        await refresh(locations: allLocations, force: force)
+        if force {
+            // ⌘R / toolbar: only selected ∪ menu-bar (CR M8). Never touch savedLocations / pins / notify.
+            let targets = RefreshPlanner.manualRefreshTargets(
+                selected: selectedLocation, menuBar: menuBarLocation, saved: savedLocations)
+            await refresh(locations: targets, force: true)
+        } else {
+            await refreshDue()
+        }
     }
 
-    /// Called by the periodic loop and after wake.
+    /// Called by the periodic loop, after wake, when the window is shown, and on launch.
+    /// Fresh-cadence cities load directly; background network work goes through the stagger queue.
     func refreshDue() async {
         SyncCoordinator.shared?.pullIfChanged() // one stat; merges only when another Mac wrote
-        var targets: [WeatherLocation] = []
-        if let m = menuBarLocation { targets.append(m) }
-        // Cities with warning/rain notifications stay current even with the window closed.
-        if notificationPrefs.alerts || notificationPrefs.rain { targets += allLocations.filter(notifies) }
-        if isMainWindowVisible { targets += allLocations }
-        // A city with no data at all is fetched once even while the window is hidden or occluded
-        // (display asleep at launch), so its row never sits on "--" waiting for a visibility change.
-        targets += allLocations.filter { reports[$0.id] == nil }
-        await refresh(locations: targets, force: false)
+        let plan = await planRefresh()
+        // 1. Fresh-cadence due → direct load (network if pair older than 10 min).
+        for location in plan.fresh {
+            await load(location, force: false, allowNetwork: nil, role: .freshCadence)
+        }
+        // 2. Background cities with no report: cache-only warm-up; misses queue first on stagger.
+        var emptyFirst: [WeatherLocation] = []
+        for location in plan.cacheOnly {
+            await load(location, force: false, allowNetwork: false, role: .background)
+            if reports[location.id] == nil { emptyFirst.append(location) }
+        }
+        // 3. Due background → stagger (empty-report cities first).
+        var background = emptyFirst
+        var seen = Set(emptyFirst.map(\.id))
+        for location in plan.background where seen.insert(location.id).inserted {
+            background.append(location)
+        }
+        if !background.isEmpty { enqueueStagger(background) }
     }
 
+    private struct RefreshPlan {
+        var fresh: [WeatherLocation]
+        var background: [WeatherLocation]
+        var cacheOnly: [WeatherLocation]
+    }
+
+    /// Roles + due lists for the current viewed / menu-bar / notify set.
+    private func planRefresh() async -> RefreshPlan {
+        let viewed = isMainWindowVisible ? selectedLocation : nil
+        let menuBar = menuBarLocation
+        let cities = allLocations
+        let notifyIDs = notifyIDsForPlanner()
+        let roles = RefreshPlanner.roles(cities: cities, viewedID: viewed?.id, menuBarID: menuBar?.id,
+                                         notifyIDs: notifyIDs)
+        let now = Date()
+        var pairAges: [String: TimeInterval] = [:]
+        for city in cities {
+            if let report = reports[city.id] {
+                pairAges[city.id] = now.timeIntervalSince(report.forecastAsOf ?? report.dataAsOf)
+            }
+        }
+        var wantsIssuance: [String: Bool] = [:]
+        if let verifier = service.verifier, isMainWindowVisible {
+            for city in cities where roles[city.id] == .background {
+                wantsIssuance[city.id] = await verifier.wantsIssuance(VerificationKey.key(for: city))
+            }
+        }
+        let due = RefreshPlanner.due(now: now, cities: cities, pairAges: pairAges, roles: roles,
+                                     wantsIssuance: wantsIssuance)
+        let byID = Dictionary(uniqueKeysWithValues: cities.map { ($0.id, $0) })
+        let fresh = due.fresh.compactMap { byID[$0] }
+        let background = due.background.compactMap { byID[$0] }
+        // Cache-only: background cities that still have nothing on screen (launch / fetch-once).
+        let cacheOnly = cities.filter { roles[$0.id] == .background && reports[$0.id] == nil }
+        return RefreshPlan(fresh: fresh, background: background, cacheOnly: cacheOnly)
+    }
+
+    /// After a successful daily-limit probe: enqueue due background cities on the stagger.
+    private func enqueueDueBackground() async {
+        let plan = await planRefresh()
+        if !plan.background.isEmpty { enqueueStagger(plan.background) }
+    }
+
+    /// Append cities to the single background stagger queue (dedupe by id). Starts the worker if idle.
+    private func enqueueStagger(_ cities: [WeatherLocation]) {
+        for city in cities {
+            if !staggerQueue.contains(where: { $0.id == city.id }) {
+                staggerQueue.append(city)
+            }
+        }
+        // Cities with nothing on screen stay at the front (today's fetch-once).
+        staggerQueue.sort { a, b in
+            let aEmpty = reports[a.id] == nil
+            let bEmpty = reports[b.id] == nil
+            if aEmpty != bEmpty { return aEmpty && !bEmpty }
+            return false
+        }
+        startStaggerIfNeeded()
+    }
+
+    private func startStaggerIfNeeded() {
+        guard staggerTask == nil, !staggerQueue.isEmpty else { return }
+        staggerGeneration += 1
+        let generation = staggerGeneration
+        staggerTask = Task { [weak self] in
+            var isFirst = true
+            while let self, !Task.isCancelled, generation == self.staggerGeneration {
+                guard !self.staggerQueue.isEmpty else { break }
+                let next = self.staggerQueue.removeFirst()
+                guard let current = self.allLocations.first(where: { $0.id == next.id }) else { continue }
+                if !isFirst {
+                    let delay = RefreshPlanner.staggerDelay(for: current.id)
+                    try? await Task.sleep(for: .seconds(delay))
+                    guard !Task.isCancelled, generation == self.staggerGeneration else { break }
+                }
+                isFirst = false
+                await self.load(current, force: false, allowNetwork: true, role: .background)
+            }
+            guard let self, generation == self.staggerGeneration else { return }
+            self.staggerTask = nil
+            if !self.staggerQueue.isEmpty { self.startStaggerIfNeeded() }
+        }
+    }
+
+    /// Window hidden: cancel in-flight stagger work, but keep cities that still have no report
+    /// (fetch-once even while occluded / menu-bar only).
+    private func cancelStaggerKeepingEmptyReports() {
+        staggerTask?.cancel()
+        staggerTask = nil
+        staggerGeneration += 1
+        staggerQueue = staggerQueue.filter { reports[$0.id] == nil }
+        if !staggerQueue.isEmpty { startStaggerIfNeeded() }
+    }
+
+    /// Force refresh of a small id-deduped set (⌘R targets). Not used for background sweeps.
     private func refresh(locations: [WeatherLocation], force: Bool) async {
         var seen = Set<String>()
         let unique = locations.filter { seen.insert($0.id).inserted }
@@ -586,7 +796,11 @@ final class WeatherStore {
         guard visible != isMainWindowVisible else { return }
         isMainWindowVisible = visible
         if radar.isVisible != visible { radar.isVisible = visible }
-        if visible { Task { await refreshDue() } }
+        if visible {
+            Task { await refreshDue() }
+        } else {
+            cancelStaggerKeepingEmptyReports()
+        }
     }
 
     /// Window closed → menu bar only: stop radar playback, drop the window content (ContentView swaps it
@@ -1054,6 +1268,8 @@ extension WeatherStore {
         } else {
             guard prefs.anyOn, notifier.authorized == true else { return }
         }
+        // NWS-only has no OM nowcast: suppress rain-soon; alerts still fire (§4.4).
+        if report.forecastMode == .nwsOnly { prefs.rain = false }
         let tz = report.timeZone
         let name = location.name
         var planned: [PlannedNotification] = []
