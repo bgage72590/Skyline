@@ -7,6 +7,7 @@ import SkylineCore
 struct SkylineApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var store = WeatherStore.forApp()
+    @State private var updates = UpdateActivity.shared
 
     init() {
         // L23: start the request-rate clock at launch, not at the first request.
@@ -25,7 +26,8 @@ struct SkylineApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .appInfo) {
-                Button("Update Skyline…") { Updater.checkForUpdates() }
+                Button(updates.downloadingTitle ?? "Update Skyline…") { Updater.checkForUpdates() }
+                    .disabled(updates.isPending)
             }
             // ⌘Q closes the window and leaves Skyline in the menu bar (batch 6); ⌥⌘Q really quits.
             CommandGroup(replacing: .appTermination) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build Skyline.app, sign with the local signing identity, install to /Applications, relaunch, and
-# publish to iCloud Drive/Skyline (scripts/publish-icloud.sh: Skyline.zip, Install Skyline.command,
-# VERSION.txt, Skyline.version). Other Macs double-click Install Skyline.command (first time: right-click ›
+# publish to iCloud Drive/Skyline (scripts/publish-icloud.sh: Skyline.zip, Skyline.sha256,
+# Install Skyline.command, VERSION.txt, Skyline.version). Other Macs double-click Install Skyline.command (first time: right-click ›
 # Open), which refuses anything not signed by this Mac's certificate.
 #
 #   ./build-app.sh              # build + install + launch + zip to iCloud
@@ -193,6 +193,7 @@ codesign -d -r- "$APP" 2>&1 | sed -n 's/^designated => /    designated requireme
 if [[ $ZIP -eq 1 ]]; then
   if [[ -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs" ]]; then
     echo "==> Publishing to iCloud Drive"
+    # publish-icloud.sh writes Skyline.zip and Skyline.sha256 next to each other.
     "$ROOT/scripts/publish-icloud.sh" "$APP"
   else
     echo "    iCloud Drive not found; skipping zip"

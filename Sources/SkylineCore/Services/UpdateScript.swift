@@ -7,6 +7,18 @@ import Foundation
 public enum UpdateScript {
     public static func quote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
+    /// One file per updater run (`skyline-update-<token>.txt`) so overlapping attempts can't truncate
+    /// each other's log. `skyline-update-result.txt` is the older single path, still recognized.
+    public static func resultLogFileName(token: String) -> String {
+        "skyline-update-\(token).txt"
+    }
+
+    public static func isFailureLogName(_ name: String) -> Bool {
+        if name.hasSuffix(".partial") { return false }
+        if name == "skyline-update-result.txt" { return true }
+        return name.hasPrefix("skyline-update-") && name.hasSuffix(".txt")
+    }
+
     public static func command(installer: String, newerThan build: Int, zip: String, resultLog: String) -> String {
         let log = quote(resultLog), tmp = quote(resultLog + ".partial")
         return """
