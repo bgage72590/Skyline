@@ -360,7 +360,7 @@ public actor WeatherService {
         switch pairOutcome {
         case .success(let p): pair = p
         case .failure(let error):
-            let limited = await {
+            let limited: Bool = {
                 if case HTTPError.dailyLimit = error { return true }
                 return isDailyLimited(host: OpenMeteoQuota.forecastHost)
             }()
