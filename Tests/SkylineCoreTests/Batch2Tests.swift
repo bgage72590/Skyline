@@ -285,10 +285,11 @@ final class Batch2Tests: XCTestCase {
         XCTAssertEqual(client.forecastHits, hits, "long back-off does not hit the network")
 
         // ≤ 30s left: wait once, then a healthy Open-Meteo response clears the offline flag.
+        // A+B pair = 2 GETs after the wait.
         clock.now = windowEnd.addingTimeInterval(-20)
         let r3 = try await service.report(for: nyc, forceRefresh: true)
         XCTAssertGreaterThanOrEqual(clock.now, windowEnd, "short remainder is waited out")
-        XCTAssertEqual(client.forecastHits, hits + 1)
+        XCTAssertEqual(client.forecastHits, hits + 2)
         XCTAssertFalse(r3.isOfflineFallback)
         XCTAssertGreaterThan(r3.dataAsOf, r1.dataAsOf, "fresh download, not the pre-429 cache time")
         let cleared = await service.backoff(for: "api.open-meteo.com")
