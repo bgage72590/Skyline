@@ -272,6 +272,11 @@ public actor WeatherService {
             let issued = now()
             let nwsHourly = nws?.hourly ?? []
             let stations = nws?.point.observationStations
+            // Accuracy PR 1: pass timezone / daily / coordinate into the detached block only.
+            let measureTZ = om.timezone
+            let measureDaily = daily
+            let measureCoord = coord
+            let measureIsUS = location.isLikelyInNWSCoverage
             Task.detached(priority: .utility) {
                 if await verifier.wantsIssuance(key) {
                     let records = ForecastSampler.records(location: key, issued: issued, openMeteo: om,
@@ -279,6 +284,11 @@ public actor WeatherService {
                     await verifier.record(records, key: key)
                 }
                 await verifier.verifyIfDue(key: key, stationsURL: stations, near: coord)
+                // Measurement-only: METAR / daily high-low / MET Norway benchmark (isolated store).
+                // Kill switch default ON; failures must not affect the report or Open-Meteo/NWS backoff.
+                await verifier.runMeasurement(key: key, coordinate: measureCoord, timeZoneIdentifier: measureTZ,
+                                              daily: measureDaily, openMeteo: om, blended: hourly,
+                                              isUS: measureIsUS)
             }
         }
 

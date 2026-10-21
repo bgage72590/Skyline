@@ -1,0 +1,42 @@
+[
+  {
+    "icaoId": "LFPG",
+    "site": "Paris Charles de Gaulle",
+    "lat": 49.0128,
+    "lon": 2.55,
+    "elev": 119,
+    "country": "FR"
+  },
+  {
+    "icaoId": "LFPB",
+    "site": "Paris Le Bourget",
+    "lat": 48.9694,
+    "lon": 2.4414,
+    "elev": 66,
+    "country": "FR"
+  },
+  {
+    "icaoId": "LFPO",
+    "site": "Paris Orly",
+    "lat": 48.7233,
+    "lon": 2.3794,
+    "elev": 89,
+    "country": "FR"
+  },
+  {
+    "icaoId": "EGLL",
+    "site": "London Heathrow",
+    "lat": 51.4775,
+    "lon": -0.4614,
+    "elev": 25,
+    "country": "GB"
+  },
+  {
+    "icaoId": "FARAWAY",
+    "site": "Too Far",
+    "lat": 40.0,
+    "lon": 20.0,
+    "elev": 0,
+    "country": "XX"
+  }
+]

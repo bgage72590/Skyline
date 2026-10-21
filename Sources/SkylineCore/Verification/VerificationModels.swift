@@ -133,6 +133,174 @@ public struct VerifiedRecord: Codable, Hashable, Sendable {
     public init(_ r: ForecastRecord, _ o: ObservedHour) { self.r = r; self.o = o }
 }
 
+// MARK: Accuracy PR 1 — measurement-only types (never a VerificationSource case)
+
+/// Kill switch for measurement (default ON). Hidden defaults / `-SkylineAccuracyMeasurement NO`.
+public enum AccuracyMeasurement {
+    public static let defaultsKey = "SkylineAccuracyMeasurement"
+    public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: defaultsKey) as? Bool ?? true
+    }
+}
+
+/// Forecast sources compared on the Accuracy "Skyline vs other forecasts" section.
+/// Not a `VerificationSource`: MET Norway must never enter AdaptiveWeighting / accuracy.json.
+public enum BenchmarkForecastKind: String, Codable, CaseIterable, Sendable, Comparable {
+    case skyline
+    case nws
+    case bestMatch = "best_match"
+    case metNorway = "met_norway"
+
+    public var displayName: String {
+        switch self {
+        case .skyline: "Skyline"
+        case .nws: "NWS"
+        case .bestMatch: "Best Match"
+        case .metNorway: "MET Norway"
+        }
+    }
+
+    public static func < (a: Self, b: Self) -> Bool {
+        allCases.firstIndex(of: a)! < allCases.firstIndex(of: b)!
+    }
+}
+
+/// Nearest METAR station pick for a city (isolated benchmark store).
+public struct MetarStationPick: Codable, Hashable, Sendable {
+    public var stationID: String
+    public var name: String?
+    public var coordinate: Coordinate
+    public var elevationM: Double?
+    public var distanceKm: Double
+    public var elevationDeltaM: Double?
+    public var pickedAt: Date
+
+    public init(stationID: String, name: String? = nil, coordinate: Coordinate, elevationM: Double? = nil,
+                distanceKm: Double, elevationDeltaM: Double? = nil, pickedAt: Date) {
+        self.stationID = stationID; self.name = name; self.coordinate = coordinate
+        self.elevationM = elevationM; self.distanceKm = distanceKm
+        self.elevationDeltaM = elevationDeltaM; self.pickedAt = pickedAt
+    }
+}
+
+/// One METAR observation row kept in the isolated benchmark store (not verified.jsonl).
+public struct MetarObservationRecord: Codable, Hashable, Sendable {
+    public var loc: String
+    public var stationID: String
+    public var time: Date
+    public var temperatureC: Double?
+    public var windKmh: Double?
+    public var wet: Bool?
+    public var raw: String?
+
+    public init(loc: String, stationID: String, time: Date, temperatureC: Double?, windKmh: Double?,
+                wet: Bool?, raw: String? = nil) {
+        self.loc = loc; self.stationID = stationID; self.time = time
+        self.temperatureC = temperatureC; self.windKmh = windKmh; self.wet = wet; self.raw = raw
+    }
+}
+
+/// Forecast daily high/low issued for a city's local calendar day (benchmark store).
+public struct DailyForecastIssue: Codable, Hashable, Sendable {
+    public var loc: String
+    public var issued: Date
+    /// Local midnight of the forecast day (city IANA zone).
+    public var localDay: Date
+    public var timeZoneIdentifier: String
+    public var highs: [String: Double]
+    public var lows: [String: Double]
+
+    public init(loc: String, issued: Date, localDay: Date, timeZoneIdentifier: String,
+                highs: [String: Double], lows: [String: Double]) {
+        self.loc = loc; self.issued = issued; self.localDay = localDay
+        self.timeZoneIdentifier = timeZoneIdentifier; self.highs = highs; self.lows = lows
+    }
+}
+
+/// Observed daily extremes after a local day has fully ended (≥ 20 distinct hourly slots).
+public struct DailyObservedExtremes: Codable, Hashable, Sendable {
+    public var loc: String
+    public var localDay: Date
+    public var timeZoneIdentifier: String
+    public var highC: Double
+    public var lowC: Double
+    public var distinctHours: Int
+    public var stationID: String?
+    public var source: String
+
+    public init(loc: String, localDay: Date, timeZoneIdentifier: String, highC: Double, lowC: Double,
+                distinctHours: Int, stationID: String? = nil, source: String) {
+        self.loc = loc; self.localDay = localDay; self.timeZoneIdentifier = timeZoneIdentifier
+        self.highC = highC; self.lowC = lowC; self.distinctHours = distinctHours
+        self.stationID = stationID; self.source = source
+    }
+}
+
+/// Cached MET Norway compact forecast (honours Expires / If-Modified-Since).
+public struct MetNorwayCacheEntry: Codable, Hashable, Sendable {
+    public var loc: String
+    public var fetchedAt: Date
+    public var lastModified: String?
+    public var expires: Date?
+    public var body: Data
+    public var hourly: [MetNorwayHour]
+
+    public init(loc: String, fetchedAt: Date, lastModified: String?, expires: Date?, body: Data,
+                hourly: [MetNorwayHour]) {
+        self.loc = loc; self.fetchedAt = fetchedAt; self.lastModified = lastModified
+        self.expires = expires; self.body = body; self.hourly = hourly
+    }
+}
+
+public struct MetNorwayHour: Codable, Hashable, Sendable {
+    public var time: Date
+    public var temperatureC: Double?
+    public var windKmh: Double?
+    public var precipMM: Double?
+    public var highC: Double?
+    public var lowC: Double?
+
+    public init(time: Date, temperatureC: Double? = nil, windKmh: Double? = nil, precipMM: Double? = nil,
+                highC: Double? = nil, lowC: Double? = nil) {
+        self.time = time; self.temperatureC = temperatureC; self.windKmh = windKmh
+        self.precipMM = precipMM; self.highC = highC; self.lowC = lowC
+    }
+}
+
+/// Summary row for the Accuracy "Skyline vs other forecasts" section (cached; view reads only this).
+public struct BenchmarkSummary: Codable, Hashable, Sendable, Equatable {
+    public struct Row: Codable, Hashable, Sendable, Equatable {
+        public var kind: BenchmarkForecastKind
+        public var tempMAE: Double?
+        public var highMAE: Double?
+        public var lowMAE: Double?
+        public var n: Int
+        public var dailyN: Int
+
+        public init(kind: BenchmarkForecastKind, tempMAE: Double? = nil, highMAE: Double? = nil,
+                    lowMAE: Double? = nil, n: Int = 0, dailyN: Int = 0) {
+            self.kind = kind; self.tempMAE = tempMAE; self.highMAE = highMAE; self.lowMAE = lowMAE
+            self.n = n; self.dailyN = dailyN
+        }
+
+        /// Rows with fewer than 20 samples stay hidden in the UI.
+        public var isVisible: Bool { max(n, dailyN) >= 20 }
+    }
+
+    public var rows: [Row]
+    public var stationID: String?
+    public var stationName: String?
+    public var stationDistanceKm: Double?
+    public var metNorwayAttribution: String
+
+    public init(rows: [Row], stationID: String? = nil, stationName: String? = nil,
+                stationDistanceKm: Double? = nil,
+                metNorwayAttribution: String = "Data: MET Norway, CC BY 4.0") {
+        self.rows = rows; self.stationID = stationID; self.stationName = stationName
+        self.stationDistanceKm = stationDistanceKm; self.metNorwayAttribution = metNorwayAttribution
+    }
+}
+
 extension ForecastRecord {
     /// One model, one score: Open-Meteo's `best_match`, `gfs_seamless` and `gfs_hrrr` often carry the very
     /// same NOAA numbers, and scoring each copy as its own source would triple-count one model in the

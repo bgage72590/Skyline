@@ -210,3 +210,50 @@ public enum AdaptiveWeighting {
         }
     }
 }
+
+// MARK: Accuracy PR 1 — benchmark / daily scoring only (AdaptiveWeighting untouched)
+
+/// Scores isolated benchmark and daily-high/low rows. Does not touch `AccuracyScorer.score` or weights.
+public enum BenchmarkScorer {
+    public static func hourlyMAE(_ pairs: [BenchmarkHourlyPair], kind: BenchmarkForecastKind) -> (mae: Double, n: Int)? {
+        let rows = pairs.filter { $0.kind == kind }
+        guard !rows.isEmpty else { return nil }
+        let abs = rows.reduce(0.0) { $0 + Swift.abs($1.forecastC - $1.observedC) }
+        return (abs / Double(rows.count), rows.count)
+    }
+
+    public static func dailyMAE(issues: [DailyForecastIssue], obs: [DailyObservedExtremes],
+                                kind: BenchmarkForecastKind, high: Bool) -> (mae: Double, n: Int)? {
+        let key = kind.rawValue
+        var sum = 0.0, n = 0
+        for o in obs {
+            // Review fix: the latest issue made before the local day began (day-ahead), never a same-day nowcast.
+            let issue = issues.filter { $0.loc == o.loc && abs($0.localDay.timeIntervalSince(o.localDay)) < 1 && $0.issued < o.localDay }
+                .max(by: { $0.issued < $1.issued })
+            guard let issue else { continue }
+            let forecast = high ? issue.highs[key] : issue.lows[key]
+            guard let forecast else { continue }
+            let observed = high ? o.highC : o.lowC
+            sum += Swift.abs(forecast - observed)
+            n += 1
+        }
+        guard n > 0 else { return nil }
+        return (sum / Double(n), n)
+    }
+
+    public static func summary(hourly: [BenchmarkHourlyPair], dailyIssues: [DailyForecastIssue],
+                               dailyObs: [DailyObservedExtremes], station: MetarStationPick?) -> BenchmarkSummary {
+        var rows: [BenchmarkSummary.Row] = []
+        for kind in BenchmarkForecastKind.allCases {
+            let h = hourlyMAE(hourly, kind: kind)
+            let hi = dailyMAE(issues: dailyIssues, obs: dailyObs, kind: kind, high: true)
+            let lo = dailyMAE(issues: dailyIssues, obs: dailyObs, kind: kind, high: false)
+            let dailyN = max(hi?.n ?? 0, lo?.n ?? 0)
+            rows.append(BenchmarkSummary.Row(kind: kind, tempMAE: h?.mae, highMAE: hi?.mae, lowMAE: lo?.mae,
+                                             n: h?.n ?? 0, dailyN: dailyN))
+        }
+        return BenchmarkSummary(rows: rows, stationID: station?.stationID, stationName: station?.name,
+                                stationDistanceKm: station?.distanceKm,
+                                metNorwayAttribution: METNorwayClient.attribution)
+    }
+}

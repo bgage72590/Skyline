@@ -104,6 +104,8 @@ public enum KnownHosts {
         "api.open-meteo.com", "air-quality-api.open-meteo.com", "geocoding-api.open-meteo.com",
         "api.weather.gov", "mesonet.agron.iastate.edu", "www.spc.noaa.gov",
         "api.rainviewer.com", "tilecache.rainviewer.com",
+        // Accuracy PR 1: measurement-only hosts (METAR verification + MET Norway forecast benchmark).
+        "aviationweather.gov", "api.met.no",
     ]
 
     public static func isAllowed(_ url: URL?) -> Bool {
@@ -138,21 +140,58 @@ public final class RequestStats: @unchecked Sendable {
     }
 }
 
+/// Status + body + cache headers for conditional GETs (MET Norway). Additive to `HTTPClient.get`.
+public struct HTTPFetchResult: Sendable, Equatable {
+    public var statusCode: Int
+    public var data: Data
+    public var lastModified: String?
+    public var expires: String?
+    public var retryAfter: TimeInterval?
+
+    public init(statusCode: Int, data: Data, lastModified: String? = nil, expires: String? = nil,
+                retryAfter: TimeInterval? = nil) {
+        self.statusCode = statusCode; self.data = data; self.lastModified = lastModified
+        self.expires = expires; self.retryAfter = retryAfter
+    }
+
+    public var isNotModified: Bool { statusCode == 304 }
+    public var isNoContent: Bool { statusCode == 204 }
+    public var isDeprecated: Bool { statusCode == 203 }
+}
+
 /// Minimal async HTTP abstraction so services can be tested with fixtures.
 public protocol HTTPClient: Sendable {
     func get(_ url: URL, headers: [String: String]) async throws -> Data
+    /// Additive conditional-GET path. Default wraps `get` as status 200.
+    func fetch(_ url: URL, headers: [String: String]) async throws -> HTTPFetchResult
+}
+
+extension HTTPClient {
+    public func fetch(_ url: URL, headers: [String: String]) async throws -> HTTPFetchResult {
+        let data = try await get(url, headers: headers)
+        return HTTPFetchResult(statusCode: 200, data: data)
+    }
 }
 
 public struct URLSessionHTTPClient: HTTPClient {
-    /// Plain User-Agent for every host except NWS (Open-Meteo, IEM, RainViewer, radar tiles): no name,
-    /// no contact.
+    /// Plain User-Agent for every host except NWS / MET Norway / AWC (Open-Meteo, IEM, RainViewer, radar tiles).
     public static let genericUserAgent = "Skyline/1.0"
     /// NWS asks for a contact so it can reach the developer before throttling. Sent ONLY to api.weather.gov.
+    /// Reused as the MET Norway contact (lock §8); never duplicated as a second string literal for that host.
     public static let nwsContact = "Brian.gage@gmail.com"
     public static let nwsUserAgent = "Skyline/1.0 (\(nwsContact))"
+    /// MET Norway ToS: identifying UA with a real contact. Sent ONLY to api.met.no (lock §8).
+    public static var metNorwayUserAgent: String { "Skyline/1.0 (\(nwsContact))" }
+    /// AWC guideline: identifying UA without an email (lock §8).
+    public static let awcUserAgent = "Skyline/1.0 (macOS weather app; accuracy checks)"
 
     public static func userAgent(for url: URL) -> String {
-        url.host?.lowercased() == "api.weather.gov" ? nwsUserAgent : genericUserAgent
+        switch url.host?.lowercased() {
+        case "api.weather.gov": return nwsUserAgent
+        case "api.met.no": return metNorwayUserAgent
+        case "aviationweather.gov": return awcUserAgent
+        default: return genericUserAgent
+        }
     }
 
     private let session: URLSession
@@ -175,6 +214,20 @@ public struct URLSessionHTTPClient: HTTPClient {
     }
 
     public func get(_ url: URL, headers: [String: String]) async throws -> Data {
+        let result = try await perform(url, headers: headers, allowConditional: false)
+        if result.statusCode == 429 || result.statusCode == 503 {
+            throw HTTPError.throttled(result.statusCode, url, retryAfter: result.retryAfter)
+        }
+        guard (200..<300).contains(result.statusCode) else { throw HTTPError.status(result.statusCode, url) }
+        return result.data
+    }
+
+    /// Reads status (including 304/203/204/429) and Last-Modified / Expires without changing `get` behaviour.
+    public func fetch(_ url: URL, headers: [String: String]) async throws -> HTTPFetchResult {
+        try await perform(url, headers: headers, allowConditional: true)
+    }
+
+    private func perform(_ url: URL, headers: [String: String], allowConditional: Bool) async throws -> HTTPFetchResult {
         guard KnownHosts.isAllowed(url) else { throw HTTPError.disallowedHost(url.host ?? url.absoluteString) }
         var request = URLRequest(url: url)
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
@@ -184,11 +237,20 @@ public struct URLSessionHTTPClient: HTTPClient {
         guard let http = response as? HTTPURLResponse else { throw HTTPError.invalidResponse }
         // A redirect to somewhere else is refused too.
         guard KnownHosts.isAllowed(http.url ?? url) else { throw HTTPError.disallowedHost(http.url?.host ?? "?") }
-        if http.statusCode == 429 || http.statusCode == 503 {
-            throw HTTPError.throttled(http.statusCode, url,
-                                      retryAfter: HTTPError.retryAfter(http.value(forHTTPHeaderField: "Retry-After")))
+        let retry = HTTPError.retryAfter(http.value(forHTTPHeaderField: "Retry-After"))
+        let result = HTTPFetchResult(statusCode: http.statusCode, data: data,
+                                     lastModified: http.value(forHTTPHeaderField: "Last-Modified"),
+                                     expires: http.value(forHTTPHeaderField: "Expires"),
+                                     retryAfter: retry)
+        if allowConditional {
+            // Conditional path surfaces 304/203/204/429 to the caller; other errors still throw.
+            if result.statusCode == 304 || result.statusCode == 203 || result.statusCode == 204 { return result }
+            if result.statusCode == 429 || result.statusCode == 503 { return result }
         }
-        guard (200..<300).contains(http.statusCode) else { throw HTTPError.status(http.statusCode, url) }
-        return data
+        if result.statusCode == 429 || result.statusCode == 503 {
+            throw HTTPError.throttled(result.statusCode, url, retryAfter: retry)
+        }
+        guard (200..<300).contains(result.statusCode) else { throw HTTPError.status(result.statusCode, url) }
+        return result
     }
 }
