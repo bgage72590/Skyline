@@ -1,0 +1,45 @@
+{
+  "type": "Feature",
+  "geometry": { "type": "Point", "coordinates": [2.35, 48.85, 35] },
+  "properties": {
+    "meta": {
+      "updated_at": "2026-10-11T12:00:00Z",
+      "units": {
+        "air_temperature": "celsius",
+        "wind_speed": "m/s",
+        "precipitation_amount": "mm"
+      }
+    },
+    "timeseries": [
+      {
+        "time": "2026-10-11T12:00:00Z",
+        "data": {
+          "instant": { "details": { "air_temperature": 14.2, "wind_speed": 3.5 } },
+          "next_1_hours": { "details": { "precipitation_amount": 0.1 } },
+          "next_6_hours": { "details": { "air_temperature_max": 16.0, "air_temperature_min": 11.0, "precipitation_amount": 0.4 } }
+        }
+      },
+      {
+        "time": "2026-10-11T13:00:00Z",
+        "data": {
+          "instant": { "details": { "air_temperature": 14.8, "wind_speed": 4.0 } },
+          "next_1_hours": { "details": { "precipitation_amount": 0.0 } }
+        }
+      },
+      {
+        "time": "2026-10-11T14:00:00Z",
+        "data": {
+          "instant": { "details": { "air_temperature": 15.1, "wind_speed": 4.2 } },
+          "next_1_hours": { "details": { "precipitation_amount": 0.0 } }
+        }
+      },
+      {
+        "time": "2026-10-12T00:00:00Z",
+        "data": {
+          "instant": { "details": { "air_temperature": 10.5, "wind_speed": 2.0 } },
+          "next_6_hours": { "details": { "air_temperature_max": 12.0, "air_temperature_min": 8.0 } }
+        }
+      }
+    ]
+  }
+}

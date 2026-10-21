@@ -96,7 +96,7 @@ struct SettingsView: View {
             PrivacyEnergySection()
 
             Section("Data sources") {
-                Text("Forecasts blend Open-Meteo models (best match, NOAA HRRR, ECMWF IFS, NOAA GFS, DWD ICON) with the official National Weather Service forecast in the US. Alerts from NWS. Radar from NOAA NEXRAD via Iowa Environmental Mesonet (US) and RainViewer (global). All free, no API keys.")
+                Text("Forecasts blend Open-Meteo models (best match, NOAA HRRR, ECMWF IFS, NOAA GFS, DWD ICON) with the official National Weather Service forecast in the US. Alerts from NWS. Radar from NOAA NEXRAD via Iowa Environmental Mesonet (US) and RainViewer (global). Accuracy checks also use aviationweather.gov METARs and MET Norway Locationforecast (measurement only; they do not change the displayed forecast). All free, no API keys.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }

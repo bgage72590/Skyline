@@ -89,4 +89,48 @@ public enum Endpoints {
     public static let iemLCRefLatest = URL(string: "https://mesonet.agron.iastate.edu/data/gis/images/4326/mrms/lcref.json")!
     /// Latest NEXRAD storm attributes (GeoJSON) for storm-motion arrows.
     public static let iemNexradAttr = URL(string: "https://mesonet.agron.iastate.edu/geojson/nexrad_attr.py")!
+
+    // MARK: Accuracy PR 1 (measurement only)
+
+    /// Batched METARs from aviationweather.gov. `ids` is a comma-separated ICAO list (≤ 400).
+    public static func awcMetar(ids: [String], hours: Double = 3) -> URL {
+        var u = URLComponents(string: "https://aviationweather.gov/api/data/metar")!
+        u.queryItems = [
+            .init(name: "ids", value: ids.joined(separator: ",")),
+            .init(name: "format", value: "json"),
+            .init(name: "hours", value: String(format: "%.1f", hours)),
+        ]
+        return u.url!
+    }
+
+    /// Station metadata by ICAO ids.
+    public static func awcStationInfo(ids: [String]) -> URL {
+        var u = URLComponents(string: "https://aviationweather.gov/api/data/stationinfo")!
+        u.queryItems = [
+            .init(name: "ids", value: ids.joined(separator: ",")),
+            .init(name: "format", value: "json"),
+        ]
+        return u.url!
+    }
+
+    /// Station metadata in a bounding box (degrees). Used to pick the nearest METAR within 50 km.
+    public static func awcStationInfo(bbox minLat: Double, _ minLon: Double, _ maxLat: Double, _ maxLon: Double) -> URL {
+        var u = URLComponents(string: "https://aviationweather.gov/api/data/stationinfo")!
+        u.queryItems = [
+            .init(name: "bbox", value: String(format: "%.4f,%.4f,%.4f,%.4f", minLat, minLon, maxLat, maxLon)),
+            .init(name: "format", value: "json"),
+        ]
+        return u.url!
+    }
+
+    /// MET Norway Locationforecast 2.0 compact. Coordinates at most 4 decimals (MET ToS).
+    public static func metNorwayCompact(_ c: Coordinate) -> URL {
+        let r = c.rounded
+        var u = URLComponents(string: "https://api.met.no/weatherapi/locationforecast/2.0/compact")!
+        u.queryItems = [
+            .init(name: "lat", value: String(format: "%.4f", r.latitude)),
+            .init(name: "lon", value: String(format: "%.4f", r.longitude)),
+        ]
+        return u.url!
+    }
 }

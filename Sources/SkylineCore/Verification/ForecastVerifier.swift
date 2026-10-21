@@ -74,14 +74,19 @@ public actor ForecastVerifier {
     private var meta: [String: Meta] = [:]
     private var cachedScores: [String: AccuracyScorer.Scores] = [:]
     private var cachedWeights: [String: BlendWeights] = [:]
+    /// Isolated, unsynced store for METAR / MET Norway / daily benchmark (Accuracy PR 1).
+    private let benchmark: BenchmarkStore
 
     public init(directory: URL = ForecastVerifier.defaultDirectory(), client: HTTPClient = URLSessionHTTPClient(),
                 config: AdaptiveWeighting.Config = AdaptiveWeighting.Config(),
-                now: @escaping @Sendable () -> Date = { Date() }) {
+                now: @escaping @Sendable () -> Date = { Date() },
+                benchmarkDirectory: URL? = nil) {
         self.directory = directory
         self.client = client
         self.config = config
         self.now = now
+        self.benchmark = BenchmarkStore(directory: benchmarkDirectory ?? BenchmarkStore.directoryAlongside(verification: directory),
+                                        client: client, now: now)
     }
 
     public static func defaultDirectory() -> URL {
@@ -288,6 +293,96 @@ public actor ForecastVerifier {
                               recentWinner: winner?.source, recentWinnerMAE: winner?.tempMAE,
                               weights: w, minDays: config.minDays)
     }
+
+    // MARK: Accuracy PR 1 — measurement only (isolated store)
+
+    /// Cached benchmark summary for the Accuracy screen (reads only; never fetches).
+    public func benchmarkSummary(_ key: String) async -> BenchmarkSummary? {
+        await benchmark.summary(for: key)
+    }
+
+    public func benchmarkStoreDirectory() async -> URL {
+        // Exposed for tests / QA size checks.
+        BenchmarkStore.directoryAlongside(verification: directory)
+    }
+
+    /// Runs METAR / MET Norway / daily measurement. Failures are swallowed; never affects weights or display.
+    public func runMeasurement(key: String, coordinate: Coordinate, timeZoneIdentifier: String,
+                               daily: [DailyForecast], openMeteo om: OpenMeteoResponse,
+                               blended: [HourlyForecast], isUS: Bool,
+                               nwsObservations: [StationObservation] = []) async {
+        guard AccuracyMeasurement.isEnabled() else { return }
+        let tz = TimeZone(identifier: timeZoneIdentifier) ?? .gmt
+        let issued = now()
+        // Station pick (non-US only). US keeps NWS/ASOS via verifyIfDue unchanged.
+        if !isUS {
+            _ = await benchmark.ensureStation(key: key, near: coordinate, isUS: false)
+            _ = await benchmark.fetchMetarsIfDue(for: key)
+        }
+        let metHours = await benchmark.fetchMetNorwayIfDue(key: key, coordinate: coordinate)
+        let issues = ForecastSampler.dailyIssues(location: key, issued: issued, daily: daily, openMeteo: om,
+                                                 timeZone: tz, metNorway: metHours)
+        await benchmark.recordDailyIssues(issues)
+
+        // Pair forecasts with observations into the isolated store only — never verified.jsonl.
+        var pairs: [BenchmarkHourlyPair] = []
+        var obs = isUS ? nwsObservations : await benchmark.metarObservations(for: key)
+        if obs.isEmpty, !nwsObservations.isEmpty { obs = nwsObservations }
+        if !obs.isEmpty {
+            for r in pending where r.loc == key {
+                guard let o = ObservationAggregator.observe(obs, validTime: r.valid), let ot = o.t else { continue }
+                if let bt = r.values(.blend)?.t {
+                    pairs.append(BenchmarkHourlyPair(loc: key, issued: r.issued, valid: r.valid, kind: .skyline,
+                                                     forecastC: bt, observedC: ot))
+                }
+                if let nt = r.values(.nws)?.t {
+                    pairs.append(BenchmarkHourlyPair(loc: key, issued: r.issued, valid: r.valid, kind: .nws,
+                                                     forecastC: nt, observedC: ot))
+                }
+                if let mt = r.values(.bestMatch)?.t {
+                    pairs.append(BenchmarkHourlyPair(loc: key, issued: r.issued, valid: r.valid, kind: .bestMatch,
+                                                     forecastC: mt, observedC: ot))
+                }
+            }
+            let metLeads = ForecastSampler.metNorwayLeadValues(location: key, issued: issued, hours: metHours)
+            for (valid, ft) in metLeads {
+                if let o = ObservationAggregator.observe(obs, validTime: valid), let ot = o.t {
+                    pairs.append(BenchmarkHourlyPair(loc: key, issued: issued, valid: valid, kind: .metNorway,
+                                                     forecastC: ft, observedC: ot))
+                }
+            }
+            // Also pair current blended hours against obs for Skyline/Best Match when no pending yet.
+            if pending.filter({ $0.loc == key }).isEmpty {
+                for h in blended {
+                    guard let o = ObservationAggregator.observe(obs, validTime: h.time), let ot = o.t else { continue }
+                    pairs.append(BenchmarkHourlyPair(loc: key, issued: issued, valid: h.time, kind: .skyline,
+                                                     forecastC: h.temperature, observedC: ot))
+                }
+            }
+        }
+        if !pairs.isEmpty { await benchmark.recordHourlyPairs(pairs) }
+
+        let extraTemps = nwsObservations.compactMap { o -> (Date, Double)? in
+            guard let t = o.temperatureC else { return nil }
+            return (o.time, t)
+        }
+        await benchmark.scoreCompletedDays(key: key, timeZoneIdentifier: timeZoneIdentifier, extraTemps: extraTemps)
+    }
+
+    /// Test seam: seed the isolated store without touching verified.jsonl / weights.
+    public func seedBenchmark(station: MetarStationPick? = nil, key: String,
+                              metars: [MetarObservationRecord] = [],
+                              hourly: [BenchmarkHourlyPair] = [],
+                              daily: [DailyObservedExtremes] = []) async {
+        if let station { await benchmark.seedStation(station, key: key) }
+        if !metars.isEmpty { await benchmark.seedMetars(metars) }
+        if !hourly.isEmpty { await benchmark.seedHourly(hourly) }
+        if !daily.isEmpty { await benchmark.seedDailyObs(daily) }
+        await benchmark.forceRecomputeSummaries()
+    }
+
+    public func benchmarkMetarCount(_ key: String) async -> Int { await benchmark.metarCount(for: key) }
+    public func benchmarkByteSize() async -> Int { await benchmark.totalByteSize() }
 
     // MARK: Internals
 

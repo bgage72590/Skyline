@@ -1,0 +1,55 @@
+[
+  {
+    "icaoId": "LFPG",
+    "receiptTime": "2026-10-11T12:05:00.000Z",
+    "obsTime": 1760185800,
+    "temp": 14.0,
+    "dewp": 10.0,
+    "wdir": 180,
+    "wspd": 8,
+    "wgst": 18,
+    "rawOb": "METAR LFPG 111230Z 18008G18KT 9999 -RA BKN015 14/10 Q1012"
+  },
+  {
+    "icaoId": "LFPG",
+    "receiptTime": "2026-10-11T12:35:00.000Z",
+    "obsTime": 1760187600,
+    "temp": 15.0,
+    "dewp": 10.0,
+    "wdir": 190,
+    "wspd": 10,
+    "rawOb": "SPECI LFPG 111300Z 19010KT 9999 NSW SCT020 15/10 Q1012"
+  },
+  {
+    "icaoId": "LFPG",
+    "obsTime": 1760189400,
+    "rawOb": "METAR LFPG 111330Z 00000KT CAVOK M05/M08 Q1015"
+  },
+  {
+    "icaoId": "LFPG",
+    "obsTime": 1760191200,
+    "rawOb": "METAR LFPG 111400Z VRB03MPS //// //// Q////"
+  },
+  {
+    "icaoId": "LFPG",
+    "obsTime": 1760193000,
+    "rawOb": "METAR LFPG 111430Z 27012KMH 9999 VCSH SCT030 12/08 Q1011"
+  },
+  {
+    "icaoId": "LFPG",
+    "obsTime": 1760194800,
+    "rawOb": "COR METAR LFPG 111500Z AUTO 09005KT 9999 RERA SCT040 11/07 Q1010"
+  },
+  {
+    "icaoId": "LFPG",
+    "obsTime": 1760196600,
+    "rawOb": "METAR LFPG 111530Z 20006KT 9999 +TSRA BKN008 10/09 Q1009"
+  },
+  {
+    "icaoId": "EGLL",
+    "obsTime": 1760185800,
+    "temp": 12.0,
+    "wspd": 6,
+    "rawOb": "METAR EGLL 111230Z 24006KT 9999 FEW020 12/08 Q1013"
+  }
+]

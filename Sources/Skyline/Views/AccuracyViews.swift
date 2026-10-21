@@ -49,6 +49,7 @@ struct AccuracyPanel: View {
     @Environment(WeatherStore.self) private var store
     @State private var bucket: LeadBucket?
     @State private var showDetails = false
+    @State private var benchmark: BenchmarkSummary?
 
     var body: some View {
         let r = store.accuracy[location.id]
@@ -71,12 +72,83 @@ struct AccuracyPanel: View {
             } else {
                 collecting(nil)
             }
+            benchmarkSection(report: r)
             Text("How it works: every few hours Skyline saves what each source predicted for this place, then compares it with what the nearest NWS weather station measured. Typical error is the mean absolute difference; rain calls count hours with ≥ 50 % chance (or ≥ 0.2 mm) against hours the station reported precipitation. Once there are \(Int(r?.minDays ?? 3))+ days of pairs, the blend gives more weight to the sources that have been most accurate here, and never drops any source entirely.")
                 .font(.caption)
                 .foregroundStyle(Glass.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .task(id: location.id) { await store.refreshAccuracy(for: location) }
+        .task(id: location.id) {
+            await store.refreshAccuracy(for: location)
+            let key = VerificationKey.key(for: location)
+            benchmark = await store.service.verifier?.benchmarkSummary(key)
+        }
+    }
+
+    /// Accuracy PR 1: measurement-only comparison. NWS / Best Match reuse existing scores; MET Norway from the isolated store.
+    @ViewBuilder
+    private func benchmarkSection(report: AccuracyReport?) -> some View {
+        let rows = benchmarkRows(report: report)
+        if !rows.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Skyline vs other forecasts")
+                    .font(.title2.weight(.semibold))
+                Text("How Skyline’s forecast compares with other free forecasts at this place. Hidden until there are at least 20 verified samples.")
+                    .font(.caption).foregroundStyle(Glass.secondaryText)
+                ForEach(rows, id: \.title) { row in
+                    HStack {
+                        Text(row.title).font(.callout.weight(.semibold))
+                        Spacer()
+                        Text(row.value).font(.callout.monospacedDigit())
+                    }
+                    .padding(.vertical, 2)
+                }
+                if let b = benchmark {
+                    if let id = b.stationID {
+                        let dist = b.stationDistanceKm.map { String(format: " · %.0f km", $0) } ?? ""
+                        Text("Station: \(b.stationName ?? id) (\(id))\(dist)")
+                            .font(.caption).foregroundStyle(Glass.secondaryText)
+                    }
+                    Text(b.metNorwayAttribution)
+                        .font(.caption2).foregroundStyle(Glass.secondaryText)
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+    }
+
+    private struct BenchRow: Hashable {
+        var title: String
+        var value: String
+    }
+
+    private func benchmarkRows(report: AccuracyReport?) -> [BenchRow] {
+        var out: [BenchRow] = []
+        // Reuse existing verified source scores for NWS and Best Match (lock §7.4).
+        if let report {
+            if let s = report.overall[.blend], s.tempHours >= 20, let mae = s.tempMAE {
+                out.append(BenchRow(title: "Skyline", value: "±" + AccuracyFormat.delta(mae, units)))
+            }
+            if let s = report.overall[.nws], s.tempHours >= 20, let mae = s.tempMAE {
+                out.append(BenchRow(title: "NWS", value: "±" + AccuracyFormat.delta(mae, units)))
+            }
+            if let s = report.overall[.bestMatch], s.tempHours >= 20, let mae = s.tempMAE {
+                out.append(BenchRow(title: "Best Match", value: "±" + AccuracyFormat.delta(mae, units)))
+            }
+        }
+        if let b = benchmark {
+            for row in b.rows where row.isVisible {
+                if row.kind == .metNorway, let mae = row.tempMAE ?? row.highMAE {
+                    out.append(BenchRow(title: "MET Norway", value: "±" + AccuracyFormat.delta(mae, units)))
+                }
+                if row.kind == .skyline, report?.overall[.blend] == nil, let mae = row.tempMAE ?? row.highMAE {
+                    out.append(BenchRow(title: "Skyline", value: "±" + AccuracyFormat.delta(mae, units)))
+                }
+            }
+        }
+        return out
     }
 
     // MARK: Collecting
