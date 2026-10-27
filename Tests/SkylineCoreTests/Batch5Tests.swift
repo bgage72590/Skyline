@@ -288,7 +288,8 @@ final class Batch5Tests: XCTestCase {
                        SourceReading(name: "C", high: 14.8, low: 8, weight: 1), SourceReading(name: "D", high: 21, low: 8, weight: 0.5)]
         let c = ForecastInsight.confidence(day: day, hourly: [], timeZone: ny, now: fixtureTime, hourLabel: hourLabel,
                                            delta: { Int(($0 * 9 / 5).rounded()) })
-        XCTAssertEqual(c.level, .high, c.sentence)
+        // Untrimmed max(high, low) spread: one far outlier reads Low.
+        XCTAssertEqual(c.level, .low, c.sentence)
         var single = DailyForecast(date: fixtureTime, weatherCode: 3, high: 15, low: 8)
         single.sources = [SourceReading(name: "ECMWF", high: 15, low: 8, weight: 1)]
         let s = ForecastInsight.confidence(day: single, hourly: [], timeZone: ny, now: fixtureTime, hourLabel: hourLabel, delta: { Int($0) })

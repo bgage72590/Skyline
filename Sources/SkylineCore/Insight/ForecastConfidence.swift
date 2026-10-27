@@ -10,6 +10,7 @@ public enum ForecastConfidence {
 
     /// Minimum remaining hours of today (and samples per series) required for a day-0 spread.
     public static let confidenceMinRemainingHours = 3
+    public static let secondsPerHour: TimeInterval = 3600
 
     public static let emDash = "—"
     public static let notEnoughOfTodayLeft = "Not enough of today left"
@@ -43,7 +44,7 @@ public enum ForecastConfidence {
     /// Hours left in the city-TZ day-0 window from `now` (may be negative if `now` is past end).
     public static func remainingTodayHours(dayDate: Date, timeZone: TimeZone, now: Date) -> Double? {
         guard let w = day0Window(dayDate: dayDate, timeZone: timeZone, now: now) else { return nil }
-        return w.end.timeIntervalSince(w.start) / 3600
+        return w.end.timeIntervalSince(w.start) / secondsPerHour
     }
 
     /// Max of high-spread and low-spread in raw °C, or nil when not enough data / day-0 window.
@@ -78,14 +79,15 @@ public enum ForecastConfidence {
 
     private static func day0Spread(day: DailyForecast, modelSeries: [ModelSeries],
                                    timeZone: TimeZone, now: Date) -> Double? {
+        guard let window = day0Window(dayDate: day.date, timeZone: timeZone, now: now) else { return nil }
+        let remaining = window.end.timeIntervalSince(window.start) / secondsPerHour
+        if remaining < Double(confidenceMinRemainingHours) { return nil }
+
         let series = modelSeries.filter { !$0.isBlend }
         if series.isEmpty {
-            // testEmptyModelSeriesFallback: fall back to sources when nothing hourly is available.
+            // Fall back to sources when nothing hourly is available (after the <3 h guard).
             return sourcesSpread(day)
         }
-        guard let window = day0Window(dayDate: day.date, timeZone: timeZone, now: now) else { return nil }
-        let remaining = window.end.timeIntervalSince(window.start) / 3600
-        if remaining < Double(confidenceMinRemainingHours) { return nil }
 
         var remHighs: [Double] = []
         var remLows: [Double] = []

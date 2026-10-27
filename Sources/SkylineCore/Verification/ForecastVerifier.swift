@@ -56,6 +56,8 @@ public actor ForecastVerifier {
     public static let observationInterval: TimeInterval = 55 * 60
     /// Fix 3: 24 h negative cache after a failed US NWS stations seed (named Form4 day literal).
     public static let usStationSeedNegativeCache: TimeInterval = BenchmarkStore.secondsPerDay
+    /// How long a verification station ID stays fresh without a re-fetch.
+    public static let verificationStationMaxAge: TimeInterval = 7 * 86400
 
     struct Meta: Codable {
         var firstIssued: Date?
@@ -544,8 +546,8 @@ public actor ForecastVerifier {
     }
 
     /// Test seam: write verification-station meta (existing fields only) without a stations GET.
-    public func seedVerificationStationMeta(key: String, stationID: String, stationName: String? = nil,
-                                            fetched: Date, lastObsCheck: Date? = nil) {
+    func seedVerificationStationMeta(key: String, stationID: String, stationName: String? = nil,
+                                     fetched: Date, lastObsCheck: Date? = nil) {
         load()
         meta[key, default: Meta()].stationID = stationID
         meta[key]?.stationName = stationName
@@ -554,29 +556,29 @@ public actor ForecastVerifier {
         saveMeta()
     }
 
-    public func pendingCount(for key: String) -> Int {
+    func pendingCount(for key: String) -> Int {
         load(); return pending.filter { $0.loc == key }.count
     }
 
-    public func verifiedCount(for key: String) -> Int {
+    func verifiedCount(for key: String) -> Int {
         load(); return verified.filter { $0.r.loc == key }.count
     }
 
-    public func verificationStationID(for key: String) -> String? {
+    func verificationStationID(for key: String) -> String? {
         load(); return meta[key]?.stationID
     }
 
-    public func lastObsCheck(for key: String) -> Date? {
+    func lastObsCheck(for key: String) -> Date? {
         load(); return meta[key]?.lastObsCheck
     }
 
     public func benchmarkMetarCount(_ key: String) async -> Int { await benchmark.metarCount(for: key) }
     public func benchmarkByteSize() async -> Int { await benchmark.totalByteSize() }
-    public func benchmarkStation(for key: String) async -> MetarStationPick? { await benchmark.station(for: key) }
-    public func shouldSkipUSStationSeed(key: String, now: Date) async -> Bool {
+    func benchmarkStation(for key: String) async -> MetarStationPick? { await benchmark.station(for: key) }
+    func shouldSkipUSStationSeed(key: String, now: Date) async -> Bool {
         await benchmark.shouldSkipUSStationSeed(key: key, now: now)
     }
-    public func noteUSStationSeedFailure(key: String, until: Date) async {
+    func noteUSStationSeedFailure(key: String, until: Date) async {
         await benchmark.noteUSStationSeedFailure(key: key, until: until)
     }
 
@@ -620,7 +622,7 @@ public actor ForecastVerifier {
 
         let cachedID = meta[key]?.stationID
         let cachedFresh = cachedID != nil
-            && meta[key]?.stationFetched.map { now().timeIntervalSince($0) < 7 * 86400 } == true
+            && meta[key]?.stationFetched.map { now().timeIntervalSince($0) < Self.verificationStationMaxAge } == true
         if cachedFresh, let id = cachedID {
             await seedUSBenchmarkStationIfNeeded(key: key, verifyingID: id, stationsURL: stationsURL,
                                                  near: forecastPoint, cityElevationM: cityElevationM)
@@ -669,7 +671,7 @@ public actor ForecastVerifier {
         if let inflight = seedInFlight[key] { await inflight.value }
         let cachedID = meta[key]?.stationID
         let cachedFresh = cachedID != nil
-            && meta[key]?.stationFetched.map { now().timeIntervalSince($0) < 7 * 86400 } == true
+            && meta[key]?.stationFetched.map { now().timeIntervalSince($0) < Self.verificationStationMaxAge } == true
         if cachedFresh, let id = cachedID {
             // Fix 3: even on a 7-day verification-station cache hit, seed/replace benchmark meta
             // when missing or pointing at a different station id.
@@ -677,10 +679,15 @@ public actor ForecastVerifier {
                                                  near: forecastPoint, cityElevationM: cityElevationM)
             return id
         }
-        // Launch seed already spent this key's stations GET budget — do not start another.
-        if seedFetched.contains(key) { return meta[key]?.stationID }
-        guard let stationsURL, let data = try? await client.get(stationsURL, headers: ["Accept": "application/geo+json"]),
-              let chosen = try? NWSObservationParser.verificationStation(data, near: forecastPoint) else { return meta[key]?.stationID }
+        // Skip a fresh stations GET only while the 24 h US seed back-off is active.
+        if await benchmark.shouldSkipUSStationSeed(key: key, now: now()) { return meta[key]?.stationID }
+        guard let stationsURL else { return meta[key]?.stationID }
+        guard let data = try? await client.get(stationsURL, headers: ["Accept": "application/geo+json"]),
+              let chosen = try? NWSObservationParser.verificationStation(data, near: forecastPoint) else {
+            await benchmark.noteUSStationSeedFailure(key: key,
+                                                     until: now().addingTimeInterval(Self.usStationSeedNegativeCache))
+            return meta[key]?.stationID
+        }
         meta[key, default: Meta()].stationID = chosen.id
         meta[key]?.stationName = chosen.name
         meta[key]?.stationFetched = now()
@@ -703,8 +710,6 @@ public actor ForecastVerifier {
         // Point must be known before GET (launch seed already gates this; keep the order here too).
         guard let point = forecastPoint else { return }
         if await benchmark.shouldSkipUSStationSeed(key: key, now: now()) { return }
-        if seedFetched.contains(key) { return }
-        seedFetched.insert(key)
         guard let data = try? await client.get(stationsURL, headers: ["Accept": "application/geo+json"]),
               let pick = Self.nwsStationPick(data: data, id: verifyingID, near: point,
                                              cityElevationM: cityElevationM, at: now()) else {

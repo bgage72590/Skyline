@@ -43,7 +43,7 @@ public enum ForecastInsight {
             reason = "Only one forecast available for this day"
         } else if let spread = ForecastConfidence.spread(day: day, modelSeries: modelSeries,
                                                          timeZone: timeZone, now: now, isToday: isToday)
-                    ?? day.highSpread {
+                    ?? (isToday ? nil : day.highSpread) {
             // Shared raw °C thresholds (both surfaces). °F via `delta` is display text only.
             let t = ForecastConfidence.level(spread)
             if t > .high {

@@ -402,14 +402,17 @@ final class AccuracyFixesTests: XCTestCase {
     }
 
     func testEmptyModelSeriesFallback() {
-        var day = DailyForecast(date: Date(timeIntervalSince1970: 1_700_000_000), weatherCode: 0,
-                                high: 15, low: 5)
+        var nycCal = Calendar(identifier: .gregorian)
+        nycCal.timeZone = nycTZ
+        let dayDate = nycCal.startOfDay(for: Date(timeIntervalSince1970: 1_700_000_000))
+        var day = DailyForecast(date: dayDate, weatherCode: 0, high: 15, low: 5)
         day.sources = [
             SourceReading(name: "A", high: 15, low: 5, weight: 1),
             SourceReading(name: "B", high: 17, low: 6, weight: 1),
         ]
+        let now = dayDate.addingTimeInterval(10 * ForecastConfidence.secondsPerHour)
         let viaEmpty = ForecastConfidence.spread(day: day, modelSeries: [], timeZone: nycTZ,
-                                                 now: day.date.addingTimeInterval(10 * 3600), isToday: true)
+                                                 now: now, isToday: true)
         let viaSources = ForecastConfidence.sourcesSpread(day)
         XCTAssertEqual(viaEmpty, viaSources)
         XCTAssertEqual(viaEmpty ?? -1, 2.0, accuracy: 1e-9)
@@ -481,5 +484,102 @@ final class AccuracyFixesTests: XCTestCase {
         // Re-blend: confidence helpers must not change blender output either.
         let again = ForecastBlender.blendDaily(openMeteo: om, nwsPeriods: nws, timeZone: tz)
         XCTAssertEqual(again, before)
+    }
+
+    // MARK: Push-check follow-ups
+
+    func testInsightSaysNothingOnTemperatureWithUnder3hLeft() {
+        var nycCal = Calendar(identifier: .gregorian)
+        nycCal.timeZone = nycTZ
+        let dayDate = nycCal.startOfDay(for: Date(timeIntervalSince1970: 1_720_000_000))
+        var day = DailyForecast(date: dayDate, weatherCode: 0, high: 20, low: 10, highSpread: 6)
+        day.sources = [
+            SourceReading(name: "A", high: 10, low: 0, weight: 1),
+            SourceReading(name: "B", high: 16, low: 2, weight: 1),
+            SourceReading(name: "C", high: 18, low: 4, weight: 1),
+        ]
+        let late = nycCal.date(byAdding: .hour, value: 22, to: dayDate)!
+        let emptySpread = ForecastConfidence.spread(day: day, modelSeries: [], timeZone: nycTZ,
+                                                    now: late, isToday: true)
+        XCTAssertNil(emptySpread)
+        let c = ForecastInsight.confidence(day: day, hourly: [], timeZone: nycTZ, now: late,
+                                           hourLabel: { _ in "" }, delta: { Int($0.rounded()) },
+                                           modelSeries: [])
+        XCTAssertNil(c.reason, "temperature leg must say nothing when <3 h of today remain")
+    }
+
+    func testInsightAndModuleDetailAgreeOnDay0() {
+        var nycCal = Calendar(identifier: .gregorian)
+        nycCal.timeZone = nycTZ
+        let dayDate = nycCal.startOfDay(for: Date(timeIntervalSince1970: 1_720_000_000))
+        var day = DailyForecast(date: dayDate, weatherCode: 0, high: 20, low: 10)
+        // Whole-day sources disagree widely (would read Low without modelSeries).
+        day.sources = [
+            SourceReading(name: "A", high: 10, low: 0, weight: 1),
+            SourceReading(name: "B", high: 20, low: 8, weight: 1),
+            SourceReading(name: "C", high: 25, low: 12, weight: 1),
+        ]
+        let times = (0..<24).compactMap { nycCal.date(byAdding: .hour, value: $0, to: dayDate) }
+        // Remaining afternoon agrees tightly → High on the day-0 window.
+        let a = times.enumerated().map { $0.offset < 10 ? 0.0 : 15.0 }
+        let b = times.enumerated().map { $0.offset < 10 ? 20.0 : 15.5 }
+        let series = [
+            ModelSeries(name: "GFS", times: times, temperatures: a),
+            ModelSeries(name: "ECMWF", times: times, temperatures: b),
+        ]
+        let noon = nycCal.date(byAdding: .hour, value: 12, to: dayDate)!
+        let spread = ForecastConfidence.spread(day: day, modelSeries: series, timeZone: nycTZ,
+                                               now: noon, isToday: true)
+        XCTAssertEqual(ForecastConfidence.levelName(spread), "High")
+        let withSeries = ForecastInsight.confidence(day: day, hourly: [], timeZone: nycTZ, now: noon,
+                                                    hourLabel: { _ in "" }, delta: { Int($0.rounded()) },
+                                                    modelSeries: series)
+        XCTAssertEqual(withSeries.level, .high)
+        let withoutSeries = ForecastInsight.confidence(day: day, hourly: [], timeZone: nycTZ, now: noon,
+                                                       hourLabel: { _ in "" }, delta: { Int($0.rounded()) },
+                                                       modelSeries: [])
+        XCTAssertEqual(withoutSeries.level, .low, "empty modelSeries falls back to wide sources")
+    }
+
+    func testFailedLaunchSeedDoesNotDisableVerificationAfterBackoff() async throws {
+        let dir = tempDir("seed-backoff-verify")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let stationGets = AFLockBox(0)
+        let obsGets = AFLockBox(0)
+        let failFlag = AFLockBox(true)
+        let client = RecordingHTTPClient { url in
+            // Obs URLs contain "/stations/" — match observations first.
+            if url.absoluteString.contains("/observations") {
+                obsGets.value += 1
+                return try Fixture.data("nws_observations")
+            }
+            if url.absoluteString.contains("/stations") {
+                stationGets.value += 1
+                if failFlag.value { throw URLError(.notConnectedToInternet) }
+                return try Fixture.data("nws_stations_kbdr")
+            }
+            throw HTTPError.status(404, url)
+        }
+        let v = ForecastVerifier(directory: dir, client: client, now: { clock.now })
+        await v.verifyIfDue(key: "bridgeport", stationsURL: stationsURL, near: near, cityElevationM: 38)
+        XCTAssertEqual(stationGets.value, 1)
+        XCTAssertEqual(obsGets.value, 0)
+
+        clock.now = clock.now.addingTimeInterval(3600)
+        await v.verifyIfDue(key: "bridgeport", stationsURL: stationsURL, near: near, cityElevationM: 38)
+        XCTAssertEqual(stationGets.value, 1, "within back-off: 0 more stations GETs")
+
+        clock.now = clock.now.addingTimeInterval(ForecastVerifier.usStationSeedNegativeCache)
+        failFlag.value = false
+        let issued = clock.now.addingTimeInterval(-4 * 3600)
+        let valid = clock.now.addingTimeInterval(-30 * 60)
+        await v.record([ForecastRecord(loc: "bridgeport", issued: issued, valid: valid,
+                                       f: ["blend": SourceValues(t: 10)])], key: "bridgeport")
+        await v.verifyIfDue(key: "bridgeport", stationsURL: stationsURL, near: near, cityElevationM: 38)
+        XCTAssertEqual(stationGets.value, 2, "after back-off: verification may stations-GET again")
+        XCTAssertEqual(obsGets.value, 1)
+        let id = await v.verificationStationID(for: "bridgeport")
+        XCTAssertEqual(id?.uppercased(), "KBDR")
     }
 }

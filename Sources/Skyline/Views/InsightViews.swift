@@ -8,7 +8,8 @@ enum InsightFormat {
         let tz = report.timeZone
         return ForecastInsight.confidence(day: day, hourly: report.hourly, timeZone: tz, now: Date(),
                                           hourLabel: { Fmt.hour($0, tz) },
-                                          delta: { Int(units.temperatureDelta($0).rounded()) })
+                                          delta: { Int(units.temperatureDelta($0).rounded()) },
+                                          modelSeries: report.modelSeries)
     }
 
     static func changes(_ report: WeatherReport, units: DisplayUnits) -> [String] {
