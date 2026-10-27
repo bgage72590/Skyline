@@ -6,6 +6,110 @@ public enum ForecastSampler {
     /// Lead times (hours) recorded per issuance: dense early, sparse later (~21 rows per issuance).
     public static let leads: [Int] = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 21, 24, 30, 36, 42, 48, 60, 72, 96, 120]
 
+    // MARK: DST daily-date accuracy compat (plan-dst / CR-signed)
+
+    /// Issuances on or after this instant used corrected `dailyTimes`; never drop them for DST skew.
+    /// 2026-10-28 00:00:00 UTC — named so scrub rules carry no bare date literals.
+    public static let dstFixShipDate = Date(timeIntervalSince1970: 1_793_145_600)
+
+    /// Open-Meteo `forecast_days` window: only groups issued inside this many days before a fall-back
+    /// transition are eligible for the window scrub rule.
+    public static let dstCompatLookbackDays = 10
+
+    /// `(loc, localDay)` pairs removed from pre-ship daily issues (and matching daily training rows).
+    public struct DSTDroppedDay: Hashable, Sendable {
+        public var loc: String
+        public var localDay: Date
+        public init(loc: String, localDay: Date) { self.loc = loc; self.localDay = localDay }
+    }
+
+    private struct IssueGroupKey: Hashable {
+        var loc: String
+        var issued: Date
+    }
+
+    /// Drop pre-`dstFixShipDate` daily-issue rows skewed by the Open-Meteo fixed-offset DST bug.
+    /// Duplicate rule: if a (loc, issued) group has a duplicate `localDay`, drop days on/after the first
+    /// duplicated day. Window rule: fall-back only (offset decreases); if issued is within
+    /// `dstCompatLookbackDays` before the change, drop days on/after the transition's local day.
+    /// Post-ship groups are never modified.
+    public static func scrubDSTSkewedDailyIssues(_ issues: [DailyForecastIssue])
+        -> (kept: [DailyForecastIssue], dropped: Set<DSTDroppedDay>) {
+        var kept: [DailyForecastIssue] = []
+        var dropped = Set<DSTDroppedDay>()
+        for (_, rows) in Dictionary(grouping: issues, by: { IssueGroupKey(loc: $0.loc, issued: $0.issued) }) {
+            let part = scrubDSTSkewedIssueGroup(rows)
+            kept.append(contentsOf: part.kept)
+            dropped.formUnion(part.dropped)
+        }
+        return (kept, dropped)
+    }
+
+    /// Drop dailyHigh/dailyLow training rows whose `(loc, localDay)` was scrubbed from daily issues.
+    public static func scrubDSTSkewedTraining(_ rows: [TrainingRow], dropped: Set<DSTDroppedDay>) -> [TrainingRow] {
+        guard !dropped.isEmpty else { return rows }
+        return rows.filter { row in
+            guard row.target.isDaily else { return true }
+            return !dropped.contains(DSTDroppedDay(loc: row.loc, localDay: row.localDay))
+        }
+    }
+
+    private static func scrubDSTSkewedIssueGroup(_ rows: [DailyForecastIssue])
+        -> (kept: [DailyForecastIssue], dropped: Set<DSTDroppedDay>) {
+        guard let sample = rows.first else { return ([], []) }
+        if sample.issued >= dstFixShipDate {
+            return (rows, [])
+        }
+        var thresholds: [Date] = []
+        if let dup = firstDuplicatedLocalDay(in: rows) {
+            thresholds.append(dup)
+        }
+        if let tz = TimeZone(identifier: sample.timeZoneIdentifier),
+           let fall = firstFallBackLocalDay(after: sample.issued, timeZone: tz,
+                                            withinDays: dstCompatLookbackDays) {
+            thresholds.append(fall)
+        }
+        guard let cut = thresholds.min() else { return (rows, []) }
+        var kept: [DailyForecastIssue] = []
+        var dropped = Set<DSTDroppedDay>()
+        for row in rows {
+            if row.localDay >= cut {
+                dropped.insert(DSTDroppedDay(loc: row.loc, localDay: row.localDay))
+            } else {
+                kept.append(row)
+            }
+        }
+        return (kept, dropped)
+    }
+
+    /// Earliest `localDay` that appears more than once in the group (calendar order).
+    private static func firstDuplicatedLocalDay(in rows: [DailyForecastIssue]) -> Date? {
+        var counts: [TimeInterval: Int] = [:]
+        for day in rows.map(\.localDay) {
+            counts[day.timeIntervalSince1970, default: 0] += 1
+        }
+        let dups = rows.map(\.localDay).filter { counts[$0.timeIntervalSince1970, default: 0] > 1 }
+        return dups.min()
+    }
+
+    /// Local start-of-day of the next fall-back (offset decreases) in `(issued, issued+withinDays]`.
+    private static func firstFallBackLocalDay(after issued: Date, timeZone tz: TimeZone,
+                                              withinDays: Int) -> Date? {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        guard let limit = cal.date(byAdding: .day, value: withinDays, to: issued) else { return nil }
+        var cursor = issued
+        while let next = tz.nextDaylightSavingTimeTransition(after: cursor), next <= limit {
+            let before = tz.secondsFromGMT(for: next.addingTimeInterval(-1))
+            let after = tz.secondsFromGMT(for: next.addingTimeInterval(1))
+            if after < before {
+                return cal.startOfDay(for: next)
+            }
+            cursor = next
+        }
+        return nil
+    }
+
     public static func records(location key: String, issued: Date, openMeteo om: OpenMeteoResponse,
                                nwsHourly: [NWSPeriod], blended: [HourlyForecast]) -> [ForecastRecord] {
         let times = om.hourlyTimes
