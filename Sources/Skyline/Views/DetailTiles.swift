@@ -437,16 +437,18 @@ struct ConfidenceTile: View {
     let report: WeatherReport
     let units: DisplayUnits
     var body: some View {
-        let spread = report.today?.highSpread
-        let level: String = {
-            guard let spread else { return "—" }
-            if spread <= 2 { return "High" }
-            if spread <= 4 { return "Medium" }
-            return "Low"
+        let a = report.today.map {
+            ForecastConfidence.assess(day: $0, modelSeries: report.modelSeries, timeZone: report.timeZone, now: Date())
+        }
+        let level = a?.levelName ?? ForecastConfidence.emDash
+        let label: String? = {
+            guard let a else { return nil }
+            if let spread = a.spread { return "±\(Int((units.temperatureDelta(spread) / 2).rounded()))° between sources" }
+            return ForecastConfidence.detailText(a, delta: { units.temperatureDelta($0) })
         }()
         Tile(title: "Confidence", systemImage: "checkmark.seal.fill") {
             TileValue(value: level,
-                      label: spread.map { "±\(Int((units.temperatureDelta($0) / 2).rounded()))° between sources" },
+                      label: label,
                       detail: "\(report.sources.count) sources blended. Tap for the breakdown; see Accuracy for how they verify.")
         }
     }

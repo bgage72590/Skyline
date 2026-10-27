@@ -16,10 +16,14 @@ public enum ForecastInsight {
     }
 
     public struct Confidence: Equatable, Sendable {
-        public var level: Level
+        /// nil → no level today (<3 h left, nothing else to say about rain).
+        public var level: Level?
         /// One short reason ("Models disagree on rain chances after 2 PM"), nil if there's nothing to say.
         public var reason: String?
-        public var sentence: String { reason.map { "\(level.label): \($0.prefix(1).lowercased() + $0.dropFirst())." } ?? "\(level.label)." }
+        public var sentence: String {
+            guard let level else { return reason.map { "\($0)." } ?? "\(ForecastConfidence.emDash)." }
+            return reason.map { "\(level.label): \($0.prefix(1).lowercased() + $0.dropFirst())." } ?? "\(level.label)."
+        }
     }
 
     /// Hours where the sources' rain chances differ by this much (percentage points) count as disagreement.
@@ -32,25 +36,20 @@ public enum ForecastInsight {
     public static func confidence(day: DailyForecast, hourly: [HourlyForecast], timeZone: TimeZone, now: Date,
                                   hourLabel: (Date) -> String, delta: (Double) -> Int,
                                   modelSeries: [ModelSeries] = []) -> Confidence {
-        var level = Level.high
-        var reason: String?
         var cal = Calendar(identifier: .gregorian); cal.timeZone = timeZone
-        let isToday = cal.isDate(day.date, inSameDayAs: now)
-        let highs = day.sources.filter { $0.weight > 0 }.compactMap(\.high)
-        if !day.sources.isEmpty, highs.count < 2 {
-            // One forecast can't agree with anything: don't claim High (Code Reviewer batch 4, NTH 6).
-            level = .medium
-            reason = "Only one forecast available for this day"
-        } else if let spread = ForecastConfidence.spread(day: day, modelSeries: modelSeries,
-                                                         timeZone: timeZone, now: now, isToday: isToday)
-                    ?? (isToday ? nil : day.highSpread) {
-            // Shared raw °C thresholds (both surfaces). °F via `delta` is display text only.
-            let t = ForecastConfidence.level(spread)
+        // Shared with ModuleDetail and the Confidence tile (raw °C thresholds; `delta` is display text only).
+        let a = ForecastConfidence.assess(day: day, modelSeries: modelSeries, timeZone: timeZone, now: now)
+        var level: Level? = a.level
+        var reason: String?
+        if a.notEnoughOfToday {
+            reason = ForecastConfidence.notEnoughOfTodayLeft
+        } else if a.singleForecast {
+            reason = ForecastConfidence.onlyOneForecast
+        } else if let spread = a.spread, let t = a.level, let side = a.side {
             if t > .high {
-                level = t
-                reason = "Models differ by \(delta(spread))° on the high"
+                reason = "Models differ by \(delta(spread))° on the \(side.rawValue)"
             } else if day.sources.count >= 3 || spread > 0 {
-                reason = "Models agree on the high within \(max(1, delta(spread)))°"
+                reason = "Models agree on the \(side.rawValue) within \(max(1, delta(spread)))°"
             }
         }
         // Rain timing: daytime hours (6 AM–midnight local) still ahead where the sources split.
@@ -60,7 +59,7 @@ public enum ForecastInsight {
         let split = hourly.filter { $0.time > start && $0.time <= end && ($0.precipitationProbabilitySpread ?? 0) >= popSpreadDisagree }
         if split.count >= 2, let first = split.first {
             let r: Level = split.count >= 6 ? .low : .medium
-            if r >= level {
+            if level.map({ r >= $0 }) ?? true {
                 level = r
                 // Rain chance at T covers the hour ending at T, so the disagreement starts an hour earlier.
                 reason = "Models disagree on rain chances after \(hourLabel(first.time.addingTimeInterval(-3600)))"

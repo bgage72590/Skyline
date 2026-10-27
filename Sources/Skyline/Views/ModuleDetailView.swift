@@ -199,15 +199,10 @@ struct ModuleDetailView: View {
             case .accuracy:
                 EmptyView()
             case .confidence:
-                let spread = ForecastConfidence.spread(day: d, modelSeries: report.modelSeries,
-                                                       timeZone: tz, now: Date(), isToday: isToday)
-                Text(ForecastConfidence.levelName(spread)).font(.system(size: 40, weight: .medium))
-                if let s = spread {
-                    Text("Sources agree within ±\(Int((units.temperatureDelta(s) / 2).rounded()))°").font(.title3).opacity(0.85)
-                } else if isToday,
-                          let hrs = ForecastConfidence.remainingTodayHours(dayDate: d.date, timeZone: tz, now: Date()),
-                          hrs < Double(ForecastConfidence.confidenceMinRemainingHours) {
-                    Text(ForecastConfidence.notEnoughOfTodayLeft).font(.title3).opacity(0.85)
+                let a = ForecastConfidence.assess(day: d, modelSeries: report.modelSeries, timeZone: tz, now: Date())
+                Text(a.levelName).font(.system(size: 40, weight: .medium))
+                if let text = ForecastConfidence.detailText(a, delta: { units.temperatureDelta($0) }) {
+                    Text(text).font(.title3).opacity(0.85)
                 }
             }
         }

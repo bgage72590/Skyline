@@ -505,7 +505,10 @@ final class AccuracyFixesTests: XCTestCase {
         let c = ForecastInsight.confidence(day: day, hourly: [], timeZone: nycTZ, now: late,
                                            hourLabel: { _ in "" }, delta: { Int($0.rounded()) },
                                            modelSeries: [])
-        XCTAssertNil(c.reason, "temperature leg must say nothing when <3 h of today remain")
+        // Fix 3: no level and no temperature reason; the shared "not enough of today" copy instead.
+        XCTAssertNil(c.level, "no level when <3 h of today remain")
+        XCTAssertEqual(c.reason, ForecastConfidence.notEnoughOfTodayLeft)
+        XCTAssertFalse(c.sentence.contains("Models differ"))
     }
 
     func testInsightAndModuleDetailAgreeOnDay0() {
@@ -581,5 +584,87 @@ final class AccuracyFixesTests: XCTestCase {
         XCTAssertEqual(obsGets.value, 1)
         let id = await v.verificationStationID(for: "bridgeport")
         XCTAssertEqual(id?.uppercased(), "KBDR")
+    }
+
+    // MARK: Fix 3 — one shared level/reason for Insight, ModuleDetail and the Confidence tile
+
+    private func fix3Day(offsetDays: Int, highs: [Double], lows: [Double]) -> (DailyForecast, Calendar) {
+        var nycCal = Calendar(identifier: .gregorian)
+        nycCal.timeZone = nycTZ
+        let base = nycCal.startOfDay(for: Date(timeIntervalSince1970: 1_720_000_000))
+        let dayDate = nycCal.date(byAdding: .day, value: offsetDays, to: base)!
+        var day = DailyForecast(date: dayDate, weatherCode: 0, high: highs[0], low: lows[0])
+        day.sources = zip(highs, lows).enumerated().map { i, hl in
+            SourceReading(name: "S\(i)", high: hl.0, low: hl.1, weight: 1)
+        }
+        return (day, nycCal)
+    }
+
+    func testInsightNilSpreadTodayHasNoLevelText() {
+        let (day, cal) = fix3Day(offsetDays: 0, highs: [20, 20.5, 21], lows: [10, 10.5, 11])
+        let late = cal.date(byAdding: .hour, value: 22, to: day.date)!
+        let c = ForecastInsight.confidence(day: day, hourly: [], timeZone: nycTZ, now: late,
+                                           hourLabel: { _ in "" }, delta: { Int($0.rounded()) })
+        XCTAssertFalse(c.sentence.contains("confidence"), c.sentence)
+        XCTAssertTrue(c.sentence.contains(ForecastConfidence.notEnoughOfTodayLeft), c.sentence)
+    }
+
+    func testReasonNamesLowWhenLowDrivesLevel() {
+        let (day, cal) = fix3Day(offsetDays: 1, highs: [15, 16, 15.5], lows: [0, 5, 2])
+        let now = cal.date(byAdding: .hour, value: -12, to: day.date)!
+        let c = ForecastInsight.confidence(day: day, hourly: [], timeZone: nycTZ, now: now,
+                                           hourLabel: { _ in "" }, delta: { Int($0.rounded()) })
+        XCTAssertEqual(c.level, .low)
+        XCTAssertEqual(c.reason, "Models differ by 5° on the low")
+    }
+
+    func testModuleDetailCopyMatchesLevel() {
+        let f: (Double) -> Double = { $0 * 9 / 5 }
+        for (lows, name) in [([0.0, 3, 1.5], "Medium"), ([0.0, 6, 3], "Low")] {
+            let (day, cal) = fix3Day(offsetDays: 1, highs: [15, 15.5, 15.2], lows: lows)
+            let now = cal.date(byAdding: .hour, value: -12, to: day.date)!
+            let a = ForecastConfidence.assess(day: day, modelSeries: [], timeZone: nycTZ, now: now)
+            XCTAssertEqual(a.levelName, name)
+            let text = ForecastConfidence.detailText(a, delta: f) ?? ""
+            XCTAssertFalse(text.contains("agree within"), text)
+            XCTAssertTrue(text.hasSuffix("on the low"), text)
+        }
+        let (hi, cal) = fix3Day(offsetDays: 1, highs: [15, 16, 15.5], lows: [5, 5.5, 6])
+        let a = ForecastConfidence.assess(day: hi, modelSeries: [], timeZone: nycTZ,
+                                          now: cal.date(byAdding: .hour, value: -12, to: hi.date)!)
+        XCTAssertEqual(ForecastConfidence.detailText(a, delta: f), "Sources agree within ±1°")
+    }
+
+    func testAllSurfacesAgreeThroughSharedAssessment() {
+        // CR: assert optional LEVEL identity (not only reason text) across Insight, ModuleDetail,
+        // and the DetailTiles Confidence tile — all via assess — for under 3 h / High / Medium / Low.
+        // Lock also requires day≥1 Medium/Low and Insight level == assess level == legacy spread level.
+        let cases: [(label: String, offset: Int, hour: Int, lows: [Double], want: ForecastInsight.Level?)] = [
+            ("under 3 h → nil", 0, 22, [10, 10.5, 11], nil),
+            ("High", 0, 12, [10, 10.5, 11], .high),
+            ("Medium", 0, 12, [10, 13, 11.5], .medium),
+            ("Low", 0, 12, [10, 16, 12], .low),
+            ("Medium d1", 1, -12, [10, 13, 11.5], .medium),
+            ("Low d2", 2, -36, [10, 16, 12], .low),
+        ]
+        for c in cases {
+            let (day, cal) = fix3Day(offsetDays: c.offset, highs: [20, 20.5, 21], lows: c.lows)
+            let now = cal.date(byAdding: .hour, value: c.hour, to: day.date)!
+            // ModuleDetail and DetailTiles both call assess; Insight builds from the same Assessment.
+            let moduleDetail = ForecastConfidence.assess(day: day, modelSeries: [], timeZone: nycTZ, now: now)
+            let tile = ForecastConfidence.assess(day: day, modelSeries: [], timeZone: nycTZ, now: now)
+            let insight = ForecastInsight.confidence(day: day, hourly: [], timeZone: nycTZ, now: now,
+                                                     hourLabel: { _ in "" }, delta: { Int($0.rounded()) })
+            XCTAssertEqual(moduleDetail.level, c.want, "ModuleDetail LEVEL: \(c.label)")
+            XCTAssertEqual(tile.level, c.want, "DetailTiles tile LEVEL: \(c.label)")
+            XCTAssertEqual(insight.level, c.want, "Insight LEVEL: \(c.label)")
+            XCTAssertEqual(insight.level, moduleDetail.level, "Insight vs ModuleDetail LEVEL: \(c.label)")
+            XCTAssertEqual(insight.level, tile.level, "Insight vs DetailTiles LEVEL: \(c.label)")
+            XCTAssertEqual(moduleDetail.level, tile.level, "ModuleDetail vs DetailTiles LEVEL: \(c.label)")
+            let isToday = cal.isDate(day.date, inSameDayAs: now)
+            let legacy = ForecastConfidence.spread(day: day, modelSeries: [], timeZone: nycTZ, now: now, isToday: isToday)
+            XCTAssertEqual(ForecastConfidence.levelName(legacy), moduleDetail.levelName,
+                           "legacy spread levelName == assess: \(c.label)")
+        }
     }
 }

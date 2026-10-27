@@ -14,6 +14,71 @@ public enum ForecastConfidence {
 
     public static let emDash = "—"
     public static let notEnoughOfTodayLeft = "Not enough of today left"
+    public static let onlyOneForecast = "Only one forecast available for this day"
+
+    /// Which spread sets the level (the larger one; the high wins a tie).
+    public enum Side: String, Sendable { case high, low }
+
+    /// One answer for every confidence surface (Insight, ModuleDetail, Confidence tile).
+    public struct Assessment: Equatable, Sendable {
+        /// nil → no temperature level ("—").
+        public var level: ForecastInsight.Level?
+        /// Raw °C spread that set the level (nil when there's no level or only one forecast).
+        public var spread: Double?
+        public var side: Side?
+        /// Today with fewer than `confidenceMinRemainingHours` left.
+        public var notEnoughOfToday: Bool
+        public var singleForecast: Bool
+        public var levelName: String {
+            switch level {
+            case .high?: "High"
+            case .medium?: "Medium"
+            case .low?: "Low"
+            case nil: emDash
+            }
+        }
+    }
+
+    /// The shared level + reason inputs. Order: <3 h today → none; one forecast → Medium; else spread.
+    public static func assess(day: DailyForecast, modelSeries: [ModelSeries], timeZone: TimeZone,
+                              now: Date) -> Assessment {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+        let isToday = cal.isDate(day.date, inSameDayAs: now)
+        var a = Assessment(level: nil, spread: nil, side: nil, notEnoughOfToday: false, singleForecast: false)
+        if isToday, let hrs = remainingTodayHours(dayDate: day.date, timeZone: timeZone, now: now),
+           hrs < Double(confidenceMinRemainingHours) {
+            a.notEnoughOfToday = true
+            return a
+        }
+        let highs = day.sources.filter { $0.weight > 0 }.compactMap(\.high)
+        if !day.sources.isEmpty, highs.count < 2 {
+            a.level = .medium
+            a.singleForecast = true
+            return a
+        }
+        var parts = isToday
+            ? day0Parts(day: day, modelSeries: modelSeries, timeZone: timeZone, now: now)
+            : sourcesParts(day)
+        if !isToday, parts.high == nil, parts.low == nil { parts.high = day.highSpread }
+        switch (parts.high, parts.low) {
+        case let (h?, l?): a.spread = max(h, l); a.side = l > h ? .low : .high
+        case let (h?, nil): a.spread = h; a.side = .high
+        case let (nil, l?): a.spread = l; a.side = .low
+        case (nil, nil): return a
+        }
+        a.level = a.spread.map(level)
+        return a
+    }
+
+    /// ModuleDetail / tile caption. `delta` converts a raw °C difference to display degrees (not rounded).
+    public static func detailText(_ a: Assessment, delta: (Double) -> Double) -> String? {
+        if a.notEnoughOfToday { return notEnoughOfTodayLeft }
+        if a.singleForecast { return onlyOneForecast }
+        guard let s = a.spread, let level = a.level, let side = a.side else { return nil }
+        if level == .high { return "Sources agree within ±\(Int((delta(s) / 2).rounded()))°" }
+        return "Sources differ by \(Int(delta(s).rounded()))° on the \(side.rawValue)"
+    }
 
     /// High / Medium / Low / "—" from a raw °C spread.
     public static func levelName(_ spread: Double?) -> String {
@@ -60,6 +125,19 @@ public enum ForecastConfidence {
 
     /// Days ≥ 1 (and empty-modelSeries fallback): max(high, low) from weighted sources.
     public static func sourcesSpread(_ day: DailyForecast) -> Double? {
+        combine(sourcesParts(day))
+    }
+
+    static func combine(_ p: (high: Double?, low: Double?)) -> Double? {
+        switch (p.high, p.low) {
+        case let (h?, l?): return max(h, l)
+        case let (h?, nil): return h
+        case let (nil, l?): return l
+        case (nil, nil): return nil
+        }
+    }
+
+    static func sourcesParts(_ day: DailyForecast) -> (high: Double?, low: Double?) {
         let rows = day.sources.filter { $0.weight > 0 }
         let highs = rows.compactMap(\.high)
         let lows = rows.compactMap(\.low)
@@ -69,24 +147,24 @@ public enum ForecastConfidence {
         let lowSpread: Double?
         if lows.count >= 2, let hi = lows.max(), let lo = lows.min() { lowSpread = hi - lo }
         else { lowSpread = nil }
-        switch (highSpread, lowSpread) {
-        case let (h?, l?): return max(h, l)
-        case let (h?, nil): return h
-        case let (nil, l?): return l
-        case (nil, nil): return nil
-        }
+        return (highSpread, lowSpread)
     }
 
     private static func day0Spread(day: DailyForecast, modelSeries: [ModelSeries],
                                    timeZone: TimeZone, now: Date) -> Double? {
-        guard let window = day0Window(dayDate: day.date, timeZone: timeZone, now: now) else { return nil }
+        combine(day0Parts(day: day, modelSeries: modelSeries, timeZone: timeZone, now: now))
+    }
+
+    static func day0Parts(day: DailyForecast, modelSeries: [ModelSeries],
+                          timeZone: TimeZone, now: Date) -> (high: Double?, low: Double?) {
+        guard let window = day0Window(dayDate: day.date, timeZone: timeZone, now: now) else { return (nil, nil) }
         let remaining = window.end.timeIntervalSince(window.start) / secondsPerHour
-        if remaining < Double(confidenceMinRemainingHours) { return nil }
+        if remaining < Double(confidenceMinRemainingHours) { return (nil, nil) }
 
         let series = modelSeries.filter { !$0.isBlend }
         if series.isEmpty {
             // Fall back to sources when nothing hourly is available (after the <3 h guard).
-            return sourcesSpread(day)
+            return sourcesParts(day)
         }
 
         var remHighs: [Double] = []
@@ -102,7 +180,7 @@ public enum ForecastConfidence {
         }
         guard remHighs.count >= 2, remLows.count >= 2,
               let highMax = remHighs.max(), let highMin = remHighs.min(),
-              let lowMax = remLows.max(), let lowMin = remLows.min() else { return nil }
-        return max(highMax - highMin, lowMax - lowMin)
+              let lowMax = remLows.max(), let lowMin = remLows.min() else { return (nil, nil) }
+        return (highMax - highMin, lowMax - lowMin)
     }
 }
