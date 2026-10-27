@@ -8,7 +8,8 @@ enum InsightFormat {
         let tz = report.timeZone
         return ForecastInsight.confidence(day: day, hourly: report.hourly, timeZone: tz, now: Date(),
                                           hourLabel: { Fmt.hour($0, tz) },
-                                          delta: { Int(units.temperatureDelta($0).rounded()) })
+                                          delta: { Int(units.temperatureDelta($0).rounded()) },
+                                          modelSeries: report.modelSeries)
     }
 
     static func changes(_ report: WeatherReport, units: DisplayUnits) -> [String] {
@@ -55,19 +56,21 @@ struct OutlookCard: View {
         }
     }
 
-    static func symbol(_ l: ForecastInsight.Level) -> String {
+    static func symbol(_ l: ForecastInsight.Level?) -> String {
         switch l {
-        case .high: "checkmark.circle.fill"
-        case .medium: "circle.lefthalf.filled"
-        case .low: "questionmark.circle.fill"
+        case nil: "minus.circle"
+        case .high?: "checkmark.circle.fill"
+        case .medium?: "circle.lefthalf.filled"
+        case .low?: "questionmark.circle.fill"
         }
     }
 
-    static func tint(_ l: ForecastInsight.Level) -> Color {
+    static func tint(_ l: ForecastInsight.Level?) -> Color {
         switch l {
-        case .high: Color(red: 0.55, green: 0.9, blue: 0.6)
-        case .medium: Color(red: 1.0, green: 0.85, blue: 0.45)
-        case .low: Color(red: 1.0, green: 0.6, blue: 0.5)
+        case nil: Color.secondary
+        case .high?: Color(red: 0.55, green: 0.9, blue: 0.6)
+        case .medium?: Color(red: 1.0, green: 0.85, blue: 0.45)
+        case .low?: Color(red: 1.0, green: 0.6, blue: 0.5)
         }
     }
 }

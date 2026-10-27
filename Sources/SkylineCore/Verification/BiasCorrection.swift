@@ -309,13 +309,19 @@ public enum BiasCorrection {
 
     // MARK: UI copy
 
+    /// Siting failure with no US station pick yet (seed in flight or not yet attempted).
+    public static let offStationPending = "off: station (pending)"
+    /// Siting failure after back-off or for a non-US / failed key.
+    public static let offStation = "off: station"
+
     public static func statusLine(entry: CorrectionEntry?, gated: Bool, sitingOK: Bool,
                                   switchOn: Bool, nDays: Int, units: (Double) -> Double,
                                   qaOverride: Bool = false,
                                   target: CorrectionTarget = .dailyHigh,
-                                  nPairs: Int = 0) -> String {
+                                  nPairs: Int = 0,
+                                  stationPending: Bool = false) -> String {
         if !switchOn { return "off: switched off" }
-        if !sitingOK { return "off: station" }
+        if !sitingOK { return stationPending ? offStationPending : offStation }
         if let e = entry, e.autoOff { return "off: worse on recent days" }
         if !gated {
             let needDays = dayThreshold(for: target)

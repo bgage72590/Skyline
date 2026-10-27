@@ -100,7 +100,7 @@ final class Build45LocationTests: XCTestCase {
 
 final class Build45WordingTests: XCTestCase {
     func testC1SameShownSpreadSameLevel() {
-        func level(_ spread: Double) -> ForecastInsight.Level {
+        func level(_ spread: Double) -> ForecastInsight.Level? {
             let day = DailyForecast(date: Date(timeIntervalSince1970: 1_800_000_000), weatherCode: 3, high: 20, low: 10, highSpread: spread)
             return ForecastInsight.confidence(day: day, hourly: [], timeZone: TimeZone(identifier: "America/New_York")!,
                                               now: day.date, hourLabel: { _ in "" }, delta: { Int(($0 * 1.8).rounded()) }).level

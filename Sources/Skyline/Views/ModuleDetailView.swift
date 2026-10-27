@@ -199,9 +199,10 @@ struct ModuleDetailView: View {
             case .accuracy:
                 EmptyView()
             case .confidence:
-                Text(confidenceLevel(d.highSpread)).font(.system(size: 40, weight: .medium))
-                if let s = d.highSpread {
-                    Text("Sources agree within ±\(Int((units.temperatureDelta(s) / 2).rounded()))°").font(.title3).opacity(0.85)
+                let a = ForecastConfidence.assess(day: d, modelSeries: report.modelSeries, timeZone: tz, now: Date())
+                Text(a.levelName).font(.system(size: 40, weight: .medium))
+                if let text = ForecastConfidence.detailText(a, delta: { units.temperatureDelta($0) }) {
+                    Text(text).font(.title3).opacity(0.85)
                 }
             }
         }
@@ -427,11 +428,6 @@ struct ModuleDetailView: View {
         }
         .padding(.horizontal, 12)
         .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    private func confidenceLevel(_ spread: Double?) -> String {
-        guard let spread else { return "—" }
-        return spread <= 2 ? "High" : (spread <= 4 ? "Medium" : "Low")
     }
 
     private func summary(_ d: DailyForecast) -> String {

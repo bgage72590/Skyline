@@ -56,6 +56,8 @@ public actor ForecastVerifier {
     public static let observationInterval: TimeInterval = 55 * 60
     /// Fix 3: 24 h negative cache after a failed US NWS stations seed (named Form4 day literal).
     public static let usStationSeedNegativeCache: TimeInterval = BenchmarkStore.secondsPerDay
+    /// How long a verification station ID stays fresh without a re-fetch.
+    public static let verificationStationMaxAge: TimeInterval = 7 * 86400
 
     struct Meta: Codable {
         var firstIssued: Date?
@@ -92,6 +94,16 @@ public actor ForecastVerifier {
     private var cachedWeightsMerged: [String: Bool] = [:]
     /// `-SkylineCorrectionQAOverride` from the launch arguments only (never defaults or data), clamped (H1).
     private let qaOverrideC: Double?
+    /// In-memory: US keys that already tried a launch seed this process (sync insert before first await).
+    private var seedAttempted: Set<String> = []
+    /// Keys that already performed a stations GET for seed this process (budget ≤1).
+    private var seedFetched: Set<String> = []
+    /// In-flight launch seeds so concurrent verify awaits one GET.
+    private var seedInFlight: [String: Task<Void, Never>] = [:]
+    /// Keys seen with a non-nil `stationsURL` (US) this process — drives "(pending)" without touching WeatherService.
+    private var usKeys: Set<String> = []
+    /// Last time-zone id used to build `cachedStatuses` (in-memory; rebuild after seed).
+    private var statusTimeZoneIdentifier: [String: String] = [:]
 
     public init(directory: URL = ForecastVerifier.defaultDirectory(), client: HTTPClient = URLSessionHTTPClient(),
                 config: AdaptiveWeighting.Config = AdaptiveWeighting.Config(),
@@ -153,11 +165,19 @@ public actor ForecastVerifier {
     public func verifyIfDue(key: String, stationsURL: URL?, near forecastPoint: Coordinate? = nil,
                             cityElevationM: Double? = nil) async {
         load()
+        if stationsURL != nil { usKeys.insert(key) }
+        // Seed before the 55-min throttle / empty-due returns so fresh installs don't wait on verify.
+        await seedBenchmarkStationIfMissing(key: key, stationsURL: stationsURL, near: forecastPoint,
+                                            cityElevationM: cityElevationM)
+        if let inflight = seedInFlight[key] { await inflight.value }
+
         let t = now()
         if let last = meta[key]?.lastObsCheck, t.timeIntervalSince(last) < Self.observationInterval { return }
         let due = pending.filter { $0.loc == key && $0.valid <= t.addingTimeInterval(-20 * 60) }
         guard !due.isEmpty else { return }
         meta[key, default: Meta()].lastObsCheck = t
+        // Never start a fresh stations GET while a launch seed for this key is in flight.
+        if let inflight = seedInFlight[key] { await inflight.value }
         guard let station = await station(for: key, stationsURL: stationsURL, near: forecastPoint,
                                           cityElevationM: cityElevationM) else { saveMeta(); return }
         let start = max(due.map(\.valid).min()!.addingTimeInterval(-70 * 60), t.addingTimeInterval(-3 * 86400))
@@ -322,17 +342,20 @@ public actor ForecastVerifier {
     }
 
     /// Ensures corrections are loaded / refreshed for `key`. Safe to call off-main / detached.
+    /// `isUS`: test/UI seam for "(pending)" when `stationsURL` has not yet marked the key (WeatherService unchanged).
     @discardableResult
     public func corrections(_ key: String, timeZoneIdentifier: String = TimeZone.gmt.identifier,
-                            cityElevationM: Double? = nil) async -> [CorrectionTarget: Double] {
+                            cityElevationM: Double? = nil, isUS: Bool? = nil) async -> [CorrectionTarget: Double] {
         await benchmark.loadCorrectionsOnly()
         correctionsReady = true
+        if isUS == true { usKeys.insert(key) }
+        statusTimeZoneIdentifier[key] = timeZoneIdentifier
         let siting = await benchmark.sitingOK(for: key, cityElevationM: cityElevationM)
         let offsets = await benchmark.refreshCorrections(key: key, timeZoneIdentifier: timeZoneIdentifier,
                                                          sitingOK: siting, qaOverrideC: qaOverrideC)
         cachedOffsets[key] = offsets
         cachedStatuses[key] = await buildStatuses(key: key, timeZoneIdentifier: timeZoneIdentifier,
-                                                 sitingOK: siting, offsets: offsets)
+                                                 sitingOK: siting, offsets: offsets, isUS: isUS)
         return offsets
     }
 
@@ -341,12 +364,20 @@ public actor ForecastVerifier {
     }
 
     private func buildStatuses(key: String, timeZoneIdentifier: String, sitingOK: Bool,
-                              offsets: [CorrectionTarget: Double]) async -> [CorrectionStatus] {
+                              offsets: [CorrectionTarget: Double], isUS: Bool? = nil) async -> [CorrectionStatus] {
         let switchOn = BiasCorrection.Switch.isEnabled()
         let qa = qaOverrideC != nil
         var cal = Calendar(identifier: .gregorian)
         if let tz = TimeZone(identifier: timeZoneIdentifier) { cal.timeZone = tz }
         let localDay = cal.startOfDay(for: now())
+        let stationNil = await benchmark.station(for: key) == nil
+        let skip = await benchmark.shouldSkipUSStationSeed(key: key, now: now())
+        let usContext: Bool = {
+            if isUS == false { return false }
+            if isUS == true { return true }
+            return usKeys.contains(key) || meta[key]?.stationID != nil
+        }()
+        let stationPending = stationNil && usContext && !skip
         var out: [CorrectionStatus] = []
         for target in CorrectionTarget.allCases {
             let rows = await benchmark.trainingRows(for: key, target: target)
@@ -364,7 +395,8 @@ public actor ForecastVerifier {
             let line = BiasCorrection.statusLine(entry: entry, gated: gated, sitingOK: sitingOK,
                                                  switchOn: switchOn, nDays: nDays,
                                                  units: { $0 }, qaOverride: qa,
-                                                 target: target, nPairs: nPairs)
+                                                 target: target, nPairs: nPairs,
+                                                 stationPending: stationPending)
             out.append(CorrectionStatus(loc: key, target: target, line: line,
                                         appliedC: offsets[target] ?? 0, nDays: nDays, nPairs: nPairs,
                                         gated: gated, autoOff: entry?.autoOff ?? false, sitingOK: sitingOK))
@@ -513,8 +545,42 @@ public actor ForecastVerifier {
         await benchmark.forceRecomputeSummaries()
     }
 
+    /// Test seam: write verification-station meta (existing fields only) without a stations GET.
+    func seedVerificationStationMeta(key: String, stationID: String, stationName: String? = nil,
+                                     fetched: Date, lastObsCheck: Date? = nil) {
+        load()
+        meta[key, default: Meta()].stationID = stationID
+        meta[key]?.stationName = stationName
+        meta[key]?.stationFetched = fetched
+        if let lastObsCheck { meta[key]?.lastObsCheck = lastObsCheck }
+        saveMeta()
+    }
+
+    func pendingCount(for key: String) -> Int {
+        load(); return pending.filter { $0.loc == key }.count
+    }
+
+    func verifiedCount(for key: String) -> Int {
+        load(); return verified.filter { $0.r.loc == key }.count
+    }
+
+    func verificationStationID(for key: String) -> String? {
+        load(); return meta[key]?.stationID
+    }
+
+    func lastObsCheck(for key: String) -> Date? {
+        load(); return meta[key]?.lastObsCheck
+    }
+
     public func benchmarkMetarCount(_ key: String) async -> Int { await benchmark.metarCount(for: key) }
     public func benchmarkByteSize() async -> Int { await benchmark.totalByteSize() }
+    func benchmarkStation(for key: String) async -> MetarStationPick? { await benchmark.station(for: key) }
+    func shouldSkipUSStationSeed(key: String, now: Date) async -> Bool {
+        await benchmark.shouldSkipUSStationSeed(key: key, now: now)
+    }
+    func noteUSStationSeedFailure(key: String, until: Date) async {
+        await benchmark.noteUSStationSeedFailure(key: key, until: until)
+    }
 
     // MARK: Internals
 
@@ -525,11 +591,87 @@ public actor ForecastVerifier {
         return s
     }
 
-    private func station(for key: String, stationsURL: URL?, near forecastPoint: Coordinate?,
-                         cityElevationM: Double? = nil) async -> String? {
+    /// Launch/verify path: seed the US benchmark station when missing, before the obs throttle.
+    private func seedBenchmarkStationIfMissing(key: String, stationsURL: URL?,
+                                               near forecastPoint: Coordinate?,
+                                               cityElevationM: Double?) async {
+        // forecastPoint checked before any GET; non-US (nil stationsURL) never seeds here.
+        guard let stationsURL, forecastPoint != nil else { return }
+        if let inflight = seedInFlight[key] {
+            await inflight.value
+            return
+        }
+        if seedAttempted.contains(key) { return }
+        // Sync insert before the first await (actor reentrancy).
+        seedAttempted.insert(key)
+        let point = forecastPoint
+        let elev = cityElevationM
+        let task = Task {
+            await self.runUSStationSeed(key: key, stationsURL: stationsURL, near: point, cityElevationM: elev)
+        }
+        seedInFlight[key] = task
+        await task.value
+        seedInFlight[key] = nil
+    }
+
+    private func runUSStationSeed(key: String, stationsURL: URL, near forecastPoint: Coordinate?,
+                                  cityElevationM: Double?) async {
+        if await benchmark.station(for: key) != nil { return }
+        if await benchmark.shouldSkipUSStationSeed(key: key, now: now()) { return }
+        guard let forecastPoint else { return }
+
         let cachedID = meta[key]?.stationID
         let cachedFresh = cachedID != nil
-            && meta[key]?.stationFetched.map { now().timeIntervalSince($0) < 7 * 86400 } == true
+            && meta[key]?.stationFetched.map { now().timeIntervalSince($0) < Self.verificationStationMaxAge } == true
+        if cachedFresh, let id = cachedID {
+            await seedUSBenchmarkStationIfNeeded(key: key, verifyingID: id, stationsURL: stationsURL,
+                                                 near: forecastPoint, cityElevationM: cityElevationM)
+            if await benchmark.station(for: key) != nil {
+                await invalidateStatusesAfterSeed(key: key, cityElevationM: cityElevationM)
+            }
+            return
+        }
+
+        // Fresh install / expired ID: one stations GET; write existing meta fields + benchmark seed.
+        if seedFetched.contains(key) { return }
+        seedFetched.insert(key)
+        guard let data = try? await client.get(stationsURL, headers: ["Accept": "application/geo+json"]),
+              let chosen = try? NWSObservationParser.verificationStation(data, near: forecastPoint) else {
+            await benchmark.noteUSStationSeedFailure(key: key,
+                                                     until: now().addingTimeInterval(Self.usStationSeedNegativeCache))
+            return
+        }
+        meta[key, default: Meta()].stationID = chosen.id
+        meta[key]?.stationName = chosen.name
+        meta[key]?.stationFetched = now()
+        if let pick = Self.nwsStationPick(data: data, id: chosen.id, near: forecastPoint,
+                                          cityElevationM: cityElevationM, at: now()) {
+            await benchmark.seedStation(pick, key: key)
+            if let cityElevationM { await benchmark.seedCityElevation(cityElevationM, key: key) }
+            await invalidateStatusesAfterSeed(key: key, cityElevationM: cityElevationM)
+        } else {
+            await benchmark.noteUSStationSeedFailure(key: key,
+                                                     until: now().addingTimeInterval(Self.usStationSeedNegativeCache))
+        }
+        saveMeta()
+    }
+
+    private func invalidateStatusesAfterSeed(key: String, cityElevationM: Double?) async {
+        // Rebuild in place so correctionStatuses() does not briefly hide rows.
+        guard cachedStatuses[key] != nil || cachedOffsets[key] != nil else { return }
+        let tz = statusTimeZoneIdentifier[key] ?? TimeZone.gmt.identifier
+        let siting = await benchmark.sitingOK(for: key, cityElevationM: cityElevationM)
+        let offsets = cachedOffsets[key] ?? [:]
+        cachedStatuses[key] = await buildStatuses(key: key, timeZoneIdentifier: tz,
+                                                 sitingOK: siting, offsets: offsets)
+    }
+
+    private func station(for key: String, stationsURL: URL?, near forecastPoint: Coordinate?,
+                         cityElevationM: Double? = nil) async -> String? {
+        if let inflight = seedInFlight[key] { await inflight.value }
+        let cachedID = meta[key]?.stationID
+        let cachedFresh = cachedID != nil
+            && meta[key]?.stationFetched.map { now().timeIntervalSince($0) < Self.verificationStationMaxAge } == true
         if cachedFresh, let id = cachedID {
             // Fix 3: even on a 7-day verification-station cache hit, seed/replace benchmark meta
             // when missing or pointing at a different station id.
@@ -537,8 +679,15 @@ public actor ForecastVerifier {
                                                  near: forecastPoint, cityElevationM: cityElevationM)
             return id
         }
-        guard let stationsURL, let data = try? await client.get(stationsURL, headers: ["Accept": "application/geo+json"]),
-              let chosen = try? NWSObservationParser.verificationStation(data, near: forecastPoint) else { return meta[key]?.stationID }
+        // Skip a fresh stations GET only while the 24 h US seed back-off is active.
+        if await benchmark.shouldSkipUSStationSeed(key: key, now: now()) { return meta[key]?.stationID }
+        guard let stationsURL else { return meta[key]?.stationID }
+        guard let data = try? await client.get(stationsURL, headers: ["Accept": "application/geo+json"]),
+              let chosen = try? NWSObservationParser.verificationStation(data, near: forecastPoint) else {
+            await benchmark.noteUSStationSeedFailure(key: key,
+                                                     until: now().addingTimeInterval(Self.usStationSeedNegativeCache))
+            return meta[key]?.stationID
+        }
         meta[key, default: Meta()].stationID = chosen.id
         meta[key]?.stationName = chosen.name
         meta[key]?.stationFetched = now()
@@ -558,9 +707,10 @@ public actor ForecastVerifier {
         let existing = await benchmark.station(for: key)
         if let existing, existing.stationID.uppercased() == verifyingID.uppercased() { return }
         guard let stationsURL else { return }
+        // Point must be known before GET (launch seed already gates this; keep the order here too).
+        guard let point = forecastPoint else { return }
         if await benchmark.shouldSkipUSStationSeed(key: key, now: now()) { return }
         guard let data = try? await client.get(stationsURL, headers: ["Accept": "application/geo+json"]),
-              let point = forecastPoint,
               let pick = Self.nwsStationPick(data: data, id: verifyingID, near: point,
                                              cityElevationM: cityElevationM, at: now()) else {
             await benchmark.noteUSStationSeedFailure(key: key, until: now().addingTimeInterval(Self.usStationSeedNegativeCache))
