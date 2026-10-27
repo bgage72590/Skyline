@@ -114,6 +114,8 @@ public struct OpenMeteoResponse: Codable, Sendable {
     }
 
     /// Intended local start-of-day for one Open-Meteo daily unixtime (see `dailyTimes`).
+    /// Builds Y-M-D in the city's `TimeZone` (not noon-UTC), so UTC+13/+14 zones stay on the
+    /// intended calendar day; then `startOfDay` (which may be 01:00 in a midnight-transition zone).
     public static func localDailyDate(unixTime: TimeInterval, utcOffsetSeconds: Int, timeZone: TimeZone) -> Date {
         let shifted = Date(timeIntervalSince1970: unixTime + TimeInterval(utcOffsetSeconds))
         var utc = Calendar(identifier: .gregorian)
@@ -121,11 +123,10 @@ public struct OpenMeteoResponse: Codable, Sendable {
         let y = utc.component(.year, from: shifted)
         let m = utc.component(.month, from: shifted)
         let d = utc.component(.day, from: shifted)
-        // Noon UTC on that Y-M-D sits inside the local calendar day for any civil offset.
-        let utcNoon = utc.date(from: DateComponents(year: y, month: m, day: d, hour: 12))!
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = timeZone
-        return cal.startOfDay(for: utcNoon)
+        let localYMD = cal.date(from: DateComponents(year: y, month: m, day: d))!
+        return cal.startOfDay(for: localYMD)
     }
 
     /// Models that actually returned at least one non-null hourly temperature.

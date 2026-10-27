@@ -9,8 +9,9 @@ public enum ForecastSampler {
     // MARK: DST daily-date accuracy compat (plan-dst / CR-signed)
 
     /// Issuances on or after this instant used corrected `dailyTimes`; never drop them for DST skew.
-    /// 2026-10-28 00:00:00 UTC — named so scrub rules carry no bare date literals.
-    public static let dstFixShipDate = Date(timeIntervalSince1970: 1_793_145_600)
+    /// 2026-11-01 06:00:00 UTC (America/New_York fall-back instant) — at/after install since this
+    /// ships before then; named so scrub rules carry no bare date literals.
+    public static let dstFixShipDate = Date(timeIntervalSince1970: 1_793_512_800)
 
     /// Open-Meteo `forecast_days` window: only groups issued inside this many days before a fall-back
     /// transition are eligible for the window scrub rule.

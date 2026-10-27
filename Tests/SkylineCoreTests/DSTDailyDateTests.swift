@@ -153,6 +153,41 @@ final class DSTDailyDateTests: XCTestCase {
         }
     }
 
+    /// UTC+13 NZDT: noon-UTC heuristic would shift every day +1; city Y-M-D must stay on today.
+    func testAucklandUTCPlus13SummerNoShift() {
+        let unix: [TimeInterval] = [
+            1_799_838_000, // 2027-01-14 00:00 NZDT (+13)
+            1_799_924_400, // Jan 15
+            1_800_010_800, // Jan 16
+            1_800_097_200, // Jan 17
+        ]
+        let tz = TimeZone(identifier: "Pacific/Auckland")!
+        let om = omDaily(timezone: "Pacific/Auckland", offset: 46_800, unixTimes: unix)
+        assertConsecutiveLocalDays(om.dailyTimes, count: 4,
+                                   from: DateComponents(year: 2027, month: 1, day: 14),
+                                   timeZone: tz)
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        // Explicit: Jan 15 stays Jan 15 (not Jan 16).
+        XCTAssertEqual(cal.component(.day, from: om.dailyTimes[1]), 15)
+        XCTAssertEqual(cal.component(.month, from: om.dailyTimes[1]), 1)
+    }
+
+    /// UTC+14 (extreme): same no-shift guarantee as Auckland.
+    func testKiritimatiUTCPlus14NoShift() {
+        let unix: [TimeInterval] = [
+            1_793_527_200, // 2026-11-02 00:00 +14
+            1_793_613_600,
+            1_793_700_000,
+            1_793_786_400,
+        ]
+        let tz = TimeZone(identifier: "Pacific/Kiritimati")!
+        let om = omDaily(timezone: "Pacific/Kiritimati", offset: 50_400, unixTimes: unix)
+        assertConsecutiveLocalDays(om.dailyTimes, count: 4,
+                                   from: DateComponents(year: 2026, month: 11, day: 2),
+                                   timeZone: tz)
+    }
+
     // MARK: 5. Half-hour zones
 
     func testHalfHourZonesKolkataAndAdelaide() {
@@ -210,6 +245,23 @@ final class DSTDailyDateTests: XCTestCase {
         }
         assertConsecutiveLocalDays(dates, count: 5,
                                    from: DateComponents(year: 2026, month: 9, day: 4),
+                                   timeZone: santiago)
+    }
+
+    /// America/Santiago April 2026 fall-back: fixed −03 skews later days to 23:00 prior evening.
+    func testSantiagoAprilFallBackCorrectedConsecutive() {
+        let santiago = TimeZone(identifier: "America/Santiago")!
+        let unix: [TimeInterval] = [
+            1_775_098_800, // 2026-04-02 00:00 −03
+            1_775_185_200,
+            1_775_271_600, // Apr 4
+            1_775_358_000, // intended Apr 5 — wire skew → Apr 4 23:00 −04
+            1_775_444_400,
+            1_775_530_800,
+        ]
+        let om = omDaily(timezone: "America/Santiago", offset: -10_800, unixTimes: unix)
+        assertConsecutiveLocalDays(om.dailyTimes, count: 6,
+                                   from: DateComponents(year: 2026, month: 4, day: 2),
                                    timeZone: santiago)
     }
 
@@ -335,7 +387,7 @@ final class DSTDailyDateTests: XCTestCase {
         }
 
         XCTAssertEqual(ForecastSampler.dstCompatLookbackDays, 10)
-        XCTAssertEqual(ForecastSampler.dstFixShipDate, Date(timeIntervalSince1970: 1_793_145_600))
+        XCTAssertEqual(ForecastSampler.dstFixShipDate, Date(timeIntervalSince1970: 1_793_512_800))
 
         // Pre-ship group with duplicated Nov 1 (and days after): drop from Nov 1 on; keep Oct 27–31.
         let preIssued = day(2026, 10, 27)
