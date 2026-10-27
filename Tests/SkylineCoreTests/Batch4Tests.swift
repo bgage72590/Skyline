@@ -400,7 +400,8 @@ final class Batch4Tests: XCTestCase {
                                stationName: nil, overall: s.overall, byBucket: s.byBucket, recentWinner: nil,
                                recentWinnerMAE: nil, weights: BlendWeights(), minDays: 3)
         let text = AccuracySummary.headline(r, delta: { String(format: "%.1f°C", $0) })
-        XCTAssertTrue(text.contains("(20 of 20 rainy hours caught)"), text)
+        XCTAssertTrue(text.contains("(20 of 20 rainy hours)"), text)
+        XCTAssertTrue(text.contains("Rain: caught"), text)
     }
 
     /// The launch sweep scans off the actor; a fresh write landing during the scan must survive it.

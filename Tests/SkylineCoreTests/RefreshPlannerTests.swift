@@ -2,7 +2,7 @@ import Foundation
 import XCTest
 @testable import SkylineCore
 
-/// Plan §6 items 9–10: RefreshPlanner roles, due, stagger, manualRefreshTargets, store guard.
+/// Plan §6 items 9–10 + Fix 1 / Decision 2 planner tests.
 final class RefreshPlannerTests: XCTestCase {
     private func city(_ id: String, lat: Double = 40.7, lon: Double = -74.0) -> WeatherLocation {
         WeatherLocation(id: id, name: id, country: "United States",
@@ -27,7 +27,13 @@ final class RefreshPlannerTests: XCTestCase {
         XCTAssertEqual(RefreshPlanner.role(for: "bg", viewedID: "x", menuBarID: "y", notifyIDs: []), .background)
     }
 
-    // MARK: Due (M6)
+    // MARK: Due (M6) + Decision 2 TTL
+
+    func testDecision2TTLConstants() {
+        XCTAssertEqual(WeatherService.TTL.background, 10_800)
+        XCTAssertEqual(WeatherService.TTL.blendMaxAge, 43_200)
+        XCTAssertEqual(WeatherService.TTL.notifyReuseHidden, 1_800)
+    }
 
     func testDueFreshByForecastTTLBackgroundByBackgroundTTL() {
         let cities = [city("fresh"), city("bg")]
@@ -35,28 +41,24 @@ final class RefreshPlannerTests: XCTestCase {
         let forecastTTL = WeatherService.TTL.forecast
         let backgroundTTL = WeatherService.TTL.background
 
-        // Young pairs — nothing due.
         let young = RefreshPlanner.due(cities: cities,
                                        pairAges: ["fresh": forecastTTL - 1, "bg": backgroundTTL - 1],
                                        roles: roles)
         XCTAssertTrue(young.fresh.isEmpty)
         XCTAssertTrue(young.background.isEmpty)
 
-        // Fresh past 10 min TTL.
         let freshDue = RefreshPlanner.due(cities: cities,
                                           pairAges: ["fresh": forecastTTL, "bg": 0],
                                           roles: roles)
         XCTAssertEqual(freshDue.fresh, ["fresh"])
         XCTAssertTrue(freshDue.background.isEmpty)
 
-        // Background past background TTL.
         let bgDue = RefreshPlanner.due(cities: cities,
                                        pairAges: ["fresh": 0, "bg": backgroundTTL],
                                        roles: roles)
         XCTAssertTrue(bgDue.fresh.isEmpty)
         XCTAssertEqual(bgDue.background, ["bg"])
 
-        // Missing pair age → due.
         let missing = RefreshPlanner.due(cities: cities, pairAges: [:], roles: roles)
         XCTAssertEqual(missing.fresh, ["fresh"])
         XCTAssertEqual(missing.background, ["bg"])
@@ -66,9 +68,10 @@ final class RefreshPlannerTests: XCTestCase {
         let cities = [city("bg")]
         let roles: [String: RefreshPlanner.Role] = ["bg": .background]
         let due = RefreshPlanner.due(cities: cities,
-                                     pairAges: ["bg": 60], // young vs background TTL
+                                     pairAges: ["bg": 60],
                                      roles: roles,
-                                     wantsIssuance: ["bg": true])
+                                     wantsIssuance: ["bg": true],
+                                     windowVisible: true)
         XCTAssertEqual(due.background, ["bg"])
 
         let notWanted = RefreshPlanner.due(cities: cities,
@@ -78,22 +81,59 @@ final class RefreshPlannerTests: XCTestCase {
         XCTAssertTrue(notWanted.background.isEmpty)
     }
 
-    /// CR PR20 B1: window hidden → background cities only when they have no pair (fetch-once);
-    /// no TTL- or issuance-driven background refresh while hidden (§4.3 / budget §5).
-    func testHiddenWindowBackgroundOnlyFetchOnce() {
-        let cities = [city("menu"), city("old"), city("empty")]
-        let roles: [String: RefreshPlanner.Role] = ["menu": .freshCadence, "old": .background, "empty": .background]
-        let ages: [String: TimeInterval] = ["menu": WeatherService.TTL.forecast,
-                                            "old": WeatherService.TTL.background * 3]
+    /// Decision 2: TTL-due background cities while hidden; issuance-only while hidden → not due.
+    func testHiddenWindowBackgroundTTLDue() {
+        let cities = [city("menu"), city("old"), city("empty"), city("young")]
+        let roles: [String: RefreshPlanner.Role] = [
+            "menu": .freshCadence, "old": .background, "empty": .background, "young": .background
+        ]
+        let ages: [String: TimeInterval] = [
+            "menu": WeatherService.TTL.forecast,
+            "old": WeatherService.TTL.background,
+            "young": WeatherService.TTL.background - 1
+        ]
         let hidden = RefreshPlanner.due(cities: cities, pairAges: ages, roles: roles,
-                                        wantsIssuance: ["old": true], windowVisible: false)
+                                        wantsIssuance: ["young": true, "old": true],
+                                        windowVisible: false)
         XCTAssertEqual(hidden.fresh, ["menu"])
-        XCTAssertEqual(hidden.background, ["empty"])
-        let visible = RefreshPlanner.due(cities: cities, pairAges: ages, roles: roles, windowVisible: true)
-        XCTAssertEqual(visible.background, ["old", "empty"])
+        XCTAssertEqual(Set(hidden.background), Set(["old", "empty"]))
+        XCTAssertFalse(hidden.background.contains("young"), "issuance-only while hidden is not due")
+
+        let atBoundary = RefreshPlanner.due(cities: [city("bg")],
+                                            pairAges: ["bg": 10_800],
+                                            roles: ["bg": .background],
+                                            windowVisible: false)
+        XCTAssertEqual(atBoundary.background, ["bg"])
+        let justUnder = RefreshPlanner.due(cities: [city("bg")],
+                                           pairAges: ["bg": 10_799],
+                                           roles: ["bg": .background],
+                                           windowVisible: false)
+        XCTAssertTrue(justUnder.background.isEmpty)
+
+        let visible = RefreshPlanner.due(cities: cities, pairAges: ages, roles: roles,
+                                         wantsIssuance: ["young": true], windowVisible: true)
+        XCTAssertEqual(Set(visible.background), Set(["old", "empty", "young"]))
     }
 
-    // MARK: Stagger
+    func testNotifyReuseWhileHidden() {
+        let cities = [city("notify"), city("other")]
+        let roles: [String: RefreshPlanner.Role] = ["notify": .freshCadence, "other": .freshCadence]
+        // At 20 min: notify reuses (not due); other uses 10-min forecast TTL (due).
+        let mid = RefreshPlanner.due(cities: cities, pairAges: ["notify": 1_200, "other": 1_200],
+                                     roles: roles, windowVisible: false, notifyIDs: ["notify"])
+        XCTAssertEqual(mid.fresh, ["other"])
+        // At 30 min: notify becomes due under notifyReuseHidden.
+        let due = RefreshPlanner.due(cities: [city("notify")], pairAges: ["notify": 1_800],
+                                     roles: ["notify": .freshCadence],
+                                     windowVisible: false, notifyIDs: ["notify"])
+        XCTAssertEqual(due.fresh, ["notify"])
+        let justUnder = RefreshPlanner.due(cities: [city("notify")], pairAges: ["notify": 1_799],
+                                           roles: ["notify": .freshCadence],
+                                           windowVisible: false, notifyIDs: ["notify"])
+        XCTAssertTrue(justUnder.fresh.isEmpty)
+    }
+
+    // MARK: Stagger / retain / dropdown / stillDue
 
     func testStaggerDelayAtLeast15() {
         for id in ["a", "b", "city-3", "nyc"] {
@@ -102,6 +142,64 @@ final class RefreshPlannerTests: XCTestCase {
             XCTAssertEqual(RefreshPlanner.staggerDelay(for: id),
                            RefreshPlanner.staggerBase + FetchRetryPolicy.jitter(for: id))
         }
+    }
+
+    func testNextDequeueDelayAndShouldEnqueue() {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        XCTAssertEqual(RefreshPlanner.nextDequeueDelay(lastDequeueAt: nil, now: now, id: "a"), 0)
+        let last = now.addingTimeInterval(-5)
+        let delay = RefreshPlanner.nextDequeueDelay(lastDequeueAt: last, now: now, id: "a")
+        XCTAssertGreaterThanOrEqual(delay, 10)
+        XCTAssertLessThanOrEqual(delay, RefreshPlanner.staggerDelay(for: "a"))
+
+        XCTAssertTrue(RefreshPlanner.shouldEnqueue(id: "x", queued: [], loading: []))
+        XCTAssertFalse(RefreshPlanner.shouldEnqueue(id: "x", queued: ["x"], loading: []))
+        XCTAssertFalse(RefreshPlanner.shouldEnqueue(id: "x", queued: [], loading: ["x"]))
+    }
+
+    func testRetainOnHide() {
+        let kept = RefreshPlanner.retainOnHide(ids: ["empty", "old", "young"],
+                                               pairAges: ["old": 10_800, "young": 60])
+        XCTAssertEqual(Set(kept), Set(["empty", "old"]))
+    }
+
+    func testDropdownStaleOldestFirstCap5() {
+        let order = (0..<15).map { "c\($0)" }
+        var ages: [String: TimeInterval] = [:]
+        var thresholds: [String: TimeInterval] = [:]
+        for (i, id) in order.enumerated() where id != "c1" {
+            ages[id] = TimeInterval(i * 100) // c0 youngest, c14 oldest
+            thresholds[id] = 500
+        }
+        thresholds["c1"] = 500
+        let picked = RefreshPlanner.dropdownStale(ages: ages, missing: ["c1"], thresholds: thresholds,
+                                                  order: order, cap: 5)
+        XCTAssertEqual(picked.count, 5)
+        XCTAssertEqual(picked.first, "c1")
+        XCTAssertEqual(picked[1], "c14")
+        XCTAssertFalse(picked.contains("c0"))
+        XCTAssertFalse(picked.contains("c2")) // under threshold
+    }
+
+    func testStillDue() {
+        XCTAssertTrue(RefreshPlanner.stillDue(id: "a", pairAge: 10_800, role: .background,
+                                              wantsIssuance: false, windowVisible: false, dailyLimited: false))
+        XCTAssertFalse(RefreshPlanner.stillDue(id: "a", pairAge: 10_799, role: .background,
+                                               wantsIssuance: true, windowVisible: false, dailyLimited: false))
+        XCTAssertFalse(RefreshPlanner.stillDue(id: "a", pairAge: 10_800, role: .background,
+                                               wantsIssuance: false, windowVisible: false, dailyLimited: true))
+        XCTAssertTrue(RefreshPlanner.stillDue(id: "a", pairAge: 60, role: .background,
+                                              wantsIssuance: true, windowVisible: true, dailyLimited: false))
+    }
+
+    /// Blocker 3: dequeue must pass real wantsIssuance — young pair + issuance stays due while visible.
+    func testStillDueIssuanceKeepsYoungBackgroundDueWhenVisible() {
+        XCTAssertTrue(RefreshPlanner.stillDue(id: "bg", pairAge: 60, role: .background,
+                                              wantsIssuance: true, windowVisible: true, dailyLimited: false),
+                      "issuance-due background must stay due at dequeue (not forced wantsIssuance:false)")
+        XCTAssertFalse(RefreshPlanner.stillDue(id: "bg", pairAge: 60, role: .background,
+                                               wantsIssuance: false, windowVisible: true, dailyLimited: false),
+                       "without issuance, young background is not due")
     }
 
     // MARK: manualRefreshTargets (M8)
@@ -120,7 +218,6 @@ final class RefreshPlannerTests: XCTestCase {
         let viewedOnly = RefreshPlanner.manualRefreshTargets(selected: selected, menuBar: nil)
         XCTAssertEqual(viewedOnly.map(\.id), ["sel"])
 
-        // Deleted pin: caller already resolved LocationList fallback into menuBar.
         let fallback = city("fallback-first-saved")
         let resolved = RefreshPlanner.manualRefreshTargets(selected: selected, menuBar: fallback,
                                                            saved: [fallback, city("other")])

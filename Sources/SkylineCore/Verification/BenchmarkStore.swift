@@ -8,6 +8,14 @@ public actor BenchmarkStore {
     public static let maxRecordsPerCity = 4_000
     public static let maxTotalBytes = 10 * 1024 * 1024
     public static let metNorwayIssueInterval: TimeInterval = 3 * 3600
+    /// Fix 4: record MET samples only when cache fetchedAt is this fresh (derived; no new hour literal).
+    public static var metNorwaySampleMaxAge: TimeInterval { metNorwayIssueInterval }
+    /// One day in seconds (named so Form4 expiry / negative-cache literals stay readable).
+    public static let secondsPerDay: TimeInterval = 86_400
+    /// Fix 4: drop pending whose valid is older than this without an observation.
+    public static let metPendingExpiry: TimeInterval = 2 * secondsPerDay
+    /// Fix 4: hard cap on met-pending.jsonl rows (oldest first).
+    public static let metPendingCap = 10_000
 
     public struct Meta: Codable, Sendable {
         var station: MetarStationPick?
@@ -18,13 +26,17 @@ public actor BenchmarkStore {
         /// Review fix: negative / failure cache for the AWC station search.
         var noStationUntil: Date?
         var lastDailyIssue: Date?
+        /// Fix 3: 24 h negative cache after a failed US NWS stations seed.
+        var noUSStationSeedUntil: Date?
         init(station: MetarStationPick? = nil, lastMetNorwayFetch: Date? = nil, lastMetarBatch: Date? = nil,
              lastSummaryAt: Date? = nil, cityElevationM: Double? = nil,
-             noStationUntil: Date? = nil, lastDailyIssue: Date? = nil) {
+             noStationUntil: Date? = nil, lastDailyIssue: Date? = nil,
+             noUSStationSeedUntil: Date? = nil) {
             self.station = station; self.lastMetNorwayFetch = lastMetNorwayFetch
             self.lastMetarBatch = lastMetarBatch; self.lastSummaryAt = lastSummaryAt
             self.cityElevationM = cityElevationM
             self.noStationUntil = noStationUntil; self.lastDailyIssue = lastDailyIssue
+            self.noUSStationSeedUntil = noUSStationSeedUntil
         }
     }
 
@@ -54,6 +66,8 @@ public actor BenchmarkStore {
     private var summaries: [String: BenchmarkSummary] = [:]
     /// Hourly Skyline/NWS/Best Match/MET Norway temps recorded for benchmark MAE (isolated).
     private var hourlyBench: [BenchmarkHourlyPair] = []
+    /// Fix 4: MET Norway forecasts awaiting observations (additive file).
+    private var metPending: [MetPendingSample] = []
     /// Compact training rows (Accuracy PR 2). Cap 200/city×target, 180 d, 2 MB hard ceiling.
     private var training: [TrainingRow] = []
     private var lastTrainingPruneAt: Date?
@@ -205,16 +219,100 @@ public actor BenchmarkStore {
     /// Clears every benchmark / correction / training file (B15).
     public func reset() {
         assertOffMain()
-        metars = []; dailyIssues = []; dailyObs = []; hourlyBench = []
+        metars = []; dailyIssues = []; dailyObs = []; hourlyBench = []; metPending = []
         training = []; metarVerified = []; metCache = [:]; summaries = [:]
         meta = [:]; global = GlobalMeta()
         correctionsFile = CorrectionsFile(); correctionsLoaded = true; loaded = true
         lastPruneAt = nil; lastTrainingPruneAt = nil; bytesWrittenSeam = 0
         let names = ["metars.jsonl", "daily-issues.jsonl", "daily-obs.jsonl", "hourly.jsonl",
                      "met-cache.json", "meta.json", "global.json", "summaries.json",
-                     "training.jsonl", "corrections.json", "metar-verified.jsonl"]
+                     "training.jsonl", "corrections.json", "metar-verified.jsonl", "met-pending.jsonl"]
         for name in names {
             try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+        }
+    }
+
+    // MARK: Fix 3 — US station seed helpers
+
+    public func shouldSkipUSStationSeed(key: String, now: Date) -> Bool {
+        load()
+        if let until = meta[key]?.noUSStationSeedUntil, now < until { return true }
+        return false
+    }
+
+    public func noteUSStationSeedFailure(key: String, until: Date) {
+        load()
+        meta[key, default: Meta()].noUSStationSeedUntil = until
+        saveMeta()
+    }
+
+    // MARK: Fix 4 — MET Norway pending
+
+    public func metNorwayFetchedAt(for key: String) -> Date? {
+        load()
+        return metCache[key]?.fetchedAt
+    }
+
+    /// Append MET pending samples for future valid hours (dedupe loc/issued/valid). Freshness gated.
+    public func recordMetPending(key: String, issued: Date, hours: [MetNorwayHour], fetchedAt: Date?) {
+        load()
+        assertOffMain()
+        guard let fetchedAt, issued.timeIntervalSince(fetchedAt) <= Self.metNorwaySampleMaxAge,
+              issued.timeIntervalSince(fetchedAt) >= 0 else { return }
+        let leads = ForecastSampler.metNorwayLeadValues(location: key, issued: issued, hours: hours)
+        struct K: Hashable { var loc: String; var issued: Date; var valid: Date }
+        var seen = Set(metPending.map { K(loc: $0.loc, issued: $0.issued, valid: $0.valid) })
+        var fresh: [MetPendingSample] = []
+        for (valid, t) in leads where valid > issued {
+            let k = K(loc: key, issued: issued, valid: valid)
+            guard seen.insert(k).inserted else { continue }
+            fresh.append(MetPendingSample(loc: key, issued: issued, valid: valid, forecastC: t))
+        }
+        guard !fresh.isEmpty else { return }
+        metPending.append(contentsOf: fresh)
+        append(fresh, to: "met-pending.jsonl")
+        pruneMetPendingIfNeeded(rewrite: false)
+    }
+
+    /// Score due MET pending against observations; remove scored/expired samples.
+    public func scoreMetPending(key: String, observations obs: [StationObservation],
+                                now: Date) -> [BenchmarkHourlyPair] {
+        load()
+        assertOffMain()
+        var pairs: [BenchmarkHourlyPair] = []
+        var keep: [MetPendingSample] = []
+        var removed = false
+        let dueCutoff = now.addingTimeInterval(-20 * 60)
+        let expiryCutoff = now.addingTimeInterval(-Self.metPendingExpiry)
+        for s in metPending {
+            guard s.loc == key else { keep.append(s); continue }
+            if s.valid <= expiryCutoff { removed = true; continue }
+            if s.valid <= dueCutoff, let o = ObservationAggregator.observe(obs, validTime: s.valid),
+               let ot = o.t {
+                pairs.append(BenchmarkHourlyPair(loc: s.loc, issued: s.issued, valid: s.valid,
+                                                 kind: .metNorway, forecastC: s.forecastC, observedC: ot))
+                removed = true
+                continue
+            }
+            keep.append(s)
+        }
+        if removed {
+            metPending = keep
+            writeAll(metPending, to: "met-pending.jsonl")
+        }
+        return pairs
+    }
+
+    private func pruneMetPendingIfNeeded(rewrite: Bool) {
+        let expiryCutoff = now().addingTimeInterval(-Self.metPendingExpiry)
+        let before = metPending.count
+        metPending = metPending.filter { $0.valid > expiryCutoff }
+        if metPending.count > Self.metPendingCap {
+            metPending.sort { $0.valid < $1.valid }
+            metPending.removeFirst(metPending.count - Self.metPendingCap)
+        }
+        if rewrite || metPending.count != before {
+            writeAll(metPending, to: "met-pending.jsonl")
         }
     }
 
@@ -657,6 +755,7 @@ public actor BenchmarkStore {
         dailyObs = capped(dailyObs.filter { $0.localDay >= cutoff }, perCity: \.loc, time: \.localDay)
         hourlyBench = capped(hourlyBench.filter { $0.valid >= cutoff }, perCity: \.loc, time: \.valid)
         metarVerified = capped(metarVerified.filter { $0.r.valid >= cutoff }, perCity: { $0.r.loc }, time: { $0.r.valid })
+        pruneMetPendingIfNeeded(rewrite: true)
         writeAll(metars, to: "metars.jsonl")
         writeAll(dailyIssues, to: "daily-issues.jsonl")
         writeAll(dailyObs, to: "daily-obs.jsonl")
@@ -720,6 +819,7 @@ public actor BenchmarkStore {
         dailyIssues = readAll(DailyForecastIssue.self, from: "daily-issues.jsonl")
         dailyObs = readAll(DailyObservedExtremes.self, from: "daily-obs.jsonl")
         hourlyBench = readAll(BenchmarkHourlyPair.self, from: "hourly.jsonl")
+        metPending = readAll(MetPendingSample.self, from: "met-pending.jsonl")
         training = dedupeTraining(readAll(TrainingRow.self, from: "training.jsonl"))
         metarVerified = dedupeMetarVerified(readAll(VerifiedRecord.self, from: "metar-verified.jsonl"))
         if let data = try? Data(contentsOf: directory.appendingPathComponent("meta.json")),
@@ -833,6 +933,18 @@ public actor BenchmarkStore {
         if let d = try? Self.encoder.encode(summaries) {
             try? d.write(to: directory.appendingPathComponent("summaries.json"), options: .atomic)
         }
+    }
+}
+
+/// Fix 4: one MET Norway forecast hour awaiting an observation.
+public struct MetPendingSample: Codable, Hashable, Sendable {
+    public var loc: String
+    public var issued: Date
+    public var valid: Date
+    public var forecastC: Double
+
+    public init(loc: String, issued: Date, valid: Date, forecastC: Double) {
+        self.loc = loc; self.issued = issued; self.valid = valid; self.forecastC = forecastC
     }
 }
 

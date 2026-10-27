@@ -154,6 +154,15 @@ public struct OpenMeteoResponse: Codable, Sendable {
             && a.daily?["time"] == b.daily?["time"]
     }
 
+    /// Content-only pair check (Form4b): timezone, utc offset, and hourly/daily `time` axes.
+    /// No storedAt slack and no lat/lon (A and B may snap to different grids; location is keyA/keyB).
+    public static func pairContentConsistent(_ a: OpenMeteoResponse, _ b: OpenMeteoResponse) -> Bool {
+        a.timezone == b.timezone
+            && a.utcOffsetSeconds == b.utcOffsetSeconds
+            && a.hourly?["time"] == b.hourly?["time"]
+            && a.daily?["time"] == b.daily?["time"]
+    }
+
     /// Merge A+B into one response. lat/lon/elevation/timezone/utc_offset from A; `current`,
     /// `minutely_15`, and the 7 bare B columns from B (CR M2).
     public static func mergePair(a: OpenMeteoResponse, b: OpenMeteoResponse) -> OpenMeteoResponse {

@@ -101,8 +101,9 @@ struct AccuracyPanel: View {
                             switchOn: SkylineAccuracyCorrection.isEnabled(),
                             nDays: s.nDays,
                             units: { units.temperatureDelta($0) },
-                            qaOverride: qaActive),
-                        appliedC: s.appliedC, nDays: s.nDays, gated: s.gated,
+                            qaOverride: qaActive,
+                            target: s.target, nPairs: s.nPairs),
+                        appliedC: s.appliedC, nDays: s.nDays, nPairs: s.nPairs, gated: s.gated,
                         autoOff: s.autoOff, sitingOK: s.sitingOK)
                     return copy
                 }
@@ -176,8 +177,10 @@ struct AccuracyPanel: View {
                         Text("Station: \(b.stationName ?? id) (\(id))\(dist)")
                             .font(.caption).foregroundStyle(Glass.secondaryText)
                     }
-                    Text(b.metNorwayAttribution)
-                        .font(.caption2).foregroundStyle(Glass.secondaryText)
+                    if BenchmarkScorer.showsMetNorwayRow(b) {
+                        Text(b.metNorwayAttribution)
+                            .font(.caption2).foregroundStyle(Glass.secondaryText)
+                    }
                 }
             }
             .padding(12)
@@ -211,7 +214,10 @@ struct AccuracyPanel: View {
                 // Hourly temp MAE only — never fall back to daily highMAE here.
                 guard let mae = row.tempMAE, row.n >= 20 else { continue }
                 if row.kind == .metNorway {
-                    out.append(BenchRow(title: "MET Norway", value: "±" + AccuracyFormat.delta(mae, units)))
+                    if BenchmarkScorer.showsMetNorwayRow(b) {
+                        out.append(BenchRow(title: "MET Norway", value: "±" + AccuracyFormat.delta(mae, units)))
+                    }
+                    continue
                 }
                 if row.kind == .skyline, report?.overall[.blend] == nil {
                     out.append(BenchRow(title: "Skyline", value: "±" + AccuracyFormat.delta(mae, units)))

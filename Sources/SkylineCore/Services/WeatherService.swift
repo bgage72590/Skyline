@@ -11,8 +11,12 @@ public actor WeatherService {
     public enum TTL {
         public static let forecast: TimeInterval = 10 * 60
         /// Background cities (not viewed / menu-bar / notify): longer OM + AQ cache. Single constant
-        /// for AQ background TTL, background stale (+15 min), RefreshPlanner, tests and QA (§4.2 D1).
-        public static let background: TimeInterval = 2 * 3600
+        /// for AQ background TTL, background stale (+15 min), RefreshPlanner, tests and QA (Decision 2: 3 h).
+        public static let background: TimeInterval = 10_800
+        /// Decision 2 L: while cached multi-model A is younger than this, background refreshes send B only.
+        public static let blendMaxAge: TimeInterval = 43_200
+        /// Decision 2 N: while the window is hidden, notify cities reuse the OM pair up to this age.
+        public static let notifyReuseHidden: TimeInterval = 1_800
         public static let nwsForecast: TimeInterval = 15 * 60
         public static let alerts: TimeInterval = 5 * 60
         public static let nwsPoint: TimeInterval = 7 * 24 * 3600
@@ -31,6 +35,26 @@ public actor WeatherService {
         public static let hrrrRun: TimeInterval = 10 * 60
         /// Storm-attribute GeoJSON (~2 min poll while radar is visible).
         public static let stormAttr: TimeInterval = 2 * 60
+
+        /// Inert QA override: `-SkylineQABackgroundTTLMinutes <N>`. Launch-arg only (never written to
+        /// defaults). Invalid / ≤0 → `background`. Without the arg, byte-identical to `background`.
+        public enum QABackgroundTTLMinutes {
+            public static let argument = "-SkylineQABackgroundTTLMinutes"
+            public static func minutes(arguments: [String] = ProcessInfo.processInfo.arguments) -> Int? {
+                guard let i = arguments.lastIndex(of: argument), arguments.indices.contains(i + 1) else { return nil }
+                let raw = arguments[i + 1].trimmingCharacters(in: .whitespaces)
+                guard let n = Int(raw), n > 0 else { return nil }
+                return n
+            }
+        }
+
+        /// Effective background TTL used at runtime. Override is `N * 60` seconds when the QA arg is set.
+        public static func effectiveBackground(arguments: [String] = ProcessInfo.processInfo.arguments) -> TimeInterval {
+            if let n = QABackgroundTTLMinutes.minutes(arguments: arguments) {
+                return TimeInterval(n) * 60
+            }
+            return background
+        }
     }
 
     /// The oldest cached copy that may stand in when the network fails ("offline fallback").
@@ -54,12 +78,16 @@ public actor WeatherService {
     /// Merged Open-Meteo A+B pair (CR M1).
     struct OpenMeteoPairResult: Sendable {
         var response: OpenMeteoResponse
-        /// Older of the two halves' storedAt (pair age / dataAsOf / forecastAsOf).
+        /// Pair age / dataAsOf / forecastAsOf. For a B-only refresh this is B's storedAt (Decision 2).
         var storedAt: Date
         var isFallback: Bool
         var cause: FallbackCause?
         var halfA: Fetched
         var halfB: Fetched
+        /// Decision 2 L: B refreshed while A was reused (no issuance / accuracy sample).
+        var isBOnly: Bool = false
+        /// Decision 2 L fallback: A refetch failed; display is single-model B only.
+        var isSingleModelB: Bool = false
     }
 
     /// Pause before the one immediate re-try of a GET that died in flight (`FallbackCause.retriesOnce`).
@@ -122,7 +150,10 @@ public actor WeatherService {
     public func report(for location: WeatherLocation, forceRefresh: Bool = false,
                        priority: FetchPriority = .background,
                        allowNetwork: Bool? = nil,
-                       role: RefreshPlanner.Role? = nil) async throws -> WeatherReport {
+                       role: RefreshPlanner.Role? = nil,
+                       windowVisible: Bool = true,
+                       isNotifyCity: Bool = false,
+                       lightBackground: Bool? = nil) async throws -> WeatherReport {
         // The coordinate is part of the key: My Location keeps its id while it moves, and a second fix
         // during a slow load must not get the old place's report (QA #13).
         let netTag: String = {
@@ -133,12 +164,22 @@ public actor WeatherService {
             }
         }()
         let roleTag = role == .background ? "+bg" : ""
+        let reuseTag = (!windowVisible && isNotifyCity) ? "+nr" : ""
+        let lightTag: String = {
+            switch lightBackground {
+            case .some(true): return "+L"
+            case .some(false): return "+AB"
+            case .none: return ""
+            }
+        }()
         let key = location.id + "@\(location.coordinate.latitude),\(location.coordinate.longitude)"
-            + (forceRefresh ? "!" : "") + netTag + roleTag
+            + (forceRefresh ? "!" : "") + netTag + roleTag + reuseTag + lightTag
         if let existing = inFlight[key] { return try await existing.value }
         let task = Task {
             try await self.buildReport(for: location, forceRefresh: forceRefresh, priority: priority,
-                                       allowNetwork: allowNetwork, role: role)
+                                       allowNetwork: allowNetwork, role: role,
+                                       windowVisible: windowVisible, isNotifyCity: isNotifyCity,
+                                       lightBackground: lightBackground)
         }
         inFlight[key] = task
         defer { inFlight[key] = nil }
@@ -274,6 +315,7 @@ public actor WeatherService {
         let until = OpenMeteoQuota.until(after: t, jitter: jitter)
         dailyLimitUntil[h] = until
         nextProbeAt[h] = OpenMeteoQuota.nextProbeAt(lastProbeAt: t)
+        SkylineLog.quotaDailyLimit(host: h, until: until)
         guard persistQuotaMarker else { return }
         let marker = OpenMeteoQuota.Marker(until: until, lastProbeAt: t, jitter: jitter)
         if let data = try? OpenMeteoQuota.encode(marker) {
@@ -327,20 +369,32 @@ public actor WeatherService {
     private func buildReport(for location: WeatherLocation, forceRefresh force: Bool,
                              priority: FetchPriority = .background,
                              allowNetwork: Bool? = nil,
-                             role: RefreshPlanner.Role? = nil) async throws -> WeatherReport {
+                             role: RefreshPlanner.Role? = nil,
+                             windowVisible: Bool = true,
+                             isNotifyCity: Bool = false,
+                             lightBackground lightOverride: Bool? = nil) async throws -> WeatherReport {
         // "My Location" goes out at ~1 km (the store already coarsens the fix; this is defense in depth).
         let coord = location.isCurrentLocation ? location.coordinate.coarse : location.coordinate.rounded
         // US-only sources (HRRR, NWS) follow the border outlines and the saved city's country (QA 4).
         let models = ForecastModel.models(inCONUS: location.isInCONUS)
-        let omTTL = (role == .background) ? TTL.background : TTL.forecast
-        let aqTTL = (role == .background) ? TTL.background : TTL.airQuality
+        let backgroundTTL = TTL.effectiveBackground()
+        // Decision 2 N: hidden notify cities reuse OM up to notifyReuseHidden; alerts keep 5-min TTL.
+        let omTTL: TimeInterval = {
+            if role == .background { return backgroundTTL }
+            if !windowVisible, isNotifyCity { return TTL.notifyReuseHidden }
+            return TTL.forecast
+        }()
+        let aqTTL = (role == .background) ? backgroundTTL : TTL.airQuality
         let omPriority = force ? FetchPriority.interactive : priority
+        // Decision 2 L: background (non-force) may send B-only while A < blendMaxAge.
+        // Issuance-due background loads pass lightOverride = false so A+B runs and can record.
+        let lightBackground = lightOverride ?? (role == .background && !force)
 
         async let omPairFetch: Result<OpenMeteoPairResult, Error> = {
             do {
                 return .success(try await fetchOpenMeteoPair(
                     coord, models: models, ttl: omTTL, force: force, maxStale: MaxStale.forecast,
-                    priority: omPriority, allowNetwork: allowNetwork))
+                    priority: omPriority, allowNetwork: allowNetwork, lightBackground: lightBackground))
             } catch {
                 return .failure(error)
             }
@@ -438,10 +492,11 @@ public actor WeatherService {
         }
 
         // Accuracy guard (§4.5): issuance only when neither half is fallback and pair age ≤ TTL.forecast.
+        // Decision 2 L: a B-only refresh records no issuance and no accuracy sample.
         // runMeasurement always when OM exists; empty series when not fresh. verifyIfDue ungated.
         let pairAge = now().timeIntervalSince(pair.storedAt)
         let halvesFresh = !pair.halfA.isFallback && !pair.halfB.isFallback
-        let issuanceOK = halvesFresh && pairAge <= TTL.forecast
+        let issuanceOK = halvesFresh && pairAge <= TTL.forecast && !pair.isBOnly && !pair.isSingleModelB
         let measureFresh = issuanceOK
         if let verifier {
             let issued = issuedNow
@@ -537,9 +592,10 @@ public actor WeatherService {
     // MARK: Open-Meteo A+B pair (CR M1)
 
     /// Fetches (or reads) the A+B forecast pair as one unit inside a single Open-Meteo turn.
+    /// Decision 2 L: when `lightBackground` and cached A age < blendMaxAge, only B is fetched.
     func fetchOpenMeteoPair(_ coord: Coordinate, models: [ForecastModel], ttl: TimeInterval,
                             force: Bool, maxStale: TimeInterval, priority: FetchPriority,
-                            allowNetwork: Bool?) async throws -> OpenMeteoPairResult {
+                            allowNetwork: Bool?, lightBackground: Bool = false) async throws -> OpenMeteoPairResult {
         let urlA = Endpoints.openMeteoForecastA(coord, models: models)
         let urlB = Endpoints.openMeteoForecastB(coord)
         let keyA = urlA.absoluteString
@@ -558,9 +614,9 @@ public actor WeatherService {
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
                 let age = now().timeIntervalSince(cached.storedAt)
                 if age >= ttl {
-                    return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                               isFallback: true, cause: isDailyLimited(host: host) ? .dailyLimit : .unreachable,
-                                               halfA: cached.halfA, halfB: cached.halfB)
+                    return asFallbackPair(cached,
+                                               cause: isDailyLimited(host: host) ? .dailyLimit : .unreachable,
+                                               markHalves: false)
                 }
                 return cached
             }
@@ -571,10 +627,7 @@ public actor WeatherService {
         // Daily-limited: prefer stale pair; probe only when due / forced / allowNetwork.
         if isDailyLimited(host: host), !mayProbeDailyLimit(host: host, force: force, allowNetwork: allowNetwork) {
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .dailyLimit,
-                                           halfA: fallbackHalf(cached.halfA, .dailyLimit),
-                                           halfB: fallbackHalf(cached.halfB, .dailyLimit))
+                return asFallbackPair(cached, cause: .dailyLimit)
             }
             throw HTTPError.dailyLimit(host: host)
         }
@@ -583,17 +636,14 @@ public actor WeatherService {
         var waits = force
         if !force, let until = backoffUntil[host], until > now() {
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .busy,
-                                           halfA: fallbackHalf(cached.halfA, .busy),
-                                           halfB: fallbackHalf(cached.halfB, .busy))
+                return asFallbackPair(cached, cause: .busy)
             }
             guard priority == .interactive else { throw HTTPError.backingOff(host: host, until: until) }
             waits = true
         }
         if waits { try await prepareForceFetch(host) }
 
-        let pairKey = "om-pair:" + keyA
+        let pairKey = "om-pair:" + keyA + (lightBackground ? "+L" : "")
         // Same coordinate already fetching: join (add + sync under another id).
         if !force, let shared = inFlightPairGets[pairKey] {
             joinedGets += 1
@@ -607,7 +657,8 @@ public actor WeatherService {
                                                    key: pairKey) {
                     try await self.loadOpenMeteoPairNetwork(urlA: urlA, urlB: urlB, keyA: keyA, keyB: keyB,
                                                             host: host, force: force, maxStale: maxStale,
-                                                            allowNetwork: allowNetwork)
+                                                            allowNetwork: allowNetwork,
+                                                            lightBackground: lightBackground)
                 }
             } catch let error as HTTPError {
                 guard waits, case .backingOff = error else { throw error }
@@ -615,7 +666,8 @@ public actor WeatherService {
                 return try await withOpenMeteoTurn(host, priority: priority, key: pairKey) {
                     try await self.loadOpenMeteoPairNetwork(urlA: urlA, urlB: urlB, keyA: keyA, keyB: keyB,
                                                             host: host, force: force, maxStale: maxStale,
-                                                            allowNetwork: allowNetwork)
+                                                            allowNetwork: allowNetwork,
+                                                            lightBackground: lightBackground)
                 }
             }
         }
@@ -631,79 +683,137 @@ public actor WeatherService {
     /// Network half of the pair fetch; caller holds the Open-Meteo turn.
     private func loadOpenMeteoPairNetwork(urlA: URL, urlB: URL, keyA: String, keyB: String,
                                           host: String, force: Bool, maxStale: TimeInterval,
-                                          allowNetwork: Bool?) async throws -> OpenMeteoPairResult {
+                                          allowNetwork: Bool?,
+                                          lightBackground: Bool = false) async throws -> OpenMeteoPairResult {
         if isDailyLimited(host: host), !mayProbeDailyLimit(host: host, force: force, allowNetwork: allowNetwork) {
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .dailyLimit,
-                                           halfA: fallbackHalf(cached.halfA, .dailyLimit),
-                                           halfB: fallbackHalf(cached.halfB, .dailyLimit))
+                return asFallbackPair(cached, cause: .dailyLimit)
             }
             throw HTTPError.dailyLimit(host: host)
         }
         if let until = backoffUntil[host], until > now() {
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .busy,
-                                           halfA: fallbackHalf(cached.halfA, .busy),
-                                           halfB: fallbackHalf(cached.halfB, .busy))
+                return asFallbackPair(cached, cause: .busy)
             }
             throw HTTPError.backingOff(host: host, until: until)
         }
 
         let wasLimited = isDailyLimited(host: host)
-        let dataA: Data
-        do {
-            dataA = try await rawGet(urlA)
-        } catch HTTPError.dailyLimit(let h) {
-            await noteDailyLimit(host: h)
-            if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .dailyLimit,
-                                           halfA: fallbackHalf(cached.halfA, .dailyLimit),
-                                           halfB: fallbackHalf(cached.halfB, .dailyLimit))
+
+        // Decision 2 L: B-only while cached A is younger than blendMaxAge.
+        if lightBackground,
+           let cachedA = await cache.entry(keyA, maxAge: TTL.blendMaxAge),
+           now().timeIntervalSince(cachedA.storedAt) < TTL.blendMaxAge,
+           let decodedA = try? OpenMeteoResponse.decode(cachedA.data) {
+            if let bOnly = try await loadBOnly(cachedA: cachedA, decodedA: decodedA, urlB: urlB, keyB: keyB,
+                                               keyA: keyA, host: host, wasLimited: wasLimited, maxStale: maxStale) {
+                return bOnly
             }
-            throw HTTPError.dailyLimit(host: h)
-        } catch {
-            if case HTTPError.throttled(_, _, let retryAfter) = error {
-                noteThrottled(host, retryAfter: retryAfter)
-            }
-            if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: FallbackCause(error),
-                                           halfA: fallbackHalf(cached.halfA, FallbackCause(error)),
-                                           halfB: fallbackHalf(cached.halfB, FallbackCause(error)))
-            }
-            throw error
+            // Content mismatch → fall through to full A+B.
         }
 
-        // A succeeded — only then fetch B. Do not cache A until B is also 2xx.
+        // Decision 2 L (blendMaxAge path): fetch B before A so a later A 429 can show single-model B
+        // without a second GET. Never call fetchSingleModelB after noteDailyLimit / noteThrottled.
+        if lightBackground {
+            return try await loadFullPairBFirst(urlA: urlA, urlB: urlB, keyA: keyA, keyB: keyB,
+                                                host: host, wasLimited: wasLimited, maxStale: maxStale)
+        }
+
+        // Interactive / force: A then B (unchanged PR #20 order).
+        return try await loadFullPairAThenB(urlA: urlA, urlB: urlB, keyA: keyA, keyB: keyB,
+                                            host: host, wasLimited: wasLimited, maxStale: maxStale)
+    }
+
+    /// Background ≥ blendMaxAge: B first, then A. A quota failure → single-model B already in hand.
+    private func loadFullPairBFirst(urlA: URL, urlB: URL, keyA: String, keyB: String,
+                                    host: String, wasLimited: Bool,
+                                    maxStale: TimeInterval) async throws -> OpenMeteoPairResult {
         let dataB: Data
         do {
             dataB = try await rawGet(urlB)
         } catch HTTPError.dailyLimit(let h) {
             await noteDailyLimit(host: h)
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .dailyLimit,
-                                           halfA: fallbackHalf(cached.halfA, .dailyLimit),
-                                           halfB: fallbackHalf(cached.halfB, .dailyLimit))
+                return asFallbackPair(cached, cause: .dailyLimit)
             }
             throw HTTPError.dailyLimit(host: h)
         } catch {
             if case HTTPError.throttled(_, _, let retryAfter) = error {
                 noteThrottled(host, retryAfter: retryAfter)
             }
-            // Discard fresh A (do not cache). Fall back to cached pair if consistent.
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: FallbackCause(error),
-                                           halfA: fallbackHalf(cached.halfA, FallbackCause(error)),
-                                           halfB: fallbackHalf(cached.halfB, FallbackCause(error)))
+                return asFallbackPair(cached, cause: FallbackCause(error))
             }
             throw error
         }
 
+        let dataA: Data
+        do {
+            dataA = try await rawGet(urlA)
+        } catch HTTPError.dailyLimit(let h) {
+            await noteDailyLimit(host: h)
+            // Already have B — show single-model B; no further GET (never after a 429).
+            return try await singleModelB(from: dataB, keyB: keyB)
+        } catch {
+            if case HTTPError.throttled(_, _, let retryAfter) = error {
+                noteThrottled(host, retryAfter: retryAfter)
+                return try await singleModelB(from: dataB, keyB: keyB)
+            }
+            // Non-quota A failure with B in hand → single-model B (Decision 2 L fallback).
+            return try await singleModelB(from: dataB, keyB: keyB)
+        }
+        return try await finishPair(dataA: dataA, dataB: dataB, keyA: keyA, keyB: keyB,
+                                    host: host, wasLimited: wasLimited, maxStale: maxStale)
+    }
+
+    /// Interactive A-then-B pair. Quota errors fall back to the cached pair only (no post-429 B GET).
+    private func loadFullPairAThenB(urlA: URL, urlB: URL, keyA: String, keyB: String,
+                                    host: String, wasLimited: Bool,
+                                    maxStale: TimeInterval) async throws -> OpenMeteoPairResult {
+        let dataA: Data
+        do {
+            dataA = try await rawGet(urlA)
+        } catch HTTPError.dailyLimit(let h) {
+            await noteDailyLimit(host: h)
+            if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                return asFallbackPair(cached, cause: .dailyLimit)
+            }
+            throw HTTPError.dailyLimit(host: h)
+        } catch {
+            if case HTTPError.throttled(_, _, let retryAfter) = error {
+                noteThrottled(host, retryAfter: retryAfter)
+            }
+            if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                return asFallbackPair(cached, cause: FallbackCause(error))
+            }
+            throw error
+        }
+
+        let dataB: Data
+        do {
+            dataB = try await rawGet(urlB)
+        } catch HTTPError.dailyLimit(let h) {
+            await noteDailyLimit(host: h)
+            if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                return asFallbackPair(cached, cause: .dailyLimit)
+            }
+            throw HTTPError.dailyLimit(host: h)
+        } catch {
+            if case HTTPError.throttled(_, _, let retryAfter) = error {
+                noteThrottled(host, retryAfter: retryAfter)
+            }
+            if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                return asFallbackPair(cached, cause: FallbackCause(error))
+            }
+            throw error
+        }
+        return try await finishPair(dataA: dataA, dataB: dataB, keyA: keyA, keyB: keyB,
+                                    host: host, wasLimited: wasLimited, maxStale: maxStale)
+    }
+
+    private func finishPair(dataA: Data, dataB: Data, keyA: String, keyB: String,
+                            host: String, wasLimited: Bool,
+                            maxStale: TimeInterval) async throws -> OpenMeteoPairResult {
         let stored = now()
         // M1: both halves must decode and agree (time axes / tz / offset) before either is cached;
         // a fetch straddling local midnight is a pair miss, never a skewed merge or accuracy sample.
@@ -711,10 +821,7 @@ public actor WeatherService {
               let decodedB = try? OpenMeteoResponse.decode(dataB),
               OpenMeteoResponse.pairConsistent(decodedA, storedAtA: stored, decodedB, storedAtB: stored) else {
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .unreachable,
-                                           halfA: fallbackHalf(cached.halfA, .unreachable),
-                                           halfB: fallbackHalf(cached.halfB, .unreachable))
+                return asFallbackPair(cached, cause: .unreachable)
             }
             throw HTTPError.invalidResponse
         }
@@ -730,26 +837,110 @@ public actor WeatherService {
                                    halfA: halfA, halfB: halfB)
     }
 
+    /// Decision 2 L: fetch B and merge with cached A. Returns nil on content mismatch (caller does A+B).
+    /// On any B network error: return the cached pair as isFallback (no further GETs).
+    /// Same acceptance rule as `readCachedPair` B-newer path: A age < blendMaxAge + pairContentConsistent.
+    /// Writes only keyB — never writes, re-stamps, deletes or prunes keyA.
+    private func loadBOnly(cachedA: ResponseCache.Entry, decodedA: OpenMeteoResponse,
+                           urlB: URL, keyB: String, keyA: String, host: String, wasLimited: Bool,
+                           maxStale: TimeInterval) async throws -> OpenMeteoPairResult? {
+        do {
+            let dataB = try await rawGet(urlB)
+            let storedB = now()
+            guard now().timeIntervalSince(cachedA.storedAt) < TTL.blendMaxAge,
+                  let decodedB = try? OpenMeteoResponse.decode(dataB),
+                  OpenMeteoResponse.pairContentConsistent(decodedA, decodedB) else {
+                return nil
+            }
+            await cache.store(dataB, for: keyB)
+            if wasLimited { await clearDailyLimit(host: host) }
+            backoffUntil[host] = nil
+            backoffStrikes[host] = nil
+            let halfA = Fetched(data: cachedA.data, storedAt: cachedA.storedAt, isFallback: false)
+            let halfB = Fetched(data: dataB, storedAt: storedB, isFallback: false)
+            let merged = OpenMeteoResponse.mergePair(a: decodedA, b: decodedB)
+            return OpenMeteoPairResult(response: merged, storedAt: storedB, isFallback: false, cause: nil,
+                                       halfA: halfA, halfB: halfB, isBOnly: true)
+        } catch HTTPError.dailyLimit(let h) {
+            await noteDailyLimit(host: h)
+            if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                return asFallbackPair(cached, cause: .dailyLimit)
+            }
+            throw HTTPError.dailyLimit(host: h)
+        } catch {
+            if case HTTPError.throttled(_, _, let retryAfter) = error {
+                noteThrottled(host, retryAfter: retryAfter)
+            }
+            if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
+                return asFallbackPair(cached, cause: FallbackCause(error))
+            }
+            throw error
+        }
+    }
+
+    /// Decision 2 L: build single-model B from bytes already fetched (never GETs; never clears backoff).
+    private func singleModelB(from dataB: Data, keyB: String) async throws -> OpenMeteoPairResult {
+        let stored = now()
+        guard let decodedB = try? OpenMeteoResponse.decode(dataB) else { throw HTTPError.invalidResponse }
+        await cache.store(dataB, for: keyB)
+        let halfB = Fetched(data: dataB, storedAt: stored, isFallback: false)
+        return OpenMeteoPairResult(response: decodedB, storedAt: stored, isFallback: false, cause: nil,
+                                   halfA: halfB, halfB: halfB, isBOnly: true, isSingleModelB: true)
+    }
+
     private func fallbackHalf(_ h: Fetched, _ cause: FallbackCause) -> Fetched {
         Fetched(data: h.data, storedAt: h.storedAt, isFallback: true, cause: cause)
     }
 
-    /// Reads both halves from cache; returns nil when either is missing or pairConsistent fails.
+    /// Wrap a cached pair as fallback while preserving Form4b `isBOnly` / `isSingleModelB`.
+    private func asFallbackPair(_ cached: OpenMeteoPairResult, cause: FallbackCause,
+                                markHalves: Bool = true) -> OpenMeteoPairResult {
+        OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
+                            isFallback: true, cause: cause,
+                            halfA: markHalves ? fallbackHalf(cached.halfA, cause) : cached.halfA,
+                            halfB: markHalves ? fallbackHalf(cached.halfB, cause) : cached.halfB,
+                            isBOnly: cached.isBOnly, isSingleModelB: cached.isSingleModelB)
+    }
+
+    /// Reads both halves from cache.
+    /// Normal pair (|ΔstoredAt| ≤ pairStoredAtSlack): `pairConsistent`, storedAt = min(A,B), isBOnly = false.
+    /// B-newer beyond slack: accepted only when A age < TTL.blendMaxAge and pairContentConsistent;
+    /// returns storedAt = B, isBOnly = true, halfA.storedAt = A's real time.
+    /// B older than A by > slack, A ≥ blendMaxAge, or content mismatch → nil.
     private func readCachedPair(keyA: String, keyB: String, maxAge: TimeInterval) async -> OpenMeteoPairResult? {
         guard let eA = await cache.entry(keyA, maxAge: maxAge),
               let eB = await cache.entry(keyB, maxAge: maxAge),
               let a = try? OpenMeteoResponse.decode(eA.data),
-              let b = try? OpenMeteoResponse.decode(eB.data),
-              OpenMeteoResponse.pairConsistent(a, storedAtA: eA.storedAt, b, storedAtB: eB.storedAt)
+              let b = try? OpenMeteoResponse.decode(eB.data)
         else { return nil }
-        let older = min(eA.storedAt, eB.storedAt)
-        let age = now().timeIntervalSince(older)
-        // Caller decides fallback vs fresh via ttl; here we only assemble.
-        let halfA = Fetched(data: eA.data, storedAt: eA.storedAt, isFallback: false)
-        let halfB = Fetched(data: eB.data, storedAt: eB.storedAt, isFallback: false)
-        _ = age
-        return OpenMeteoPairResult(response: OpenMeteoResponse.mergePair(a: a, b: b), storedAt: older,
-                                   isFallback: false, cause: nil, halfA: halfA, halfB: halfB)
+
+        let slack = OpenMeteoResponse.pairStoredAtSlack
+        let bMinusA = eB.storedAt.timeIntervalSince(eA.storedAt)
+
+        if abs(bMinusA) <= slack {
+            guard OpenMeteoResponse.pairConsistent(a, storedAtA: eA.storedAt, b, storedAtB: eB.storedAt)
+            else { return nil }
+            let older = min(eA.storedAt, eB.storedAt)
+            let halfA = Fetched(data: eA.data, storedAt: eA.storedAt, isFallback: false)
+            let halfB = Fetched(data: eB.data, storedAt: eB.storedAt, isFallback: false)
+            return OpenMeteoPairResult(response: OpenMeteoResponse.mergePair(a: a, b: b), storedAt: older,
+                                       isFallback: false, cause: nil, halfA: halfA, halfB: halfB,
+                                       isBOnly: false)
+        }
+
+        // B-newer beyond slack: Decision 2 L readback after a B-only refresh.
+        if bMinusA > slack {
+            guard now().timeIntervalSince(eA.storedAt) < TTL.blendMaxAge,
+                  OpenMeteoResponse.pairContentConsistent(a, b) else { return nil }
+            let halfA = Fetched(data: eA.data, storedAt: eA.storedAt, isFallback: false)
+            let halfB = Fetched(data: eB.data, storedAt: eB.storedAt, isFallback: false)
+            return OpenMeteoPairResult(response: OpenMeteoResponse.mergePair(a: a, b: b),
+                                       storedAt: eB.storedAt, isFallback: false, cause: nil,
+                                       halfA: halfA, halfB: halfB, isBOnly: true)
+        }
+
+        // B older than A by > slack → reject (unchanged).
+        return nil
     }
 
     /// Direct GET with one transient retry; no cache, no Open-Meteo turn (caller holds the turn).
@@ -1069,7 +1260,9 @@ public actor WeatherService {
         backoffStrikes[host] = strikes + 1
         throttleEpoch[host, default: 0] += 1
         let delay = retryAfter.map { min(max($0, 5), 3600) } ?? min(60 * pow(2, Double(min(strikes, 5))), 1800)
-        backoffUntil[host] = now().addingTimeInterval(delay)
+        let until = now().addingTimeInterval(delay)
+        backoffUntil[host] = until
+        SkylineLog.quotaThrottled(host: host, until: until)
     }
 
     /// When requests to `host` may resume (nil = not backing off). Lets the store time its retry.
