@@ -585,6 +585,8 @@ final class Fix4Tests: XCTestCase {
         XCTAssertTrue(OpenMeteoResponse.pairConsistent(halves.a, storedAtA: tB,
                                                         halves.b, storedAtB: tB),
                       "identical synthetic timestamps → content-only check (B-fresh/A-older allowed)")
+        // Form4b: content-only helper accepts the same halves without storedAt.
+        XCTAssertTrue(OpenMeteoResponse.pairContentConsistent(halves.a, halves.b))
     }
 
     // MARK: Fix 1 helpers (planner-level; store wake catch-up listed unimplemented if not covered)
@@ -598,5 +600,422 @@ final class Fix4Tests: XCTestCase {
         XCTAssertFalse(RefreshPlanner.stillDue(id: "a", pairAge: 10_800, role: .background,
                                                wantsIssuance: false, windowVisible: false, dailyLimited: true),
                        "daily-limited background never dequeues")
+    }
+
+    // MARK: Form4b — B-newer cached-pair readback (plan-fix4b)
+
+    /// B is always `bGap` newer than A; then advance so A's age is `aAge`.
+    private func seedBNewerPair(cache: ResponseCache, clock: TestClock, location: WeatherLocation,
+                                aAge: TimeInterval,
+                                bGap: TimeInterval = 3 * 3600,
+                                mutateB: ((inout OpenMeteoResponse) -> Void)? = nil) async throws -> (urlA: String, urlB: String, tA: Date, tB: Date) {
+        let coord = location.coordinate.rounded
+        let models = ForecastModel.models(inCONUS: location.isInCONUS)
+        let urlA = Endpoints.openMeteoForecastA(coord, models: models).absoluteString
+        let urlB = Endpoints.openMeteoForecastB(coord).absoluteString
+        let fixture = location.isInCONUS ? "om_nyc" : "om_paris"
+        let halves = try OpenMeteoResponse.decode(Fixture.data(fixture)).splitPairHalves()
+        var bHalf = halves.b
+        mutateB?(&bHalf)
+        let tA = Date(timeIntervalSince1970: 1_700_000_000)
+        clock.now = tA
+        await cache.store(try OpenMeteoResponse.encode(halves.a), for: urlA)
+        let tB = tA.addingTimeInterval(bGap)
+        clock.now = tB
+        await cache.store(try OpenMeteoResponse.encode(bHalf), for: urlB)
+        clock.now = tA.addingTimeInterval(aAge)
+        return (urlA, urlB, tA, tB)
+    }
+
+    // (a)
+    func testBNewerPairAcceptedAt43199() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        let seeded = try await seedBNewerPair(cache: cache, clock: clock, location: nyc,
+                                              aAge: WeatherService.TTL.blendMaxAge - 1)
+        let svc = WeatherService(client: MockHTTPClient(), cache: cache, now: { clock.now })
+        let pair = try await svc.fetchOpenMeteoPair(nyc.coordinate.rounded,
+                                                    models: ForecastModel.models(inCONUS: true),
+                                                    ttl: WeatherService.TTL.background, force: false,
+                                                    maxStale: WeatherService.MaxStale.forecast,
+                                                    priority: .background, allowNetwork: false,
+                                                    lightBackground: true)
+        XCTAssertTrue(pair.isBOnly)
+        XCTAssertEqual(pair.storedAt, seeded.tB)
+        XCTAssertEqual(pair.halfA.storedAt, seeded.tA)
+        // B age ≫ ttl on allowNetwork:false → isFallback (lock #5).
+        XCTAssertTrue(pair.isFallback)
+    }
+
+    func testBNewerPairRejectedAt43200() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        _ = try await seedBNewerPair(cache: cache, clock: clock, location: nyc,
+                                     aAge: WeatherService.TTL.blendMaxAge)
+        let svc = WeatherService(client: MockHTTPClient(), cache: cache, now: { clock.now })
+        do {
+            _ = try await svc.fetchOpenMeteoPair(nyc.coordinate.rounded,
+                                                 models: ForecastModel.models(inCONUS: true),
+                                                 ttl: WeatherService.TTL.background, force: false,
+                                                 maxStale: WeatherService.MaxStale.forecast,
+                                                 priority: .background, allowNetwork: false,
+                                                 lightBackground: true)
+            XCTFail("A age == blendMaxAge must reject B-newer cache read")
+        } catch {
+            // expected: nil cache → throw on cache-only
+        }
+    }
+
+    func testBNewerPairRejectedAt43201() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        _ = try await seedBNewerPair(cache: cache, clock: clock, location: nyc,
+                                     aAge: WeatherService.TTL.blendMaxAge + 1)
+        let svc = WeatherService(client: MockHTTPClient(), cache: cache, now: { clock.now })
+        do {
+            _ = try await svc.fetchOpenMeteoPair(nyc.coordinate.rounded,
+                                                 models: ForecastModel.models(inCONUS: true),
+                                                 ttl: WeatherService.TTL.background, force: false,
+                                                 maxStale: WeatherService.MaxStale.forecast,
+                                                 priority: .background, allowNetwork: false,
+                                                 lightBackground: true)
+            XCTFail("A age > blendMaxAge must reject B-newer cache read")
+        } catch {
+            // expected
+        }
+    }
+
+    // (b) + L1
+    func testRelaunchAfterBOnlyRefreshNoNetwork() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        let seeder = WeatherService(client: MockHTTPClient(), cache: cache, now: { clock.now })
+        _ = try await seeder.report(for: nyc)
+        let coord = nyc.coordinate.rounded
+        let models = ForecastModel.models(inCONUS: true)
+        let urlA = Endpoints.openMeteoForecastA(coord, models: models).absoluteString
+        let aBefore = await cache.entry(urlA, maxAge: .infinity)!
+        let aBytesBefore = aBefore.data
+        let aStoredBefore = aBefore.storedAt
+
+        clock.now = aStoredBefore.addingTimeInterval(WeatherService.TTL.background + 60)
+        let live = WeatherService(client: MockHTTPClient(), cache: cache, now: { clock.now })
+        let bOnly = try await live.fetchOpenMeteoPair(coord, models: models,
+                                                      ttl: 1, force: false,
+                                                      maxStale: WeatherService.MaxStale.forecast,
+                                                      priority: .background, allowNetwork: true,
+                                                      lightBackground: true)
+        XCTAssertTrue(bOnly.isBOnly)
+        let bStored = bOnly.storedAt
+
+        let aAfter = await cache.entry(urlA, maxAge: .infinity)!
+        XCTAssertEqual(aAfter.storedAt, aStoredBefore)
+        XCTAssertEqual(aAfter.data, aBytesBefore)
+
+        let recording = RecordingHTTPClient { url in
+            if url.host?.lowercased() == OpenMeteoQuota.forecastHost {
+                XCTFail("relaunch must not GET Open-Meteo forecast")
+                throw URLError(.notConnectedToInternet)
+            }
+            return try await MockHTTPClient().get(url, headers: [:])
+        }
+        let relaunch = WeatherService(client: recording, cache: cache, now: { clock.now })
+        let report = try await relaunch.report(for: nyc, allowNetwork: false, role: .background)
+        XCTAssertEqual(recording.openMeteoForecastURLs.count, 0)
+        XCTAssertEqual(report.forecastAsOf, bStored)
+        let pairAge = clock.now.timeIntervalSince(bStored)
+        let due = RefreshPlanner.due(cities: [nyc], pairAges: [nyc.id: pairAge],
+                                     roles: [nyc.id: .background], windowVisible: false)
+        XCTAssertFalse(due.background.contains(nyc.id))
+        XCTAssertFalse(RefreshPlanner.stillDue(id: nyc.id, pairAge: pairAge, role: .background,
+                                               wantsIssuance: false, windowVisible: false,
+                                               dailyLimited: false))
+    }
+
+    // (c)
+    func testOfflineFallbackBNewerPair() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        let seeded = try await seedBNewerPair(cache: cache, clock: clock, location: nyc,
+                                              aAge: WeatherService.TTL.blendMaxAge - 60)
+        let recording = RecordingHTTPClient { _ in throw URLError(.notConnectedToInternet) }
+        let svc = WeatherService(client: recording, cache: cache, now: { clock.now })
+        clock.now = seeded.tA.addingTimeInterval(WeatherService.TTL.blendMaxAge - 30)
+        let report = try await svc.report(for: nyc, role: .background)
+        XCTAssertTrue(report.isOfflineFallback)
+        XCTAssertEqual(report.fallbackCause, .offline)
+        XCTAssertEqual(report.forecastAsOf, seeded.tB)
+        // One failed B GET (lightBackground), then cached pair — no A GET / no further OM.
+        XCTAssertEqual(recording.openMeteoForecastURLs.count, 1)
+        XCTAssertEqual(recording.openMeteoForecastURLs.first?.absoluteString, seeded.urlB)
+    }
+
+    // (d)
+    func testBackoffFallbackBNewerPair() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        let seeded = try await seedBNewerPair(cache: cache, clock: clock, location: nyc,
+                                              aAge: WeatherService.TTL.blendMaxAge - 60)
+        let recording = RecordingHTTPClient { _ in
+            XCTFail("backoff must not GET")
+            throw URLError(.timedOut)
+        }
+        let svc = WeatherService(client: recording, cache: cache, now: { clock.now })
+        await svc.setBackoffForTesting(OpenMeteoQuota.forecastHost,
+                                       until: clock.now.addingTimeInterval(600))
+        let before = await svc.backoff(for: OpenMeteoQuota.forecastHost)
+        let pair = try await svc.fetchOpenMeteoPair(nyc.coordinate.rounded,
+                                                    models: ForecastModel.models(inCONUS: true),
+                                                    ttl: 1, force: false,
+                                                    maxStale: WeatherService.MaxStale.forecast,
+                                                    priority: .background, allowNetwork: true,
+                                                    lightBackground: true)
+        XCTAssertTrue(pair.isFallback)
+        XCTAssertEqual(pair.cause, .busy)
+        XCTAssertEqual(pair.storedAt, seeded.tB)
+        XCTAssertTrue(pair.isBOnly)
+        XCTAssertEqual(recording.openMeteoForecastURLs.count, 0)
+        let after = await svc.backoff(for: OpenMeteoQuota.forecastHost)
+        XCTAssertEqual(after, before, "backoff must not be cleared")
+    }
+
+    // (e)
+    func testDailyLimitFallbackBNewerPairUS() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        let seeded = try await seedBNewerPair(cache: cache, clock: clock, location: nyc,
+                                              aAge: WeatherService.TTL.blendMaxAge - 60)
+        let recording = RecordingHTTPClient { url in
+            if url.host?.lowercased() == OpenMeteoQuota.forecastHost {
+                XCTFail("daily-limited must not GET OM forecast")
+                throw HTTPError.dailyLimit(host: OpenMeteoQuota.forecastHost)
+            }
+            return try await MockHTTPClient().get(url, headers: [:])
+        }
+        let svc = WeatherService(client: recording, cache: cache, now: { clock.now })
+        await svc.setDailyLimitForTesting(OpenMeteoQuota.forecastHost,
+                                          until: clock.now.addingTimeInterval(6 * 3600),
+                                          lastProbeAt: clock.now, jitter: 0)
+        let report = try await svc.report(for: nyc, role: .background)
+        XCTAssertEqual(report.forecastAsOf, seeded.tB)
+        XCTAssertEqual(recording.openMeteoForecastURLs.count, 0)
+    }
+
+    func testDailyLimitFallbackBNewerPairNonUS() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        let seeded = try await seedBNewerPair(cache: cache, clock: clock, location: paris,
+                                              aAge: WeatherService.TTL.blendMaxAge - 60)
+        let recording = RecordingHTTPClient { url in
+            if url.host?.lowercased() == OpenMeteoQuota.forecastHost {
+                XCTFail("daily-limited must not GET OM forecast")
+                throw HTTPError.dailyLimit(host: OpenMeteoQuota.forecastHost)
+            }
+            return try await MockHTTPClient().get(url, headers: [:])
+        }
+        let svc = WeatherService(client: recording, cache: cache, now: { clock.now })
+        await svc.setDailyLimitForTesting(OpenMeteoQuota.forecastHost,
+                                          until: clock.now.addingTimeInterval(6 * 3600),
+                                          lastProbeAt: clock.now, jitter: 0)
+        let report = try await svc.report(for: paris, role: .background)
+        XCTAssertEqual(report.forecastAsOf, seeded.tB)
+        XCTAssertEqual(recording.openMeteoForecastURLs.count, 0)
+        XCTAssertNotEqual(report.forecastMode, .nwsOnly, "non-US must keep OM stale pair, not NWS-only")
+    }
+
+    // (f)
+    func testBNewerPairHourlyTimeMismatchRejected() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        _ = try await seedBNewerPair(cache: cache, clock: clock, location: nyc,
+                                     aAge: WeatherService.TTL.blendMaxAge - 1) { b in
+            if var hourly = b.hourly, let t = hourly["time"] {
+                hourly["time"] = t.map { $0.map { $0 + 3600 } }
+                b.hourly = hourly
+            }
+        }
+        let svc = WeatherService(client: MockHTTPClient(), cache: cache, now: { clock.now })
+        do {
+            _ = try await svc.fetchOpenMeteoPair(nyc.coordinate.rounded,
+                                                 models: ForecastModel.models(inCONUS: true),
+                                                 ttl: WeatherService.TTL.background, force: false,
+                                                 maxStale: WeatherService.MaxStale.forecast,
+                                                 priority: .background, allowNetwork: false)
+            XCTFail("hourly.time mismatch must reject")
+        } catch { /* expected */ }
+    }
+
+    func testBNewerPairDailyTimeMismatchRejected() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        _ = try await seedBNewerPair(cache: cache, clock: clock, location: nyc,
+                                     aAge: WeatherService.TTL.blendMaxAge - 1) { b in
+            if var daily = b.daily, let t = daily["time"] {
+                daily["time"] = t.map { $0.map { $0 + 86_400 } }
+                b.daily = daily
+            }
+        }
+        let svc = WeatherService(client: MockHTTPClient(), cache: cache, now: { clock.now })
+        do {
+            _ = try await svc.fetchOpenMeteoPair(nyc.coordinate.rounded,
+                                                 models: ForecastModel.models(inCONUS: true),
+                                                 ttl: WeatherService.TTL.background, force: false,
+                                                 maxStale: WeatherService.MaxStale.forecast,
+                                                 priority: .background, allowNetwork: false)
+            XCTFail("daily.time mismatch must reject")
+        } catch { /* expected */ }
+    }
+
+    // (g)
+    func testViewedCityStillFetchesFullPair() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        let coord = nyc.coordinate.rounded
+        let models = ForecastModel.models(inCONUS: true)
+        let urlA = Endpoints.openMeteoForecastA(coord, models: models).absoluteString
+        let urlB = Endpoints.openMeteoForecastB(coord).absoluteString
+        let halves = try OpenMeteoResponse.decode(Fixture.data("om_nyc")).splitPairHalves()
+        let tA = clock.now
+        await cache.store(try OpenMeteoResponse.encode(halves.a), for: urlA)
+        clock.now = tA.addingTimeInterval(2 * 3600 - 60)
+        await cache.store(try OpenMeteoResponse.encode(halves.b), for: urlB)
+        clock.now = tA.addingTimeInterval(2 * 3600)
+        let recording = RecordingHTTPClient { url in try await MockHTTPClient().get(url, headers: [:]) }
+        let svc = WeatherService(client: recording, cache: cache, now: { clock.now })
+        _ = try await svc.fetchOpenMeteoPair(coord, models: models,
+                                             ttl: WeatherService.TTL.forecast, force: false,
+                                             maxStale: WeatherService.MaxStale.forecast,
+                                             priority: .interactive, allowNetwork: true,
+                                             lightBackground: false)
+        let om = recording.openMeteoForecastURLs.map(\.absoluteString)
+        XCTAssertTrue(om.contains(urlA))
+        XCTAssertTrue(om.contains(urlB))
+    }
+
+    // (h)
+    func testCachedBNewerPairNoIssuance() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        // A hours old but still within background TTL so the TTL cache hit fires (0 GETs);
+        // B age under TTL.forecast so issuanceOK's age gate would otherwise pass.
+        let bGap: TimeInterval = 2 * 3600
+        let aAge: TimeInterval = 2 * 3600 + 60
+        let seeded = try await seedBNewerPair(cache: cache, clock: clock, location: nyc,
+                                              aAge: aAge, bGap: bGap)
+        XCTAssertLessThan(clock.now.timeIntervalSince(seeded.tB), WeatherService.TTL.forecast)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("form4b-iss-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let client = MockHTTPClient()
+        let v = ForecastVerifier(directory: dir, client: client, now: { clock.now })
+        let wants = await v.wantsIssuance(VerificationKey.key(for: nyc))
+        XCTAssertTrue(wants)
+        let recording = RecordingHTTPClient { url in try await client.get(url, headers: [:]) }
+        let svc = WeatherService(client: recording, cache: cache, verifier: v, now: { clock.now })
+        _ = try await svc.report(for: nyc, role: .background)
+        try await Task.sleep(for: .milliseconds(400))
+        let pending = dir.appendingPathComponent("pending.jsonl")
+        let hasPending = FileManager.default.fileExists(atPath: pending.path)
+            && ((try? Data(contentsOf: pending))?.isEmpty == false)
+        XCTAssertFalse(hasPending, "cached B-newer pair must not record an issuance")
+        XCTAssertEqual(recording.openMeteoForecastURLs.count, 0, "must be a cache hit, no OM GET")
+    }
+
+    // (i)
+    func testAOldOfflineUnchanged() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        _ = try await seedBNewerPair(cache: cache, clock: clock, location: nyc,
+                                     aAge: WeatherService.TTL.blendMaxAge)
+        let recording = RecordingHTTPClient { url in
+            if url.host?.lowercased() == OpenMeteoQuota.forecastHost {
+                XCTFail("must not GET OM when A ≥ blendMaxAge offline")
+            }
+            return try await MockHTTPClient().get(url, headers: [:])
+        }
+        let svc = WeatherService(client: recording, cache: cache, now: { clock.now })
+        // Cache-only: A ≥ blendMaxAge → readCachedPair nil; no OM GET (pair miss throws or NWS-only).
+        do {
+            _ = try await svc.report(for: nyc, allowNetwork: false, role: .background)
+        } catch {
+            // Pair miss without dailyLimit throws; US NWS-only only on the limited path.
+        }
+        XCTAssertEqual(recording.openMeteoForecastURLs.count, 0)
+
+        let cacheP = ResponseCache(directory: nil, now: { clock.now })
+        clock.now = Date(timeIntervalSince1970: 1_700_000_000)
+        _ = try await seedBNewerPair(cache: cacheP, clock: clock, location: paris,
+                                     aAge: WeatherService.TTL.blendMaxAge)
+        let recP = RecordingHTTPClient { url in
+            if url.host?.lowercased() == OpenMeteoQuota.forecastHost {
+                XCTFail("no OM when A ≥ blendMaxAge and limited")
+                throw HTTPError.dailyLimit(host: OpenMeteoQuota.forecastHost)
+            }
+            return try await MockHTTPClient().get(url, headers: [:])
+        }
+        let svcP = WeatherService(client: recP, cache: cacheP, now: { clock.now })
+        await svcP.setDailyLimitForTesting(OpenMeteoQuota.forecastHost,
+                                           until: clock.now.addingTimeInterval(6 * 3600),
+                                           lastProbeAt: clock.now, jitter: 0)
+        do {
+            _ = try await svcP.report(for: paris, role: .background)
+            XCTFail("non-US with A ≥ blendMaxAge and limited must throw dailyLimit")
+        } catch let e as HTTPError {
+            if case .dailyLimit = e { /* expected */ }
+            else { XCTFail("\(e)") }
+        } catch {
+            XCTFail("\(error)")
+        }
+        XCTAssertEqual(recP.openMeteoForecastURLs.count, 0)
+    }
+
+    // (j)
+    func testBOlderThanABeyondSlackRejected() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        let coord = nyc.coordinate.rounded
+        let models = ForecastModel.models(inCONUS: true)
+        let urlA = Endpoints.openMeteoForecastA(coord, models: models).absoluteString
+        let urlB = Endpoints.openMeteoForecastB(coord).absoluteString
+        let halves = try OpenMeteoResponse.decode(Fixture.data("om_nyc")).splitPairHalves()
+        let tB = clock.now
+        await cache.store(try OpenMeteoResponse.encode(halves.b), for: urlB)
+        clock.now = tB.addingTimeInterval(3 * 3600)
+        await cache.store(try OpenMeteoResponse.encode(halves.a), for: urlA)
+        clock.now = tB.addingTimeInterval(3 * 3600 + 60)
+        let svc = WeatherService(client: MockHTTPClient(), cache: cache, now: { clock.now })
+        do {
+            _ = try await svc.fetchOpenMeteoPair(coord, models: models,
+                                                 ttl: WeatherService.TTL.background, force: false,
+                                                 maxStale: WeatherService.MaxStale.forecast,
+                                                 priority: .background, allowNetwork: false)
+            XCTFail("B older than A by > slack must reject")
+        } catch { /* expected */ }
+    }
+
+    // L2
+    func testNormalPairReadbackMinStoredAtNotBOnly() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let cache = ResponseCache(directory: nil, now: { clock.now })
+        let coord = nyc.coordinate.rounded
+        let models = ForecastModel.models(inCONUS: true)
+        let urlA = Endpoints.openMeteoForecastA(coord, models: models).absoluteString
+        let urlB = Endpoints.openMeteoForecastB(coord).absoluteString
+        let halves = try OpenMeteoResponse.decode(Fixture.data("om_nyc")).splitPairHalves()
+        let tA = clock.now
+        await cache.store(try OpenMeteoResponse.encode(halves.a), for: urlA)
+        clock.now = tA.addingTimeInterval(60)
+        let tB = clock.now
+        await cache.store(try OpenMeteoResponse.encode(halves.b), for: urlB)
+        clock.now = tB.addingTimeInterval(30)
+        let svc = WeatherService(client: MockHTTPClient(), cache: cache, now: { clock.now })
+        let pair = try await svc.fetchOpenMeteoPair(coord, models: models,
+                                                    ttl: WeatherService.TTL.background, force: false,
+                                                    maxStale: WeatherService.MaxStale.forecast,
+                                                    priority: .background, allowNetwork: false)
+        XCTAssertFalse(pair.isBOnly)
+        XCTAssertEqual(pair.storedAt, min(tA, tB))
+        XCTAssertEqual(pair.halfA.storedAt, tA)
+        XCTAssertEqual(pair.halfB.storedAt, tB)
     }
 }

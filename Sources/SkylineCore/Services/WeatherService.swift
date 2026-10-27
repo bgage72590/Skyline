@@ -614,9 +614,9 @@ public actor WeatherService {
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
                 let age = now().timeIntervalSince(cached.storedAt)
                 if age >= ttl {
-                    return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                               isFallback: true, cause: isDailyLimited(host: host) ? .dailyLimit : .unreachable,
-                                               halfA: cached.halfA, halfB: cached.halfB)
+                    return asFallbackPair(cached,
+                                               cause: isDailyLimited(host: host) ? .dailyLimit : .unreachable,
+                                               markHalves: false)
                 }
                 return cached
             }
@@ -627,10 +627,7 @@ public actor WeatherService {
         // Daily-limited: prefer stale pair; probe only when due / forced / allowNetwork.
         if isDailyLimited(host: host), !mayProbeDailyLimit(host: host, force: force, allowNetwork: allowNetwork) {
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .dailyLimit,
-                                           halfA: fallbackHalf(cached.halfA, .dailyLimit),
-                                           halfB: fallbackHalf(cached.halfB, .dailyLimit))
+                return asFallbackPair(cached, cause: .dailyLimit)
             }
             throw HTTPError.dailyLimit(host: host)
         }
@@ -639,10 +636,7 @@ public actor WeatherService {
         var waits = force
         if !force, let until = backoffUntil[host], until > now() {
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .busy,
-                                           halfA: fallbackHalf(cached.halfA, .busy),
-                                           halfB: fallbackHalf(cached.halfB, .busy))
+                return asFallbackPair(cached, cause: .busy)
             }
             guard priority == .interactive else { throw HTTPError.backingOff(host: host, until: until) }
             waits = true
@@ -693,19 +687,13 @@ public actor WeatherService {
                                           lightBackground: Bool = false) async throws -> OpenMeteoPairResult {
         if isDailyLimited(host: host), !mayProbeDailyLimit(host: host, force: force, allowNetwork: allowNetwork) {
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .dailyLimit,
-                                           halfA: fallbackHalf(cached.halfA, .dailyLimit),
-                                           halfB: fallbackHalf(cached.halfB, .dailyLimit))
+                return asFallbackPair(cached, cause: .dailyLimit)
             }
             throw HTTPError.dailyLimit(host: host)
         }
         if let until = backoffUntil[host], until > now() {
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .busy,
-                                           halfA: fallbackHalf(cached.halfA, .busy),
-                                           halfB: fallbackHalf(cached.halfB, .busy))
+                return asFallbackPair(cached, cause: .busy)
             }
             throw HTTPError.backingOff(host: host, until: until)
         }
@@ -746,10 +734,7 @@ public actor WeatherService {
         } catch HTTPError.dailyLimit(let h) {
             await noteDailyLimit(host: h)
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .dailyLimit,
-                                           halfA: fallbackHalf(cached.halfA, .dailyLimit),
-                                           halfB: fallbackHalf(cached.halfB, .dailyLimit))
+                return asFallbackPair(cached, cause: .dailyLimit)
             }
             throw HTTPError.dailyLimit(host: h)
         } catch {
@@ -757,10 +742,7 @@ public actor WeatherService {
                 noteThrottled(host, retryAfter: retryAfter)
             }
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: FallbackCause(error),
-                                           halfA: fallbackHalf(cached.halfA, FallbackCause(error)),
-                                           halfB: fallbackHalf(cached.halfB, FallbackCause(error)))
+                return asFallbackPair(cached, cause: FallbackCause(error))
             }
             throw error
         }
@@ -794,10 +776,7 @@ public actor WeatherService {
         } catch HTTPError.dailyLimit(let h) {
             await noteDailyLimit(host: h)
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .dailyLimit,
-                                           halfA: fallbackHalf(cached.halfA, .dailyLimit),
-                                           halfB: fallbackHalf(cached.halfB, .dailyLimit))
+                return asFallbackPair(cached, cause: .dailyLimit)
             }
             throw HTTPError.dailyLimit(host: h)
         } catch {
@@ -805,10 +784,7 @@ public actor WeatherService {
                 noteThrottled(host, retryAfter: retryAfter)
             }
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: FallbackCause(error),
-                                           halfA: fallbackHalf(cached.halfA, FallbackCause(error)),
-                                           halfB: fallbackHalf(cached.halfB, FallbackCause(error)))
+                return asFallbackPair(cached, cause: FallbackCause(error))
             }
             throw error
         }
@@ -819,10 +795,7 @@ public actor WeatherService {
         } catch HTTPError.dailyLimit(let h) {
             await noteDailyLimit(host: h)
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .dailyLimit,
-                                           halfA: fallbackHalf(cached.halfA, .dailyLimit),
-                                           halfB: fallbackHalf(cached.halfB, .dailyLimit))
+                return asFallbackPair(cached, cause: .dailyLimit)
             }
             throw HTTPError.dailyLimit(host: h)
         } catch {
@@ -830,10 +803,7 @@ public actor WeatherService {
                 noteThrottled(host, retryAfter: retryAfter)
             }
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: FallbackCause(error),
-                                           halfA: fallbackHalf(cached.halfA, FallbackCause(error)),
-                                           halfB: fallbackHalf(cached.halfB, FallbackCause(error)))
+                return asFallbackPair(cached, cause: FallbackCause(error))
             }
             throw error
         }
@@ -851,10 +821,7 @@ public actor WeatherService {
               let decodedB = try? OpenMeteoResponse.decode(dataB),
               OpenMeteoResponse.pairConsistent(decodedA, storedAtA: stored, decodedB, storedAtB: stored) else {
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .unreachable,
-                                           halfA: fallbackHalf(cached.halfA, .unreachable),
-                                           halfB: fallbackHalf(cached.halfB, .unreachable))
+                return asFallbackPair(cached, cause: .unreachable)
             }
             throw HTTPError.invalidResponse
         }
@@ -872,17 +839,17 @@ public actor WeatherService {
 
     /// Decision 2 L: fetch B and merge with cached A. Returns nil on content mismatch (caller does A+B).
     /// On any B network error: return the cached pair as isFallback (no further GETs).
+    /// Same acceptance rule as `readCachedPair` B-newer path: A age < blendMaxAge + pairContentConsistent.
+    /// Writes only keyB — never writes, re-stamps, deletes or prunes keyA.
     private func loadBOnly(cachedA: ResponseCache.Entry, decodedA: OpenMeteoResponse,
                            urlB: URL, keyB: String, keyA: String, host: String, wasLimited: Bool,
                            maxStale: TimeInterval) async throws -> OpenMeteoPairResult? {
         do {
             let dataB = try await rawGet(urlB)
             let storedB = now()
-            // Content-only check: identical synthetic timestamps so an older cached A still pairs with
-            // a fresh B (OpenMeteo.pairConsistent's 120s storedAt slack would otherwise reject).
-            guard let decodedB = try? OpenMeteoResponse.decode(dataB),
-                  OpenMeteoResponse.pairConsistent(decodedA, storedAtA: storedB,
-                                                   decodedB, storedAtB: storedB) else {
+            guard now().timeIntervalSince(cachedA.storedAt) < TTL.blendMaxAge,
+                  let decodedB = try? OpenMeteoResponse.decode(dataB),
+                  OpenMeteoResponse.pairContentConsistent(decodedA, decodedB) else {
                 return nil
             }
             await cache.store(dataB, for: keyB)
@@ -897,10 +864,7 @@ public actor WeatherService {
         } catch HTTPError.dailyLimit(let h) {
             await noteDailyLimit(host: h)
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: .dailyLimit,
-                                           halfA: fallbackHalf(cached.halfA, .dailyLimit),
-                                           halfB: fallbackHalf(cached.halfB, .dailyLimit))
+                return asFallbackPair(cached, cause: .dailyLimit)
             }
             throw HTTPError.dailyLimit(host: h)
         } catch {
@@ -908,10 +872,7 @@ public actor WeatherService {
                 noteThrottled(host, retryAfter: retryAfter)
             }
             if let cached = await readCachedPair(keyA: keyA, keyB: keyB, maxAge: maxStale) {
-                return OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
-                                           isFallback: true, cause: FallbackCause(error),
-                                           halfA: fallbackHalf(cached.halfA, FallbackCause(error)),
-                                           halfB: fallbackHalf(cached.halfB, FallbackCause(error)))
+                return asFallbackPair(cached, cause: FallbackCause(error))
             }
             throw error
         }
@@ -931,22 +892,55 @@ public actor WeatherService {
         Fetched(data: h.data, storedAt: h.storedAt, isFallback: true, cause: cause)
     }
 
-    /// Reads both halves from cache; returns nil when either is missing or pairConsistent fails.
+    /// Wrap a cached pair as fallback while preserving Form4b `isBOnly` / `isSingleModelB`.
+    private func asFallbackPair(_ cached: OpenMeteoPairResult, cause: FallbackCause,
+                                markHalves: Bool = true) -> OpenMeteoPairResult {
+        OpenMeteoPairResult(response: cached.response, storedAt: cached.storedAt,
+                            isFallback: true, cause: cause,
+                            halfA: markHalves ? fallbackHalf(cached.halfA, cause) : cached.halfA,
+                            halfB: markHalves ? fallbackHalf(cached.halfB, cause) : cached.halfB,
+                            isBOnly: cached.isBOnly, isSingleModelB: cached.isSingleModelB)
+    }
+
+    /// Reads both halves from cache.
+    /// Normal pair (|ΔstoredAt| ≤ pairStoredAtSlack): `pairConsistent`, storedAt = min(A,B), isBOnly = false.
+    /// B-newer beyond slack: accepted only when A age < TTL.blendMaxAge and pairContentConsistent;
+    /// returns storedAt = B, isBOnly = true, halfA.storedAt = A's real time.
+    /// B older than A by > slack, A ≥ blendMaxAge, or content mismatch → nil.
     private func readCachedPair(keyA: String, keyB: String, maxAge: TimeInterval) async -> OpenMeteoPairResult? {
         guard let eA = await cache.entry(keyA, maxAge: maxAge),
               let eB = await cache.entry(keyB, maxAge: maxAge),
               let a = try? OpenMeteoResponse.decode(eA.data),
-              let b = try? OpenMeteoResponse.decode(eB.data),
-              OpenMeteoResponse.pairConsistent(a, storedAtA: eA.storedAt, b, storedAtB: eB.storedAt)
+              let b = try? OpenMeteoResponse.decode(eB.data)
         else { return nil }
-        let older = min(eA.storedAt, eB.storedAt)
-        let age = now().timeIntervalSince(older)
-        // Caller decides fallback vs fresh via ttl; here we only assemble.
-        let halfA = Fetched(data: eA.data, storedAt: eA.storedAt, isFallback: false)
-        let halfB = Fetched(data: eB.data, storedAt: eB.storedAt, isFallback: false)
-        _ = age
-        return OpenMeteoPairResult(response: OpenMeteoResponse.mergePair(a: a, b: b), storedAt: older,
-                                   isFallback: false, cause: nil, halfA: halfA, halfB: halfB)
+
+        let slack = OpenMeteoResponse.pairStoredAtSlack
+        let bMinusA = eB.storedAt.timeIntervalSince(eA.storedAt)
+
+        if abs(bMinusA) <= slack {
+            guard OpenMeteoResponse.pairConsistent(a, storedAtA: eA.storedAt, b, storedAtB: eB.storedAt)
+            else { return nil }
+            let older = min(eA.storedAt, eB.storedAt)
+            let halfA = Fetched(data: eA.data, storedAt: eA.storedAt, isFallback: false)
+            let halfB = Fetched(data: eB.data, storedAt: eB.storedAt, isFallback: false)
+            return OpenMeteoPairResult(response: OpenMeteoResponse.mergePair(a: a, b: b), storedAt: older,
+                                       isFallback: false, cause: nil, halfA: halfA, halfB: halfB,
+                                       isBOnly: false)
+        }
+
+        // B-newer beyond slack: Decision 2 L readback after a B-only refresh.
+        if bMinusA > slack {
+            guard now().timeIntervalSince(eA.storedAt) < TTL.blendMaxAge,
+                  OpenMeteoResponse.pairContentConsistent(a, b) else { return nil }
+            let halfA = Fetched(data: eA.data, storedAt: eA.storedAt, isFallback: false)
+            let halfB = Fetched(data: eB.data, storedAt: eB.storedAt, isFallback: false)
+            return OpenMeteoPairResult(response: OpenMeteoResponse.mergePair(a: a, b: b),
+                                       storedAt: eB.storedAt, isFallback: false, cause: nil,
+                                       halfA: halfA, halfB: halfB, isBOnly: true)
+        }
+
+        // B older than A by > slack → reject (unchanged).
+        return nil
     }
 
     /// Direct GET with one transient retry; no cache, no Open-Meteo turn (caller holds the turn).
