@@ -22,32 +22,39 @@ public enum ForecastInsight {
         public var sentence: String { reason.map { "\(level.label): \($0.prefix(1).lowercased() + $0.dropFirst())." } ?? "\(level.label)." }
     }
 
-    /// High spread thresholds (°C): under 2.5 is high confidence, under 4.5 medium, else low.
-    static let highSpreadMedium = 2.5, highSpreadLow = 4.5
     /// Hours where the sources' rain chances differ by this much (percentage points) count as disagreement.
     static let popSpreadDisagree = 50.0
 
     /// - Parameters:
     ///   - hourLabel: "2 PM" in the report's time zone.
-    ///   - delta: a °C difference converted to display degrees, rounded.
+    ///   - delta: a °C difference converted to display degrees, rounded (text only; classification uses raw °C).
+    ///   - modelSeries: per-model + NWS hourly (day-0 remaining window). Empty → sources fallback.
     public static func confidence(day: DailyForecast, hourly: [HourlyForecast], timeZone: TimeZone, now: Date,
-                                  hourLabel: (Date) -> String, delta: (Double) -> Int) -> Confidence {
+                                  hourLabel: (Date) -> String, delta: (Double) -> Int,
+                                  modelSeries: [ModelSeries] = []) -> Confidence {
         var level = Level.high
         var reason: String?
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = timeZone
+        let isToday = cal.isDate(day.date, inSameDayAs: now)
         let highs = day.sources.filter { $0.weight > 0 }.compactMap(\.high)
         if !day.sources.isEmpty, highs.count < 2 {
             // One forecast can't agree with anything: don't claim High (Code Reviewer batch 4, NTH 6).
             level = .medium
             reason = "Only one forecast available for this day"
-        } else if let spread = trimmedSpread(highs) ?? day.highSpread {
-            // C1: classify on the number the sentence shows, so one displayed spread never reads as two levels.
-            let shown = delta(spread)
-            let t: Level = shown >= delta(highSpreadLow) ? .low : (shown >= delta(highSpreadMedium) ? .medium : .high)
-            if t > .high { level = t; reason = "Models differ by \(delta(spread))° on the high" }
-            else if day.sources.count >= 3 || spread > 0 { reason = "Models agree on the high within \(max(1, delta(spread)))°" }
+        } else if let spread = ForecastConfidence.spread(day: day, modelSeries: modelSeries,
+                                                         timeZone: timeZone, now: now, isToday: isToday)
+                    ?? day.highSpread {
+            // Shared raw °C thresholds (both surfaces). °F via `delta` is display text only.
+            let t = ForecastConfidence.level(spread)
+            if t > .high {
+                level = t
+                reason = "Models differ by \(delta(spread))° on the high"
+            } else if day.sources.count >= 3 || spread > 0 {
+                reason = "Models agree on the high within \(max(1, delta(spread)))°"
+            }
         }
         // Rain timing: daytime hours (6 AM–midnight local) still ahead where the sources split.
-        var cal = Calendar(identifier: .gregorian); cal.timeZone = timeZone
+        // Unchanged when day-0 temperature leg is skipped (<3 h remaining → nil spread).
         let start = max(cal.date(bySettingHour: 6, minute: 0, second: 0, of: day.date) ?? day.date, now)
         let end = cal.date(byAdding: .day, value: 1, to: day.date) ?? day.date.addingTimeInterval(86400)
         let split = hourly.filter { $0.time > start && $0.time <= end && ($0.precipitationProbabilitySpread ?? 0) >= popSpreadDisagree }
@@ -63,7 +70,7 @@ public enum ForecastInsight {
     }
 
     /// Max − min of the highs, ignoring the single value farthest from the median when there are four or
-    /// more: one outlier model shouldn't make the day "Low confidence" on its own.
+    /// more. Kept for existing unit tests; confidence classification no longer trims (plan rev 2).
     static func trimmedSpread(_ values: [Double]) -> Double? {
         guard values.count >= 2 else { return nil }
         var v = values.sorted()

@@ -102,7 +102,8 @@ struct AccuracyPanel: View {
                             nDays: s.nDays,
                             units: { units.temperatureDelta($0) },
                             qaOverride: qaActive,
-                            target: s.target, nPairs: s.nPairs),
+                            target: s.target, nPairs: s.nPairs,
+                            stationPending: s.line == BiasCorrection.offStationPending),
                         appliedC: s.appliedC, nDays: s.nDays, nPairs: s.nPairs, gated: s.gated,
                         autoOff: s.autoOff, sitingOK: s.sitingOK)
                     return copy
@@ -363,7 +364,7 @@ struct AccuracyPanel: View {
                     Text(s.source.displayName).fontWeight(s.source == .blend ? .bold : .regular)
                     Text(s.tempMAE.map { "±" + AccuracyFormat.delta($0, units) } ?? "—")
                     Text(s.tempBiasMean.map { AccuracyFormat.signed($0, units) } ?? "—")
-                    Text(s.windMAE.map { String(format: "±%.0f", units.speed($0)) } ?? "—")
+                    Text(s.windMAE.map { String(format: "±%.1f", units.speed($0)) } ?? "—")
                     Text(AccuracyFormat.percent(s.hitRate))
                     Text(AccuracyFormat.percent(s.falseAlarmRatio))
                     Text(s.brier.map { String(format: "%.2f", $0) } ?? "—")
