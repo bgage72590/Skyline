@@ -10,8 +10,10 @@ public actor BenchmarkStore {
     public static let metNorwayIssueInterval: TimeInterval = 3 * 3600
     /// Fix 4: record MET samples only when cache fetchedAt is this fresh (derived; no new hour literal).
     public static var metNorwaySampleMaxAge: TimeInterval { metNorwayIssueInterval }
+    /// One day in seconds (named so Form4 expiry / negative-cache literals stay readable).
+    public static let secondsPerDay: TimeInterval = 86_400
     /// Fix 4: drop pending whose valid is older than this without an observation.
-    public static let metPendingExpiry: TimeInterval = 2 * 86400
+    public static let metPendingExpiry: TimeInterval = 2 * secondsPerDay
     /// Fix 4: hard cap on met-pending.jsonl rows (oldest first).
     public static let metPendingCap = 10_000
 

@@ -26,7 +26,7 @@ public enum DataAge {
     public static func staleAfter(refreshMinutes: Int, role: RefreshPlanner.Role) -> TimeInterval {
         switch role {
         case .freshCadence: return staleAfter(refreshMinutes: refreshMinutes)
-        case .background: return WeatherService.TTL.background + 15 * 60
+        case .background: return WeatherService.TTL.effectiveBackground() + 15 * 60
         }
     }
 

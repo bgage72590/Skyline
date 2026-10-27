@@ -63,7 +63,7 @@ public enum RefreshPlanner {
                            roles: [String: Role],
                            wantsIssuance: [String: Bool] = [:],
                            forecastTTL: TimeInterval = WeatherService.TTL.forecast,
-                           backgroundTTL: TimeInterval = WeatherService.TTL.background,
+                           backgroundTTL: TimeInterval = WeatherService.TTL.effectiveBackground(),
                            windowVisible: Bool = true,
                            notifyReuseTTL: TimeInterval = WeatherService.TTL.notifyReuseHidden,
                            notifyIDs: Set<String> = []) -> Due {
@@ -101,7 +101,7 @@ public enum RefreshPlanner {
                                 windowVisible: Bool,
                                 dailyLimited: Bool,
                                 forecastTTL: TimeInterval = WeatherService.TTL.forecast,
-                                backgroundTTL: TimeInterval = WeatherService.TTL.background,
+                                backgroundTTL: TimeInterval = WeatherService.TTL.effectiveBackground(),
                                 notifyReuseTTL: TimeInterval = WeatherService.TTL.notifyReuseHidden,
                                 isNotify: Bool = false) -> Bool {
         _ = id
@@ -121,7 +121,7 @@ public enum RefreshPlanner {
     /// Drop issuance-only extras.
     public static func retainOnHide(ids: [String],
                                     pairAges: [String: TimeInterval],
-                                    backgroundTTL: TimeInterval = WeatherService.TTL.background) -> [String] {
+                                    backgroundTTL: TimeInterval = WeatherService.TTL.effectiveBackground()) -> [String] {
         ids.filter { id in
             guard let age = pairAges[id] else { return true }
             return age >= backgroundTTL
@@ -138,7 +138,7 @@ public enum RefreshPlanner {
         let stale = order.filter { id in
             if missing.contains(id) { return true }
             guard let age = ages[id] else { return false }
-            let threshold = thresholds[id] ?? WeatherService.TTL.background
+            let threshold = thresholds[id] ?? WeatherService.TTL.effectiveBackground()
             return age >= threshold
         }
         let sorted = stale.sorted { a, b in

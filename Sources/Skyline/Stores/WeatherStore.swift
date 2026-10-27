@@ -367,7 +367,8 @@ final class WeatherStore {
     // MARK: Loading
 
     func load(_ location: WeatherLocation, force: Bool = false,
-              allowNetwork: Bool? = nil, role: RefreshPlanner.Role? = nil) async {
+              allowNetwork: Bool? = nil, role: RefreshPlanner.Role? = nil,
+              lightBackground: Bool? = nil) async {
         let resolvedRole = role ?? roleFor(location.id)
         // 10-min store guard: only fresh-cadence with no explicit allowNetwork (CR M3).
         if !force, RefreshPlanner.appliesStoreGuard(role: role, allowNetwork: allowNetwork),
@@ -385,7 +386,8 @@ final class WeatherStore {
             var report = try await service.report(for: location, forceRefresh: force, priority: priority,
                                                   allowNetwork: allowNetwork, role: resolvedRole,
                                                   windowVisible: isMainWindowVisible,
-                                                  isNotifyCity: notifyIDs.contains(location.id))
+                                                  isNotifyCity: notifyIDs.contains(location.id),
+                                                  lightBackground: lightBackground)
             // My Location moved while this was loading: this answer is for the old place (L4).
             if location.isCurrentLocation,
                !CurrentLocationGuard.isCurrent(location.coordinate, current: currentLocation?.coordinate) {
@@ -784,15 +786,22 @@ final class WeatherStore {
                 }
                 let dailyLimited = await self.service.isDailyLimited(host: OpenMeteoQuota.forecastHost)
                 let notify = self.notifyIDsForPlanner().contains(current.id)
+                // Visible-only issuance: pass the real wantsIssuance so background issuances stay on ~3 h.
+                var issueWanted = false
+                if self.isMainWindowVisible, let verifier = self.service.verifier {
+                    issueWanted = await verifier.wantsIssuance(VerificationKey.key(for: current))
+                }
                 guard RefreshPlanner.stillDue(id: current.id, pairAge: pairAge, role: .background,
-                                              wantsIssuance: false,
+                                              wantsIssuance: issueWanted,
                                               windowVisible: self.isMainWindowVisible,
                                               dailyLimited: dailyLimited,
                                               isNotify: notify) else { continue }
                 let ordinal = self.allLocations.firstIndex(where: { $0.id == current.id }).map { $0 + 1 }
                 SkylineLog.refreshDequeue(ordinal: ordinal)
                 self.lastStaggerDequeueAt = Date()
-                await self.load(current, force: false, allowNetwork: true, role: .background)
+                // Issuance-due → full A+B (lightBackground false) so issuanceOK can record.
+                await self.load(current, force: false, allowNetwork: true, role: .background,
+                                lightBackground: issueWanted ? false : nil)
             }
             guard let self, generation == self.staggerGeneration else { return }
             self.staggerTask = nil

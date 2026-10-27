@@ -214,7 +214,10 @@ struct AccuracyPanel: View {
                 // Hourly temp MAE only — never fall back to daily highMAE here.
                 guard let mae = row.tempMAE, row.n >= 20 else { continue }
                 if row.kind == .metNorway {
-                    out.append(BenchRow(title: "MET Norway", value: "±" + AccuracyFormat.delta(mae, units)))
+                    if BenchmarkScorer.showsMetNorwayRow(b) {
+                        out.append(BenchRow(title: "MET Norway", value: "±" + AccuracyFormat.delta(mae, units)))
+                    }
+                    continue
                 }
                 if row.kind == .skyline, report?.overall[.blend] == nil {
                     out.append(BenchRow(title: "Skyline", value: "±" + AccuracyFormat.delta(mae, units)))

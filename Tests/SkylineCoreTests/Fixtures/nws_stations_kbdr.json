@@ -1,0 +1,43 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "stationIdentifier": "KBDR",
+        "name": "Bridgeport Igor I Sikorsky Memorial Airport",
+        "provider": "ASOS",
+        "elevation": {
+          "value": 2,
+          "unitCode": "wmoUnit:m"
+        }
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          -73.13,
+          41.16
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "stationIdentifier": "KJFK",
+        "name": "John F Kennedy International Airport",
+        "provider": "ASOS",
+        "elevation": {
+          "value": 4,
+          "unitCode": "wmoUnit:m"
+        }
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          -73.78,
+          40.64
+        ]
+      }
+    }
+  ]
+}

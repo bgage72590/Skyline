@@ -192,6 +192,16 @@ final class RefreshPlannerTests: XCTestCase {
                                               wantsIssuance: true, windowVisible: true, dailyLimited: false))
     }
 
+    /// Blocker 3: dequeue must pass real wantsIssuance — young pair + issuance stays due while visible.
+    func testStillDueIssuanceKeepsYoungBackgroundDueWhenVisible() {
+        XCTAssertTrue(RefreshPlanner.stillDue(id: "bg", pairAge: 60, role: .background,
+                                              wantsIssuance: true, windowVisible: true, dailyLimited: false),
+                      "issuance-due background must stay due at dequeue (not forced wantsIssuance:false)")
+        XCTAssertFalse(RefreshPlanner.stillDue(id: "bg", pairAge: 60, role: .background,
+                                               wantsIssuance: false, windowVisible: true, dailyLimited: false),
+                       "without issuance, young background is not due")
+    }
+
     // MARK: manualRefreshTargets (M8)
 
     func testManualRefreshTargetsSelectedMenuBarCases() {

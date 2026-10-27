@@ -54,6 +54,8 @@ public actor ForecastVerifier {
     public static let retentionDays = 90.0
     public static let issueInterval: TimeInterval = 3 * 3600
     public static let observationInterval: TimeInterval = 55 * 60
+    /// Fix 3: 24 h negative cache after a failed US NWS stations seed (named Form4 day literal).
+    public static let usStationSeedNegativeCache: TimeInterval = BenchmarkStore.secondsPerDay
 
     struct Meta: Codable {
         var firstIssued: Date?
@@ -561,7 +563,7 @@ public actor ForecastVerifier {
               let point = forecastPoint,
               let pick = Self.nwsStationPick(data: data, id: verifyingID, near: point,
                                              cityElevationM: cityElevationM, at: now()) else {
-            await benchmark.noteUSStationSeedFailure(key: key, until: now().addingTimeInterval(86400))
+            await benchmark.noteUSStationSeedFailure(key: key, until: now().addingTimeInterval(Self.usStationSeedNegativeCache))
             return
         }
         await benchmark.seedStation(pick, key: key)
