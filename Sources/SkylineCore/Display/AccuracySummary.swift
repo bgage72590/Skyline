@@ -45,15 +45,18 @@ public enum AccuracySummary {
                 text += "."
             }
         }
-        if let right = blend.rainAccuracy, blend.rainN >= 12 {
-            text += " Rain calls were right \(Int((right * 100).rounded()))% of the time"
+        // Fix 2: headline % = age-weighted hitRate (same accessor as the Accuracy card), not rainAccuracy.
+        // Guard uses real rainy-hour counts when present (plan: rainy hours, not rainN).
+        let rainyHours = blend.wetHours > 0 ? Double(blend.wetHours) : (blend.hits + blend.misses)
+        if let caught = blend.hitRate, rainyHours >= minRainyHoursForHeadline {
+            let pct = Int((caught * 100).rounded())
+            text += " Rain: caught \(pct)% of rainy hours"
             if blend.wetHours > 0 {
-                // Real hours, not the recency-weighted tallies behind the percentages.
-                text += " (\(blend.wetHoursCaught) of \(blend.wetHours) rainy hours caught)."
-            } else if blend.hits + blend.misses >= 1 {
-                text += " (\(Int(blend.hits.rounded())) of \(Int((blend.hits + blend.misses).rounded())) rainy hours caught)."
+                text += " (\(blend.wetHoursCaught) of \(blend.wetHours) rainy hours)."
             } else {
-                text += "."
+                let caughtN = Int(blend.hits.rounded())
+                let totalN = Int((blend.hits + blend.misses).rounded())
+                text += " (\(caughtN) of \(totalN) rainy hours)."
             }
         }
         return text
@@ -61,6 +64,8 @@ public enum AccuracySummary {
 
     /// Fewest verified hours before a single model is named in the headline.
     static let minHours = 20.0
+    /// Fewest rainy hours (weighted hits+misses) before the rain clause appears.
+    public static let minRainyHoursForHeadline = 12.0
 
     static func daysPhrase(_ d: Double) -> String {
         if d < 1 { return "the first day" }

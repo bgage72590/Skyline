@@ -101,8 +101,9 @@ struct AccuracyPanel: View {
                             switchOn: SkylineAccuracyCorrection.isEnabled(),
                             nDays: s.nDays,
                             units: { units.temperatureDelta($0) },
-                            qaOverride: qaActive),
-                        appliedC: s.appliedC, nDays: s.nDays, gated: s.gated,
+                            qaOverride: qaActive,
+                            target: s.target, nPairs: s.nPairs),
+                        appliedC: s.appliedC, nDays: s.nDays, nPairs: s.nPairs, gated: s.gated,
                         autoOff: s.autoOff, sitingOK: s.sitingOK)
                     return copy
                 }
@@ -176,8 +177,10 @@ struct AccuracyPanel: View {
                         Text("Station: \(b.stationName ?? id) (\(id))\(dist)")
                             .font(.caption).foregroundStyle(Glass.secondaryText)
                     }
-                    Text(b.metNorwayAttribution)
-                        .font(.caption2).foregroundStyle(Glass.secondaryText)
+                    if BenchmarkScorer.showsMetNorwayRow(b) {
+                        Text(b.metNorwayAttribution)
+                            .font(.caption2).foregroundStyle(Glass.secondaryText)
+                    }
                 }
             }
             .padding(12)

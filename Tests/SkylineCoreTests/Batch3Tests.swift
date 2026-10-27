@@ -86,7 +86,7 @@ final class Batch3Tests: XCTestCase {
             score(.hrrr, mae: 1.2), score(.gfs, mae: 1.9),
         ])
         let text = AccuracySummary.headline(r, delta: f)
-        XCTAssertEqual(text, "Over 14 days of checks, Skyline’s temperatures were off by 1.8°F on average, as good as or better than any single model (best: HRRR, 2.2°F). Rain calls were right 95% of the time (41 of 48 rainy hours caught).")
+        XCTAssertEqual(text, "Over 14 days of checks, Skyline’s temperatures were off by 1.8°F on average, as good as or better than any single model (best: HRRR, 2.2°F). Rain: caught 85% of rainy hours (41 of 48 rainy hours).")
         XCTAssertFalse(text.contains("MAE") || text.contains("Brier"))
     }
 

@@ -142,6 +142,8 @@ final class WeatherStore {
     @ObservationIgnored private var staggerQueue: [WeatherLocation] = []
     /// Bumped on cancel so a finishing worker does not clear a newer stagger task.
     @ObservationIgnored private var staggerGeneration = 0
+    /// Last background dequeue time — hide/wake/restart must not collapse spacing below 15 s.
+    @ObservationIgnored private var lastStaggerDequeueAt: Date?
 
     private enum Keys {
         static let locations = "savedLocations.v1"
@@ -379,8 +381,11 @@ final class WeatherStore {
         defer { loadingIDs.remove(location.id) }
         do {
             let priority = FetchRetryPolicy.priority(force: force, hasReport: reports[location.id] != nil)
+            let notifyIDs = notifyIDsForPlanner()
             var report = try await service.report(for: location, forceRefresh: force, priority: priority,
-                                                  allowNetwork: allowNetwork, role: resolvedRole)
+                                                  allowNetwork: allowNetwork, role: resolvedRole,
+                                                  windowVisible: isMainWindowVisible,
+                                                  isNotifyCity: notifyIDs.contains(location.id))
             // My Location moved while this was loading: this answer is for the old place (L4).
             if location.isCurrentLocation,
                !CurrentLocationGuard.isCurrent(location.coordinate, current: currentLocation?.coordinate) {
@@ -616,11 +621,25 @@ final class WeatherStore {
         } else {
             await load(location, role: .freshCadence)
         }
-        let stale = allLocations.filter { $0.id != location.id }.prefix(5)
-            .filter { loc in
-                reports[loc.id].map { MenuSummary.primaryForecastAge($0, now: now) >= staleDataAge(for: loc.id) } ?? true
+        let order = allLocations.filter { $0.id != location.id }.map(\.id)
+        var ages: [String: TimeInterval] = [:]
+        var missing = Set<String>()
+        var thresholds: [String: TimeInterval] = [:]
+        for id in order {
+            if let report = reports[id] {
+                ages[id] = MenuSummary.primaryForecastAge(report, now: now)
+            } else {
+                missing.insert(id)
             }
-        if !stale.isEmpty { enqueueStagger(Array(stale)) }
+            thresholds[id] = staleDataAge(for: id)
+        }
+        let picked = RefreshPlanner.dropdownStale(ages: ages, missing: missing, thresholds: thresholds,
+                                                  order: order, cap: 5)
+        let byID = Dictionary(uniqueKeysWithValues: allLocations.map { ($0.id, $0) })
+        let stale = picked.compactMap { byID[$0] }
+        let ordinals = picked.compactMap { id in allLocations.firstIndex(where: { $0.id == id }).map { $0 + 1 } }
+        SkylineLog.refreshDropdown(ordinals: ordinals)
+        if !stale.isEmpty { enqueueStagger(stale) }
     }
 
     func refreshAll(force: Bool) async {
@@ -687,11 +706,29 @@ final class WeatherStore {
             }
         }
         let due = RefreshPlanner.due(now: now, cities: cities, pairAges: pairAges, roles: roles,
-                                     wantsIssuance: wantsIssuance, windowVisible: isMainWindowVisible)
+                                     wantsIssuance: wantsIssuance, windowVisible: isMainWindowVisible,
+                                     notifyIDs: notifyIDs)
+        SkylineLog.refreshSummary(dueFresh: due.fresh.count, dueBackground: due.background.count,
+                                  windowVisible: isMainWindowVisible)
+        for (i, city) in cities.enumerated() {
+            let id = city.id
+            let role = roles[id] ?? .background
+            let age = pairAges[id]
+            let reason: String
+            if due.fresh.contains(id) || due.background.contains(id) {
+                if age == nil { reason = "noPair" }
+                else if wantsIssuance[id] == true { reason = "issuance" }
+                else { reason = "ttl" }
+            } else {
+                reason = "notDue"
+            }
+            SkylineLog.refreshCity(ordinal: i + 1, role: role == .freshCadence ? "fresh" : "background",
+                                   ageMinutes: age.map { Int($0 / 60) }, reason: reason)
+        }
         let byID = Dictionary(uniqueKeysWithValues: cities.map { ($0.id, $0) })
         let fresh = due.fresh.compactMap { byID[$0] }
         let background = due.background.compactMap { byID[$0] }
-        // Cache-only: background cities that still have nothing on screen (launch / fetch-once).
+        // Cache-only: background cities that still have nothing on screen (launch).
         let cacheOnly = cities.filter { roles[$0.id] == .background && reports[$0.id] == nil }
         return RefreshPlan(fresh: fresh, background: background, cacheOnly: cacheOnly)
     }
@@ -702,14 +739,20 @@ final class WeatherStore {
         if !plan.background.isEmpty { enqueueStagger(plan.background) }
     }
 
-    /// Append cities to the single background stagger queue (dedupe by id). Starts the worker if idle.
+    /// Append cities to the single background stagger queue (dedupe by id + loadingIDs). Starts the worker if idle.
     private func enqueueStagger(_ cities: [WeatherLocation]) {
+        let queued = Set(staggerQueue.map(\.id))
+        var added = 0
         for city in cities {
+            guard RefreshPlanner.shouldEnqueue(id: city.id, queued: queued.union(Set(staggerQueue.map(\.id))),
+                                               loading: loadingIDs) else { continue }
             if !staggerQueue.contains(where: { $0.id == city.id }) {
                 staggerQueue.append(city)
+                added += 1
             }
         }
-        // Cities with nothing on screen stay at the front (today's fetch-once).
+        SkylineLog.refreshEnqueue(count: added)
+        // Cities with nothing on screen stay at the front.
         staggerQueue.sort { a, b in
             let aEmpty = reports[a.id] == nil
             let bEmpty = reports[b.id] == nil
@@ -724,17 +767,31 @@ final class WeatherStore {
         staggerGeneration += 1
         let generation = staggerGeneration
         staggerTask = Task { [weak self] in
-            var isFirst = true
             while let self, !Task.isCancelled, generation == self.staggerGeneration {
                 guard !self.staggerQueue.isEmpty else { break }
                 let next = self.staggerQueue.removeFirst()
                 guard let current = self.allLocations.first(where: { $0.id == next.id }) else { continue }
-                if !isFirst {
-                    let delay = RefreshPlanner.staggerDelay(for: current.id)
+                let delay = RefreshPlanner.nextDequeueDelay(lastDequeueAt: self.lastStaggerDequeueAt,
+                                                            now: Date(), id: current.id)
+                if delay > 0 {
                     try? await Task.sleep(for: .seconds(delay))
                     guard !Task.isCancelled, generation == self.staggerGeneration else { break }
                 }
-                isFirst = false
+                // Re-check stillDue at dequeue (⌘R / click / concurrent load may have refreshed).
+                let now = Date()
+                let pairAge: TimeInterval? = self.reports[current.id].map {
+                    now.timeIntervalSince($0.forecastAsOf ?? $0.dataAsOf)
+                }
+                let dailyLimited = await self.service.isDailyLimited(host: OpenMeteoQuota.forecastHost)
+                let notify = self.notifyIDsForPlanner().contains(current.id)
+                guard RefreshPlanner.stillDue(id: current.id, pairAge: pairAge, role: .background,
+                                              wantsIssuance: false,
+                                              windowVisible: self.isMainWindowVisible,
+                                              dailyLimited: dailyLimited,
+                                              isNotify: notify) else { continue }
+                let ordinal = self.allLocations.firstIndex(where: { $0.id == current.id }).map { $0 + 1 }
+                SkylineLog.refreshDequeue(ordinal: ordinal)
+                self.lastStaggerDequeueAt = Date()
                 await self.load(current, force: false, allowNetwork: true, role: .background)
             }
             guard let self, generation == self.staggerGeneration else { return }
@@ -743,13 +800,22 @@ final class WeatherStore {
         }
     }
 
-    /// Window hidden: cancel in-flight stagger work, but keep cities that still have no report
-    /// (fetch-once even while occluded / menu-bar only).
+    /// Window hidden: cancel in-flight stagger work; keep no-report and TTL-due entries (Decision 2).
     private func cancelStaggerKeepingEmptyReports() {
         staggerTask?.cancel()
         staggerTask = nil
         staggerGeneration += 1
-        staggerQueue = staggerQueue.filter { reports[$0.id] == nil }
+        let before = staggerQueue.count
+        let now = Date()
+        var ages: [String: TimeInterval] = [:]
+        for loc in staggerQueue {
+            if let report = reports[loc.id] {
+                ages[loc.id] = now.timeIntervalSince(report.forecastAsOf ?? report.dataAsOf)
+            }
+        }
+        let keepIDs = Set(RefreshPlanner.retainOnHide(ids: staggerQueue.map(\.id), pairAges: ages))
+        staggerQueue = staggerQueue.filter { keepIDs.contains($0.id) }
+        SkylineLog.refreshHide(kept: staggerQueue.count, dropped: before - staggerQueue.count)
         if !staggerQueue.isEmpty { startStaggerIfNeeded() }
     }
 

@@ -566,7 +566,13 @@ final class AccuracyPR2Tests: XCTestCase {
         XCTAssertTrue(line.contains("correction in use"))
         XCTAssertTrue(line.contains("+2.3"))
         XCTAssertEqual(BiasCorrection.statusLine(entry: nil, gated: false, sitingOK: true, switchOn: true,
-                                                 nDays: 5, units: { $0 }), "off (5/20 days)")
+                                                 nDays: 5, units: { $0 }, target: .dailyHigh, nPairs: 0),
+                        "off (5/14 days · 0/20 pairs)")
+        XCTAssertEqual(BiasCorrection.statusLine(entry: nil, gated: false, sitingOK: true, switchOn: true,
+                                                 nDays: 3, units: { $0 }, target: .h0to6, nPairs: 21),
+                        "off (3/7 days · 21/300 pairs)")
+        XCTAssertFalse(BiasCorrection.statusLine(entry: nil, gated: false, sitingOK: true, switchOn: true,
+                                                 nDays: 5, units: { $0 }, target: .h0to6).contains("/20 days"))
         XCTAssertEqual(BiasCorrection.statusLine(entry: nil, gated: false, sitingOK: false, switchOn: true,
                                                  nDays: 5, units: { $0 }), "off: station")
         XCTAssertEqual(BiasCorrection.statusLine(entry: nil, gated: false, sitingOK: true, switchOn: false,

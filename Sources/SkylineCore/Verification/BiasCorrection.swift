@@ -24,6 +24,11 @@ public enum BiasCorrection {
     public static let trainingMaxBytes = 2 * 1024 * 1024
     public static let correctionsMaxBytes = 64 * 1024
     public static let minLeadHoursForLearning = 1.0
+    /// Gate thresholds (shared by `gate` and `statusLine`). Values unchanged.
+    public static let hourlyGateDays = 7
+    public static let hourlyGatePairs = 300
+    public static let dailyGateDays = 14
+    public static let dailyGatePairs = 20
 
     #if canImport(os)
     private static let log = Logger(subsystem: "com.briangage.Skyline", category: "accuracy")
@@ -82,9 +87,23 @@ public enum BiasCorrection {
         let pairs = rows.reduce(0) { $0 + max(0, $1.n) }
         switch target {
         case .dailyHigh, .dailyLow:
-            return days >= 14 && pairs >= 20
+            return days >= dailyGateDays && pairs >= dailyGatePairs
         case .h0to6, .h6to24, .day2, .day3plus:
-            return pairs >= 300 && days >= 7
+            return pairs >= hourlyGatePairs && days >= hourlyGateDays
+        }
+    }
+
+    public static func dayThreshold(for target: CorrectionTarget) -> Int {
+        switch target {
+        case .dailyHigh, .dailyLow: return dailyGateDays
+        case .h0to6, .h6to24, .day2, .day3plus: return hourlyGateDays
+        }
+    }
+
+    public static func pairThreshold(for target: CorrectionTarget) -> Int {
+        switch target {
+        case .dailyHigh, .dailyLow: return dailyGatePairs
+        case .h0to6, .h6to24, .day2, .day3plus: return hourlyGatePairs
         }
     }
 
@@ -292,13 +311,16 @@ public enum BiasCorrection {
 
     public static func statusLine(entry: CorrectionEntry?, gated: Bool, sitingOK: Bool,
                                   switchOn: Bool, nDays: Int, units: (Double) -> Double,
-                                  qaOverride: Bool = false) -> String {
+                                  qaOverride: Bool = false,
+                                  target: CorrectionTarget = .dailyHigh,
+                                  nPairs: Int = 0) -> String {
         if !switchOn { return "off: switched off" }
         if !sitingOK { return "off: station" }
         if let e = entry, e.autoOff { return "off: worse on recent days" }
         if !gated {
-            let need = 20
-            return "off (\(nDays)/\(need) days)"
+            let needDays = dayThreshold(for: target)
+            let needPairs = pairThreshold(for: target)
+            return "off (\(nDays)/\(needDays) days · \(nPairs)/\(needPairs) pairs)"
         }
         let applied = entry?.appliedC ?? 0
         let shown = units(applied)
@@ -446,13 +468,14 @@ public struct CorrectionStatus: Codable, Hashable, Sendable {
     public var line: String
     public var appliedC: Double
     public var nDays: Int
+    public var nPairs: Int
     public var gated: Bool
     public var autoOff: Bool
     public var sitingOK: Bool
 
     public init(loc: String, target: CorrectionTarget, line: String, appliedC: Double = 0,
-                nDays: Int = 0, gated: Bool = false, autoOff: Bool = false, sitingOK: Bool = true) {
+                nDays: Int = 0, nPairs: Int = 0, gated: Bool = false, autoOff: Bool = false, sitingOK: Bool = true) {
         self.loc = loc; self.target = target; self.line = line; self.appliedC = appliedC
-        self.nDays = nDays; self.gated = gated; self.autoOff = autoOff; self.sitingOK = sitingOK
+        self.nDays = nDays; self.nPairs = nPairs; self.gated = gated; self.autoOff = autoOff; self.sitingOK = sitingOK
     }
 }

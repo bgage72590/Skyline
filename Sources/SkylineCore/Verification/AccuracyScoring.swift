@@ -257,6 +257,14 @@ public enum BenchmarkScorer {
                                 metNorwayAttribution: METNorwayClient.attribution)
     }
 
+    /// Fix 4: MET Norway credit and row share one visibility rule.
+    public static func showsMetNorwayRow(_ summary: BenchmarkSummary) -> Bool {
+        summary.rows.contains { row in
+            row.kind == .metNorway && row.isVisible
+                && ((row.tempMAE != nil && row.n >= 20) || row.dailyN >= 20)
+        }
+    }
+
     // MARK: Accuracy PR 2 — training / gate helpers
 
     /// Deduped count of (loc, kind, issued, valid) hourly pairs (B1).

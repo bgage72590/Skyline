@@ -356,13 +356,15 @@ public actor ForecastVerifier {
                 entry = entry ?? CorrectionEntry(loc: key, target: target)
                 entry?.appliedC = offsets[target] ?? 0
             }
+            let nPairs = rows.reduce(0) { $0 + max(0, $1.n) }
             let gated = BiasCorrection.gate(rows: rows, target: target, sitingOK: sitingOK,
                                             switchOn: switchOn, measurementOn: AccuracyMeasurement.isEnabled())
             let line = BiasCorrection.statusLine(entry: entry, gated: gated, sitingOK: sitingOK,
                                                  switchOn: switchOn, nDays: nDays,
-                                                 units: { $0 }, qaOverride: qa)
+                                                 units: { $0 }, qaOverride: qa,
+                                                 target: target, nPairs: nPairs)
             out.append(CorrectionStatus(loc: key, target: target, line: line,
-                                        appliedC: offsets[target] ?? 0, nDays: nDays,
+                                        appliedC: offsets[target] ?? 0, nDays: nDays, nPairs: nPairs,
                                         gated: gated, autoOff: entry?.autoOff ?? false, sitingOK: sitingOK))
         }
         return out
@@ -448,14 +450,13 @@ public actor ForecastVerifier {
                     metarPairs.append(VerifiedRecord(r, o))
                 }
             }
-            let metLeads = ForecastSampler.metNorwayLeadValues(location: key, issued: issued, hours: metHours)
-            for (valid, ft) in metLeads {
-                if let o = ObservationAggregator.observe(obs, validTime: valid), let ot = o.t {
-                    pairs.append(BenchmarkHourlyPair(loc: key, issued: issued, valid: valid, kind: .metNorway,
-                                                     forecastC: ft, observedC: ot))
-                }
-            }
+            // Fix 4: score MET pending against observations (same 20-min rule); no immediate-future lookup.
+            let scored = await benchmark.scoreMetPending(key: key, observations: obs, now: now())
+            pairs.append(contentsOf: scored)
         }
+        // Fix 4: record MET pending at this issuance for future valid hours (fresh MET only).
+        let metFetchedAt = await benchmark.metNorwayFetchedAt(for: key)
+        await benchmark.recordMetPending(key: key, issued: issued, hours: metHours, fetchedAt: metFetchedAt)
         if !pairs.isEmpty { await benchmark.recordHourlyPairs(pairs) }
         if !metarPairs.isEmpty { await benchmark.recordMetarVerified(metarPairs) }
 
@@ -524,14 +525,21 @@ public actor ForecastVerifier {
 
     private func station(for key: String, stationsURL: URL?, near forecastPoint: Coordinate?,
                          cityElevationM: Double? = nil) async -> String? {
-        if let id = meta[key]?.stationID, let fetched = meta[key]?.stationFetched,
-           now().timeIntervalSince(fetched) < 7 * 86400 { return id }
+        let cachedID = meta[key]?.stationID
+        let cachedFresh = cachedID != nil
+            && meta[key]?.stationFetched.map { now().timeIntervalSince($0) < 7 * 86400 } == true
+        if cachedFresh, let id = cachedID {
+            // Fix 3: even on a 7-day verification-station cache hit, seed/replace benchmark meta
+            // when missing or pointing at a different station id.
+            await seedUSBenchmarkStationIfNeeded(key: key, verifyingID: id, stationsURL: stationsURL,
+                                                 near: forecastPoint, cityElevationM: cityElevationM)
+            return id
+        }
         guard let stationsURL, let data = try? await client.get(stationsURL, headers: ["Accept": "application/geo+json"]),
               let chosen = try? NWSObservationParser.verificationStation(data, near: forecastPoint) else { return meta[key]?.stationID }
         meta[key, default: Meta()].stationID = chosen.id
         meta[key]?.stationName = chosen.name
         meta[key]?.stationFetched = now()
-        // Accuracy PR 2 c3: seed benchmark siting from the already-fetched stations list (no new request).
         if let point = forecastPoint, let pick = Self.nwsStationPick(data: data, id: chosen.id, near: point,
                                                                      cityElevationM: cityElevationM, at: now()) {
             await benchmark.seedStation(pick, key: key)
@@ -540,13 +548,37 @@ public actor ForecastVerifier {
         return chosen.id
     }
 
+    /// Fix 3: for US keys, when benchmark has no station or a mismatched id, fetch stations once
+    /// (24 h negative cache on failure) and seed from the verifying NWS station.
+    private func seedUSBenchmarkStationIfNeeded(key: String, verifyingID: String, stationsURL: URL?,
+                                                near forecastPoint: Coordinate?,
+                                                cityElevationM: Double?) async {
+        let existing = await benchmark.station(for: key)
+        if let existing, existing.stationID.uppercased() == verifyingID.uppercased() { return }
+        guard let stationsURL else { return }
+        if await benchmark.shouldSkipUSStationSeed(key: key, now: now()) { return }
+        guard let data = try? await client.get(stationsURL, headers: ["Accept": "application/geo+json"]),
+              let point = forecastPoint,
+              let pick = Self.nwsStationPick(data: data, id: verifyingID, near: point,
+                                             cityElevationM: cityElevationM, at: now()) else {
+            await benchmark.noteUSStationSeedFailure(key: key, until: now().addingTimeInterval(86400))
+            return
+        }
+        await benchmark.seedStation(pick, key: key)
+        if let cityElevationM { await benchmark.seedCityElevation(cityElevationM, key: key) }
+    }
+
     /// Decode distance / elevation for one NWS station id from the gridpoint stations GeoJSON.
     /// Private to ForecastVerifier (allowed file); avoids changing off-limits Observations.swift.
+    /// Elevation: accept only `wmoUnit:m` (Fix 3 / CR 4); missing or unknown unit → elevation nil.
     static func nwsStationPick(data: Data, id: String, near point: Coordinate,
                                cityElevationM: Double?, at pickedAt: Date) -> MetarStationPick? {
         struct List: Decodable {
             struct Geom: Decodable { var coordinates: [Double]? }
-            struct Elev: Decodable { var value: Double? }
+            struct Elev: Decodable {
+                var value: Double?
+                var unitCode: String?
+            }
             struct P: Decodable {
                 var stationIdentifier: String?
                 var name: String?
@@ -560,7 +592,12 @@ public actor ForecastVerifier {
               let coords = f.geometry?.coordinates, coords.count >= 2 else { return nil }
         let coord = Coordinate(latitude: coords[1], longitude: coords[0])
         let dist = NexradStation.distanceKm(point, coord)
-        let elev = f.properties.elevation?.value
+        let elev: Double?
+        if let e = f.properties.elevation, let v = e.value, e.unitCode == "wmoUnit:m" {
+            elev = v
+        } else {
+            elev = nil
+        }
         let delta = cityElevationM.flatMap { c in elev.map { $0 - c } }
         return MetarStationPick(stationID: id, name: f.properties.name, coordinate: coord,
                                 elevationM: elev, distanceKm: dist, elevationDeltaM: delta, pickedAt: pickedAt)
