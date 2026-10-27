@@ -1,11 +1,6 @@
 import Foundation
 import XCTest
 @testable import SkylineCore
-#if canImport(Glibc)
-import Glibc
-#elseif canImport(Darwin)
-import Darwin
-#endif
 
 /// DST daily-date fix (plan-dst @8aa8ba818703). Static fixtures only; process default tz ≠ city tz.
 final class DSTDailyDateTests: XCTestCase {
@@ -29,15 +24,6 @@ final class DSTDailyDateTests: XCTestCase {
 
     private static let nycTZ = TimeZone(identifier: "America/New_York")!
     private static let nycOffsetEDT = -14_400
-
-    override func setUp() {
-        super.setUp()
-        // Prefer a process default other than America/New_York (Linux CI is UTC).
-        if TimeZone.current.identifier == "America/New_York" {
-            setenv("TZ", "UTC", 1)
-            tzset()
-        }
-    }
 
     private func nycFallBackResponse(maxes: [Double]? = nil, mins: [Double]? = nil,
                                      withHourly: Bool = false) -> OpenMeteoResponse {
@@ -230,8 +216,17 @@ final class DSTDailyDateTests: XCTestCase {
     // MARK: 7. City tz ≠ Mac / process tz
 
     func testCityTimeZoneInjectedNotProcessCurrent() {
-        XCTAssertNotEqual(TimeZone.current.identifier, "America/New_York",
+        // Force a non–New York process default so this is deterministic on an MBP set to NYC.
+        // Never read TimeZone.current (plan forbids it in fix and tests).
+        let previousDefault = NSTimeZone.default
+        let foreign = TimeZone(identifier: "Asia/Tokyo")!
+        NSTimeZone.default = foreign
+        defer { NSTimeZone.default = previousDefault }
+
+        XCTAssertEqual(NSTimeZone.default.identifier, "Asia/Tokyo")
+        XCTAssertNotEqual(NSTimeZone.default.identifier, "America/New_York",
                           "process default tz must differ from the city tz")
+
         let tz = TimeZone(identifier: "America/New_York")!
         XCTAssertNotNil(tz)
         let om = nycFallBackResponse()
@@ -240,8 +235,7 @@ final class DSTDailyDateTests: XCTestCase {
         assertConsecutiveLocalDays(dates, count: 10,
                                    from: DateComponents(year: 2026, month: 10, day: 27),
                                    timeZone: tz)
-        // Guard: production helper must not consult TimeZone.current (source rule); dates still match
-        // the injected IANA zone under a foreign process default.
+        // City-tz result is unaffected by the foreign process default (injected IANA zone wins).
         XCTAssertNotEqual(dates[6], dates[5])
     }
 
