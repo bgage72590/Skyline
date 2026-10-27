@@ -95,7 +95,39 @@ public struct OpenMeteoResponse: Codable, Sendable {
     }
 
     public var hourlyTimes: [Date] { (hourly?["time"] ?? []).compactMap { $0.map { Date(timeIntervalSince1970: $0) } } }
-    public var dailyTimes: [Date] { (daily?["time"] ?? []).compactMap { $0.map { Date(timeIntervalSince1970: $0) } } }
+
+    /// Local calendar midnights for each `daily.time` entry in this response's IANA `timezone`.
+    ///
+    /// Open-Meteo (`timeformat=unixtime`) applies one fixed `utc_offset_seconds` to every daily row.
+    /// After a fall-back DST change that skews later days onto 23:00 the previous evening. Recover the
+    /// intended Y-M-D from the UTC calendar day of `(unix + utc_offset_seconds)`, then take
+    /// `Calendar(tz).startOfDay` (which may be 01:00 in a midnight-transition zone). Raw `daily["time"]`
+    /// is never mutated — cache / `pairConsistent` / `mergePair` keep comparing the wire arrays.
+    public var dailyTimes: [Date] {
+        guard let raw = daily?["time"] else { return [] }
+        guard let tz = TimeZone(identifier: timezone) else {
+            return raw.compactMap { $0.map { Date(timeIntervalSince1970: $0) } }
+        }
+        return raw.compactMap { t in
+            t.map { Self.localDailyDate(unixTime: $0, utcOffsetSeconds: utcOffsetSeconds, timeZone: tz) }
+        }
+    }
+
+    /// Intended local start-of-day for one Open-Meteo daily unixtime (see `dailyTimes`).
+    /// Builds Y-M-D in the city's `TimeZone` (not noon-UTC), so UTC+13/+14 zones stay on the
+    /// intended calendar day; then `startOfDay` (which may be 01:00 in a midnight-transition zone).
+    public static func localDailyDate(unixTime: TimeInterval, utcOffsetSeconds: Int, timeZone: TimeZone) -> Date {
+        let shifted = Date(timeIntervalSince1970: unixTime + TimeInterval(utcOffsetSeconds))
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(secondsFromGMT: 0)!
+        let y = utc.component(.year, from: shifted)
+        let m = utc.component(.month, from: shifted)
+        let d = utc.component(.day, from: shifted)
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+        let localYMD = cal.date(from: DateComponents(year: y, month: m, day: d))!
+        return cal.startOfDay(for: localYMD)
+    }
 
     /// Models that actually returned at least one non-null hourly temperature.
     public var modelsWithData: [ForecastModel] {

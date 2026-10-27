@@ -140,6 +140,17 @@ public actor BenchmarkStore {
         return dailyObs.filter { $0.loc == key }.count
     }
 
+    /// Daily forecast issues retained for `key` (after DST scrub on load/prune).
+    public func dailyIssues(for key: String) -> [DailyForecastIssue] {
+        load()
+        return dailyIssues.filter { $0.loc == key }
+    }
+
+    public func dailyIssueCount(for key: String) -> Int {
+        load()
+        return dailyIssues.filter { $0.loc == key }.count
+    }
+
     public func hourlyBenchCount(for key: String) -> Int {
         load()
         return hourlyBench.filter { $0.loc == key }.count
@@ -755,6 +766,8 @@ public actor BenchmarkStore {
         dailyObs = capped(dailyObs.filter { $0.localDay >= cutoff }, perCity: \.loc, time: \.localDay)
         hourlyBench = capped(hourlyBench.filter { $0.valid >= cutoff }, perCity: \.loc, time: \.valid)
         metarVerified = capped(metarVerified.filter { $0.r.valid >= cutoff }, perCity: { $0.r.loc }, time: { $0.r.valid })
+        // DST daily-date compat: drop pre-ship skewed issue days (and their daily training rows).
+        applyDSTDailyDateCompatScrub(rewriteTraining: true)
         pruneMetPendingIfNeeded(rewrite: true)
         writeAll(metars, to: "metars.jsonl")
         writeAll(dailyIssues, to: "daily-issues.jsonl")
@@ -832,6 +845,18 @@ public actor BenchmarkStore {
            let s = try? Self.decoder.decode([String: BenchmarkSummary].self, from: data) { summaries = s }
         prune()
         pruneTrainingIfDue(force: true)
+    }
+
+    /// Apply ForecastSampler DST scrub to in-memory daily issues + daily training (load/prune hook).
+    private func applyDSTDailyDateCompatScrub(rewriteTraining: Bool) {
+        let scrubbed = ForecastSampler.scrubDSTSkewedDailyIssues(dailyIssues)
+        dailyIssues = scrubbed.kept
+        let filteredTraining = ForecastSampler.scrubDSTSkewedTraining(training, dropped: scrubbed.dropped)
+        let trainingChanged = filteredTraining.count != training.count
+        training = filteredTraining
+        if rewriteTraining, trainingChanged {
+            writeAll(training, to: "training.jsonl")
+        }
     }
 
     private func dedupeTraining(_ rows: [TrainingRow]) -> [TrainingRow] {
