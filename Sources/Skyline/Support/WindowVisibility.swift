@@ -172,18 +172,8 @@ struct MainWindowRelease: NSViewRepresentable {
 }
 
 extension NSView {
-    /// Public path: drop `nextKeyView` and rebuild the loop. The private `previousKeyView` selector
-    /// runs only with `-SkylinePrivateKeyViewBreak YES` (default off). Mac QA removes that branch if
-    /// `maps=0` after close without it.
+    /// Drop `nextKeyView` and rebuild the loop. QA maps stayed 0 without the private `previousKeyView` selector.
     func breakKeyViewLink() {
-        if LaunchArguments.bool("SkylinePrivateKeyViewBreak") {
-            let sel = Selector(("previousKeyView"))
-            if responds(to: sel), let previous = perform(sel)?.takeUnretainedValue() as? NSView, previous.nextKeyView === self {
-                previous.nextKeyView = nil
-                print("[keyview] private previousKeyView break")
-                fflush(stdout)
-            }
-        }
         nextKeyView = nil
         window?.recalculateKeyViewLoop()
     }
@@ -235,6 +225,22 @@ enum MainWindowFrameHold {
     static func describeCurrent() -> String {
         let frames = NSApp.windows.filter { $0.isVisible && MainWindowRelease.isMain($0) }.map { describe($0.frame) }
         return frames.isEmpty ? "none" : frames.joined(separator: ";")
+    }
+
+    static func currentFrames() -> [NSRect] {
+        NSApp.windows.filter { $0.isVisible && MainWindowRelease.isMain($0) }.map(\.frame)
+    }
+
+    /// True when any edge moved by more than 1 pt, or the set of frames changed.
+    static func moved(from before: [NSRect], to after: [NSRect]) -> Bool {
+        guard before.count == after.count else { return true }
+        for (a, b) in zip(before, after) {
+            if abs(a.origin.x - b.origin.x) > 1 || abs(a.origin.y - b.origin.y) > 1
+                || abs(a.size.width - b.size.width) > 1 || abs(a.size.height - b.size.height) > 1 {
+                return true
+            }
+        }
+        return false
     }
 
     static func describe(_ rect: NSRect) -> String {

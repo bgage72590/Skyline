@@ -14,6 +14,20 @@ struct EncodedTileCacheTests {
         fromArgument.store("b", data: Data([4, 5]))
         #expect(fromArgument.bytes == 0)
         #expect(fromArgument.touch("b") == nil)
+
+        var defaulted = EncodedTileCache(arguments: ["skyline"])
+        #expect(defaulted.budgetBytes == 0)
+        defaulted.store("c", data: Data([6]))
+        #expect(defaulted.bytes == 0)
+    }
+
+    @Test func argumentOfFourMegabytesStillStores() {
+        var cache = EncodedTileCache(arguments: ["skyline", "-SkylineRetainedTilesMB", "4"])
+        #expect(cache.budgetBytes == 4 << 20)
+        let blob = Data(repeating: 1, count: 100)
+        cache.store("a", data: blob)
+        #expect(cache.bytes == 100)
+        #expect(cache.touch("a")?.count == 100)
     }
 
     @Test func evictsOldestFirst() {

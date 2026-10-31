@@ -2,7 +2,7 @@ import Foundation
 
 /// PNG bytes for the last radar loop, kept while the window is closed. About 12 frames × 30 tiles
 /// × ~10 KB. Oldest tiles drop first. Reopen decodes these instead of rebuilding from rasters and masks.
-/// The cap is read once from `-SkylineRetainedTilesMB` (default 4). `0` stores nothing. Arguments only.
+/// The cap is read once from `-SkylineRetainedTilesMB` (default 0). `0` stores nothing. Arguments only.
 public struct EncodedTileCache: Sendable {
     public let budgetBytes: Int
     public private(set) var bytes = 0
@@ -13,7 +13,7 @@ public struct EncodedTileCache: Sendable {
         if let budgetBytes {
             self.budgetBytes = max(0, budgetBytes)
         } else {
-            let megabytes = LaunchArguments.int("SkylineRetainedTilesMB", arguments: arguments) ?? 4
+            let megabytes = LaunchArguments.int("SkylineRetainedTilesMB", arguments: arguments) ?? 0
             self.budgetBytes = max(0, megabytes) << 20
         }
     }

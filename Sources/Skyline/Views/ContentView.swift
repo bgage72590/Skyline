@@ -2,6 +2,13 @@ import AppKit
 import SwiftUI
 import SkylineCore
 
+/// How many times the main window's content view appeared. The quit-key hook FAILs if a cycle
+/// does not increase this by one. Not read by the view, so bumping it does not rebuild the window.
+@MainActor
+enum MainWindowContentAppear {
+    static var count = 0
+}
+
 struct ContentView: View {
     @Environment(WeatherStore.self) private var store
 
@@ -9,6 +16,7 @@ struct ContentView: View {
         Group {
             if store.isMainWindowOpen {
                 windowContent
+                    .onAppear { MainWindowContentAppear.count += 1 }
             } else {
                 // Fallback while the closed window is released. Reopen builds this view again.
                 Color.black

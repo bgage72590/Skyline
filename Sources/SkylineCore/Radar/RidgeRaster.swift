@@ -3,79 +3,6 @@ import Compression
 #endif
 import Foundation
 
-#if os(Linux) && !canImport(Compression)
-/// zlib `z_stream` on x86_64 System V: 112 bytes. `inflateInit2_` rejects any other `stream_size`.
-private struct SkylineZStream {
-    var nextIn: UnsafeMutablePointer<UInt8>? = nil
-    var availIn: UInt32 = 0
-    var padAvailIn: UInt32 = 0
-    var totalIn: UInt64 = 0
-    var nextOut: UnsafeMutablePointer<UInt8>? = nil
-    var availOut: UInt32 = 0
-    var padAvailOut: UInt32 = 0
-    var totalOut: UInt64 = 0
-    var msg: UnsafeMutablePointer<CChar>? = nil
-    var state: UnsafeMutableRawPointer? = nil
-    var zalloc: UnsafeMutableRawPointer? = nil
-    var zfree: UnsafeMutableRawPointer? = nil
-    var opaque: UnsafeMutableRawPointer? = nil
-    var dataType: Int32 = 0
-    var padDataType: UInt32 = 0
-    var adler: UInt64 = 0
-    var reserved: UInt64 = 0
-}
-
-@_silgen_name("inflateInit2_")
-private func skylineInflateInit2(
-    _ stream: UnsafeMutablePointer<SkylineZStream>,
-    _ windowBits: Int32,
-    _ version: UnsafePointer<CChar>,
-    _ streamSize: Int32
-) -> Int32
-
-@_silgen_name("inflate")
-private func skylineInflate(_ stream: UnsafeMutablePointer<SkylineZStream>, _ flush: Int32) -> Int32
-
-@_silgen_name("inflateEnd")
-private func skylineInflateEnd(_ stream: UnsafeMutablePointer<SkylineZStream>) -> Int32
-
-@_silgen_name("zlibVersion")
-private func skylineZlibVersion() -> UnsafePointer<CChar>
-
-/// Raw DEFLATE (windowBits −15), same bytes Apple's `COMPRESSION_ZLIB` sees after the 2-byte zlib header.
-private enum LinuxRawDeflate {
-    private static let zStreamEnd: Int32 = 1
-    private static let zFinish: Int32 = 4
-
-    static func inflate(_ input: ArraySlice<UInt8>, exactly expected: Int) -> [UInt8]? {
-        guard expected > 0, expected <= Int(UInt32.max), MemoryLayout<SkylineZStream>.size == 112 else { return nil }
-        let src = Array(input)
-        guard src.count <= Int(UInt32.max) else { return nil }
-        var stream = SkylineZStream()
-        guard skylineInflateInit2(&stream, -15, skylineZlibVersion(), 112) == 0 else { return nil }
-        defer { _ = skylineInflateEnd(&stream) }
-        var out = [UInt8](repeating: 0, count: expected)
-        var status: Int32 = -1
-        var produced: UInt64 = 0
-        withUnsafeMutablePointer(to: &stream) { sp in
-            src.withUnsafeBufferPointer { s in
-                out.withUnsafeMutableBufferPointer { o in
-                    guard let sb = s.baseAddress, let ob = o.baseAddress else { return }
-                    sp.pointee.nextIn = UnsafeMutablePointer(mutating: sb)
-                    sp.pointee.availIn = UInt32(s.count)
-                    sp.pointee.nextOut = ob
-                    sp.pointee.availOut = UInt32(expected)
-                    status = skylineInflate(sp, zFinish)
-                    produced = sp.pointee.totalOut
-                }
-            }
-        }
-        guard status == zStreamEnd, produced == UInt64(expected) else { return nil }
-        return out
-    }
-}
-#endif
-
 /// Item 4: smooth local radar. IEM's single-site N0B tiles are drawn from a 1000×1000 lat/lon raster at
 /// 0.011° (~1.2 × 0.9 km), so at the zooms used for a local site (z8–z10, 0.15–0.6 km/px) every radar
 /// cell shows as a hard square. IEM also publishes that raster itself (8-bit palette PNG + world file),
@@ -333,14 +260,7 @@ public enum PalettePNG {
     /// ends short. Memory stays at `exactly` + a 64 KB window.
     public static func inflate(_ input: ArraySlice<UInt8>, exactly expected: Int) -> [UInt8]? {
         #if !canImport(Compression)
-        // No Apple Compression. Linux `swift test` links zlib and inflates the raw deflate
-        // payload (zlib header already stripped; a 4-byte Adler trailer may follow). Any other
-        // host still returns nil and rasters fall back to IEM tiles.
-        #if os(Linux)
-        return LinuxRawDeflate.inflate(input, exactly: expected)
-        #else
-        return nil
-        #endif
+        return nil // no Compression framework (Linux): rasters fall back to IEM tiles
         #else
         guard expected > 0 else { return nil }
         var out = [UInt8](repeating: 0, count: expected)
@@ -539,8 +459,9 @@ public actor RidgeRasterStore {
             if let png = result.png, let world = result.world { storePacked(base, png: png, world: world) }
             failureStamp[base] = nil
             failures[base] = nil
-            // Landed after the window closed: keep the compressed scan, don't refill ~1 MB of decoded pixels.
-            if generation != purgeGeneration { return nil }
+            // Landed after the window closed: keep the compressed scan and hand the raster back,
+            // but don't adopt it into the decoded cache.
+            if generation != purgeGeneration { return raster }
             adopt(base, raster)
             return raster
         }

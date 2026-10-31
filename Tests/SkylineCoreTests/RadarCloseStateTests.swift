@@ -46,8 +46,6 @@ struct RadarCloseStateTests {
     @Test func closeDropsDecodedQueuesWaitersAndBumpsEpoch() {
         let book = RadarCloseState<Int>()
         let counts = Counts()
-        book.noteDecoded("a")
-        book.noteDecoded("b")
         for key in ["a", "b", "c"] {
             book.add(key: key, waiter(counts))
         }
@@ -57,7 +55,6 @@ struct RadarCloseStateTests {
         #expect(book.epoch == epoch + 1)
         #expect(book.retryGeneration == 1)
         #expect(book.suspended)
-        #expect(book.decoded.isEmpty)
         #expect(book.queued.isEmpty)
         #expect(counts.cancelled == 3)
         #expect(counts.completed == 0)
@@ -73,9 +70,6 @@ struct RadarCloseStateTests {
         let epoch = book.epoch
         book.close {}
         #expect(book.claim(epoch: epoch, key: "tile") == nil)
-        #expect(book.deliver(epoch: epoch, key: "tile", retain: true) == false)
-        #expect(book.decoded.isEmpty)
-        #expect(book.retained.isEmpty)
         #expect(counts.cancelled == 1)
         #expect(counts.completed == 0)
     }

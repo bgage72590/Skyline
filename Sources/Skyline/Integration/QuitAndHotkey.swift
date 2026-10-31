@@ -70,6 +70,8 @@ enum AppExit {
             if !statusItem { failures.append("menu-bar item missing") }
             print("[quit-test] after ⌘Q: alive=yes window=\(mainWindowVisible ? "open" : "closed") statusItem=\(statusItem)")
             for cycle in 1...5 {
+                let beforeFrames = MainWindowFrameHold.currentFrames()
+                let appearsBefore = MainWindowContentAppear.count
                 print("[quit-test] frame before close \(MainWindowFrameHold.describeCurrent())")
                 MemoryTest.closeMainWindow()
                 let mapsDeadline = Date().addingTimeInterval(8)
@@ -83,10 +85,17 @@ enum AppExit {
                     try? await Task.sleep(for: .milliseconds(100))
                 }
                 if !mainWindowVisible { failures.append("cycle \(cycle) window not visible") }
-                try? await Task.sleep(for: .milliseconds(400))
+                // Past the app's own scheduleRestore (next turn, then 0.6 s). Read only; do not apply.
+                try? await Task.sleep(for: .seconds(1.2))
                 print("[quit-test] frame after reopen \(MainWindowFrameHold.describeCurrent())")
-                MainWindowFrameHold.applyToVisible()
-                print("[quit-test] frame settled \(MainWindowFrameHold.describeCurrent())")
+                if MainWindowFrameHold.moved(from: beforeFrames, to: MainWindowFrameHold.currentFrames()) {
+                    failures.append("cycle \(cycle) frame changed")
+                }
+                let appears = MainWindowContentAppear.count
+                let contentOpen = IntentStore.shared?.isMainWindowOpen == true
+                if !contentOpen || appears != appearsBefore + 1 {
+                    failures.append("cycle \(cycle) content open=\(contentOpen) appears=\(appears) was=\(appearsBefore)")
+                }
             }
             print(failures.isEmpty ? "[quit-test] PASS" : "[quit-test] FAIL: \(failures.joined(separator: "; "))")
             fflush(stdout)

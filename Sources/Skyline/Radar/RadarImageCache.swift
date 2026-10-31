@@ -128,6 +128,16 @@ final class RadarImageCache {
         }
     }
 
+    /// The close purge task, including one that a later close chained behind it.
+    func waitForCloseChain() async {
+        await book.waitForChain()
+    }
+
+    /// Entry for the close-relief task. Nonisolated so that task does not capture this main-actor cache.
+    nonisolated static func waitForSharedCloseChain() async {
+        await shared.waitForCloseChain()
+    }
+
     /// Window opened. Restores the RAM caches, drops a stale 5–10 s back-off, and starts re-decoding
     /// the shown loop before the radar card asks.
     func reopen(frames: [RadarFrame], shownIndex: Int) {

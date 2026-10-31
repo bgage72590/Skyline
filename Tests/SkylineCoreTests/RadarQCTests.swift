@@ -166,7 +166,7 @@ struct RadarQCTests {
     }
 
     @Test func encodedTilesStayInsideFourMegabytes() {
-        var cache = EncodedTileCache()
+        var cache = EncodedTileCache(arguments: ["skyline", "-SkylineRetainedTilesMB", "4"])
         let blob = Data(repeating: 1, count: 100_000)
         for i in 0..<50 { cache.store("t\(i)", data: blob) }
         #expect(cache.budgetBytes == 4 << 20)

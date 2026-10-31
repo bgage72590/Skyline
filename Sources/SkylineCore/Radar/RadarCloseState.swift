@@ -23,10 +23,6 @@ public final class RadarCloseState<Payload> {
     public private(set) var retryGeneration = 0
     public private(set) var suspended = false
     public var retryScheduled = false
-    /// Keys accepted into the decoded cache since the last close.
-    public private(set) var decoded: Set<String> = []
-    /// Keys accepted into the retained (closed-window) set. Close does not drop these.
-    public private(set) var retained: Set<String> = []
 
     private var waiters: [String: [Waiter]] = [:]
     private var queue: [String] = []
@@ -35,8 +31,6 @@ public final class RadarCloseState<Payload> {
     public init() {}
 
     public var queued: [String] { queue }
-
-    public func noteDecoded(_ key: String) { decoded.insert(key) }
 
     /// The first waiter for `key` is queued. Further waiters join that request.
     @discardableResult
@@ -73,22 +67,12 @@ public final class RadarCloseState<Payload> {
         return waiters.removeValue(forKey: key) ?? []
     }
 
-    /// Records a decoded (and maybe retained) store only when `started` is still current.
-    @discardableResult
-    public func deliver(epoch started: Int, key: String, retain: Bool) -> Bool {
-        guard started == epoch else { return false }
-        decoded.insert(key)
-        if retain { retained.insert(key) }
-        return true
-    }
-
     public func close(purge: @escaping @Sendable () async -> Void) {
         suspended = true
         epoch += 1
         retryGeneration += 1
         retryScheduled = false
         queue.removeAll()
-        decoded.removeAll()
         let dropped = waiters
         waiters.removeAll()
         let previous = pending

@@ -93,6 +93,9 @@ final class WeatherStore {
     /// False while the main window is closed (menu bar only): ContentView then drops its content, which
     /// frees the MKMapView, radar layers and living background; it's rebuilt when the window reopens.
     private(set) var isMainWindowOpen = true
+    /// Returns freed malloc pages after the close purge, then again about 2 s later if still closed.
+    /// The relief function is nonisolated: `MemoryRelief.relieve` hops to its utility queue.
+    @ObservationIgnored private let closeRelief = CloseReliefScheduler(relief: MemoryRelief.relieve)
     /// Bumped when a report crosses its staleness deadline or an alert ends, so views that show data age
     /// (menu-bar dimming, the offline banner) re-render without polling.
     private(set) var staleTick = 0
@@ -910,14 +913,13 @@ final class WeatherStore {
             radar.setPlaying(false)
             isScrubbing = false
             RadarImageCache.shared.closeForMenuBar()
-            MemoryRelief.soon(after: 5) // after SwiftUI has deallocated the window content
-            // MapKit/VectorKit tear their engine down asynchronously; relieve again once that is done.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
-                if self?.isMainWindowOpen == false { MemoryRelief.soon(after: 0) }
+            closeRelief.noteClosed {
+                await RadarImageCache.waitForSharedCloseChain()
             }
             // Window gone: retries are only for the menu-bar location.
             for (id, task) in retryTasks where id != menuBarLocation?.id { task.cancel(); retryTasks[id] = nil }
         } else {
+            closeRelief.noteOpened()
             RadarImageCache.shared.reopen(frames: radar.frames, shownIndex: radar.index)
             MainWindowFrameHold.scheduleRestore()
         }

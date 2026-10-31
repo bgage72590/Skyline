@@ -6,8 +6,10 @@ import SkylineCore
 /// the physical footprint (Activity Monitor's "Memory") and quits at the end.
 /// * `-SkylineMemTest radar`: New York, expanded radar on the OKX site at `-SkylineMemZoom` (10),
 ///   playing; samples every 2 s for `-SkylineMemSeconds` (150).
-/// * `-SkylineMemTest cycles` (Q2): `-SkylineMemCycles` (20) rounds of close then reopen only.
-///   It does not change the city, the radar site, units, or sync.json, and it does not write defaults.
+/// * `-SkylineMemTest cycles` (Q2): `-SkylineMemCycles` (20) rounds of close then reopen.
+///   Each round expands and plays the radar first. It does not change the city, the radar site,
+///   units, or sync.json, and it does not write defaults. A cycle FAILs if maps=0 before close
+///   or the frame moves by more than 1 pt.
 /// The radar mode puts selection and radar site back afterwards. Never adds or removes cities.
 @MainActor
 enum MemoryTest {
@@ -54,17 +56,27 @@ enum MemoryTest {
             let steady = samples.suffix(max(1, samples.count * 2 / 3))
             log("RESULT radar steady min=\(steady.min()!) max=\(steady.max()!) avg=\(steady.reduce(0, +) / steady.count) peak=\(samples.max()!) z=\(radar.debugRadarZoom?() ?? -1)")
         default:
-            // Q2: close and reopen only. No city cycle, no radar-site change, no defaults write.
+            // Q2: close and reopen. Expand and play the radar, but do not change city, site, or defaults.
             let n = { let v = d.integer(forKey: "SkylineMemCycles"); return v > 0 ? v : 20 }()
             var perCycle: [Int] = []
+            var failures: [String] = []
             for i in 1...n {
-                log("frame before close \(MainWindowFrameHold.describeCurrent())")
+                store.radarExpanded = true
+                radar.setPlaying(true)
+                let mapsDeadline = Date().addingTimeInterval(8)
+                while RadarMapContainer.live == 0, Date() < mapsDeadline { await sleep(0.1) }
+                let mapsBefore = RadarMapContainer.live
+                if mapsBefore == 0 { failures.append("cycle \(i) maps=0 before close") }
+                let beforeFrames = MainWindowFrameHold.currentFrames()
+                log("frame before close \(MainWindowFrameHold.describeCurrent()) maps=\(mapsBefore)")
                 closeMainWindow()
                 await sleep(4)
                 AppExit.showMainWindow()
-                await sleep(4)
+                await sleep(4) // past scheduleRestore's 0.6 s pass. Read the frame; do not apply it.
                 log("frame after reopen \(MainWindowFrameHold.describeCurrent())")
-                MainWindowFrameHold.applyToVisible()
+                if MainWindowFrameHold.moved(from: beforeFrames, to: MainWindowFrameHold.currentFrames()) {
+                    failures.append("cycle \(i) frame changed")
+                }
                 perCycle.append(mb())
                 log("cycle \(i) mem=\(perCycle.last!) maps=\(RadarMapContainer.live) engines=\(RadarMapContainer.liveMaps) liveTiles=\(RadarLayerView.liveTiles)")
             }
@@ -73,7 +85,8 @@ enum MemoryTest {
             log("frame before close \(MainWindowFrameHold.describeCurrent())")
             closeMainWindow()
             await sleep(45)
-            log("RESULT cycles first=\(perCycle.first!) last=\(perCycle.last!) max=\(perCycle.max()!) settledOpen=\(open) settledClosed=\(mb()) maps=\(RadarMapContainer.live) engines=\(RadarMapContainer.liveMaps)")
+            let fail = failures.isEmpty ? "none" : failures.joined(separator: "; ")
+            log("RESULT cycles first=\(perCycle.first!) last=\(perCycle.last!) max=\(perCycle.max()!) settledOpen=\(open) settledClosed=\(mb()) maps=\(RadarMapContainer.live) engines=\(RadarMapContainer.liveMaps) fail=\(fail)")
         }
         if !reopenOnly {
             radar.setPlaying(false)

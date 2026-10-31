@@ -48,7 +48,7 @@ struct RetainedPurgeTests {
         return try Data(contentsOf: url)
     }
 
-    @Test func purgeAllZeroesCompressedBytes() async throws {
+    @Test(.rasterFixtures) func purgeAllZeroesCompressedBytes() async throws {
         let png = try Self.fixture("OKX_N0B_202610161748", "png")
         let wld = try Self.fixture("OKX_N0B_202610161748", "wld")
         let rasters = RidgeRasterStore { url in url.pathExtension == "png" ? png : wld }
@@ -69,7 +69,7 @@ struct RetainedPurgeTests {
         #expect(await masks.cachedCount == 0)
     }
 
-    @Test func fetchLandingAfterPurgeStaysCompressedOnly() async throws {
+    @Test(.rasterFixtures) func fetchLandingAfterPurgeStaysCompressedOnly() async throws {
         let png = try Self.fixture("OKX_N0B_202610161748", "png")
         let wld = try Self.fixture("OKX_N0B_202610161748", "wld")
         let rasterGate = Broadcast()
@@ -81,7 +81,8 @@ struct RetainedPurgeTests {
         #expect(await waitUntil(rasterGate, atLeast: 2))
         await rasters.purge()
         rasterGate.release()
-        _ = await rasterTask.value
+        let landed = await rasterTask.value
+        #expect(landed != nil)
         #expect(await rasters.count == 0)
         #expect(await rasters.compressedBytes > 0)
         #expect(await rasters.fetches == 1)

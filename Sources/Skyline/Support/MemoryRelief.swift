@@ -19,4 +19,29 @@ enum MemoryRelief {
             }
         }
     }
+
+    /// One pressure-relief pass on the utility queue. Logs the footprint before and after.
+    /// Called by `CloseReliefScheduler` after the window-close purge. Not a new allocator API:
+    /// the walk is the same `malloc_zone_pressure_relief` `soon` uses.
+    static func relieve(pass: Int) {
+        queue.async {
+            let before = footprintMB()
+            _ = malloc_zone_pressure_relief(nil, 0)
+            let after = footprintMB()
+            print("[relief] pass=\(pass) before=\(before) after=\(after)")
+            fflush(stdout)
+        }
+    }
+
+    /// Same physical-footprint read as `StressTest.footprintMB`, without that type's main-actor isolation.
+    private static func footprintMB() -> Int {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        return kr == KERN_SUCCESS ? Int(info.phys_footprint >> 20) : -1
+    }
 }
