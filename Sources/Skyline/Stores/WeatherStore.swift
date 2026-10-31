@@ -326,12 +326,22 @@ final class WeatherStore {
     /// without a banner (shown as "Updating…"). See `QuietRetryTracker` for when it clears.
     var quietRetries = QuietRetryTracker()
 
+    /// Last network-load role per city. Observable so the banner re-renders when an attempt is recorded.
+    var attemptBook = FreshAttemptBook()
+
     /// Data older than this is flagged as stale for fresh-cadence cities (see `DataAge.staleAfter`).
     var staleDataAge: TimeInterval { DataAge.staleAfter(refreshMinutes: refreshMinutes) }
 
     /// Stale threshold for a city given its current refresh role (background uses TTL.background + 15 min).
+    /// Refresh planning reads this. The banner uses `displayStaleAge(for:)`.
     func staleDataAge(for locationID: String) -> TimeInterval {
         DataAge.staleAfter(refreshMinutes: refreshMinutes, role: roleFor(locationID))
+    }
+
+    /// Display-only threshold. A fresh-cadence city whose last attempt was background, or which has
+    /// not been attempted yet, keeps the background threshold until that fresh attempt is recorded.
+    func displayStaleAge(for locationID: String) -> TimeInterval {
+        attemptBook.displayStaleAfter(id: locationID, currentRole: roleFor(locationID), refreshMinutes: refreshMinutes)
     }
 
     /// Fresh-cadence = viewed (window visible) ∪ menu-bar ∪ notify. Computed per call; never stored.
@@ -349,7 +359,7 @@ final class WeatherStore {
     /// Reads `staleTick`, so callers re-render when the report goes stale with no other change.
     func isStale(_ report: WeatherReport, now: Date = Date()) -> Bool {
         _ = staleTick
-        return hasRefreshProblem(report) || report.dataAge(at: now) > staleDataAge(for: report.location.id)
+        return hasRefreshProblem(report) || report.freshnessAge(at: now) > displayStaleAge(for: report.location.id)
     }
 
     /// True when the last refresh for this report's location failed (network or service error).
@@ -389,6 +399,7 @@ final class WeatherStore {
                                                   isNotifyCity: notifyIDs.contains(location.id),
                                                   lightBackground: lightBackground)
             // My Location moved while this was loading: this answer is for the old place (L4).
+            // Not recorded as an attempt.
             if location.isCurrentLocation,
                !CurrentLocationGuard.isCurrent(location.coordinate, current: currentLocation?.coordinate) {
                 quietRetries.abandoned(location.id) // follow-up L3: don't leave "Updating…" behind
@@ -408,6 +419,9 @@ final class WeatherStore {
                 await refreshAccuracy(for: location)
                 return
             }
+
+            // Network load finished (including a saved-data fallback). The cache-only warm-up returned above.
+            attemptBook.recordAttempt(id: location.id, role: resolvedRole)
 
             let dailyUntil = await service.dailyLimit(for: OpenMeteoQuota.forecastHost)
             let stillLimited = dailyUntil != nil
@@ -461,6 +475,7 @@ final class WeatherStore {
             await refreshAccuracy(for: location)
         } catch is CancellationError {
             // Deferred #5 note: a cancelled load must not leave "Updating…" up unless a retry is pending.
+            // A cancellation is not recorded as an attempt.
             if retryTasks[location.id] == nil { quietRetries.abandoned(location.id) }
         } catch {
             // Cache-only miss: leave empty for the stagger; no banner yet.
@@ -468,6 +483,8 @@ final class WeatherStore {
                 if retryTasks[location.id] == nil { quietRetries.abandoned(location.id) }
                 return
             }
+            // Failure and the quiet first fetch both count as an attempt.
+            attemptBook.recordAttempt(id: location.id, role: resolvedRole)
             // Force during a long back-off throws `backingOff` immediately (no multi-minute sleep, so
             // `loadingIDs` clears and Refresh stays usable). The banner keeps the saved report.
             let owner = RefreshPlanner.retryOwner(
@@ -556,7 +573,7 @@ final class WeatherStore {
         let now = Date()
         var deadlines: [Date] = []
         for report in reports.values {
-            let staleAt = report.dataAsOf.addingTimeInterval(staleDataAge(for: report.location.id))
+            let staleAt = report.freshnessDate.addingTimeInterval(displayStaleAge(for: report.location.id))
             if staleAt > now { deadlines.append(staleAt) }
             deadlines += report.alerts.compactMap(\.endTime).filter { $0 > now }
         }
@@ -633,6 +650,8 @@ final class WeatherStore {
             } else {
                 missing.insert(id)
             }
+            // Refresh planning stays on the role's real threshold. `displayStaleAge` is display-only;
+            // using it here would stop a newly viewed city from being picked.
             thresholds[id] = staleDataAge(for: id)
         }
         let picked = RefreshPlanner.dropdownStale(ages: ages, missing: missing, thresholds: thresholds,
