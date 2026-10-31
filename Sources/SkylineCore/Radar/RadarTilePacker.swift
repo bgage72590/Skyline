@@ -24,7 +24,7 @@ public final class RadarTile: @unchecked Sendable {
         indices = []; palette = []; space = rgba.colorSpace ?? CGColorSpaceCreateDeviceRGB(); encoded = nil
     }
 
-    init(encoded: Data, width: Int, height: Int) {
+    public init(encoded: Data, width: Int, height: Int) {
         rgba = nil; self.width = width; self.height = height
         indices = []; palette = []; space = CGColorSpaceCreateDeviceRGB(); self.encoded = encoded
     }

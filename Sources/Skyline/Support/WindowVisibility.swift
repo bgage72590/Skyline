@@ -142,7 +142,8 @@ struct MainWindowRelease: NSViewRepresentable {
     }
 
     final class Probe: NSView {
-        private var observer: NSObjectProtocol?
+        /// `deinit` is nonisolated. The token is only written from `arm` and removed here.
+        nonisolated(unsafe) private var observer: NSObjectProtocol?
 
         func arm() {
             guard let window, MainWindowRelease.isMain(window) else { return }

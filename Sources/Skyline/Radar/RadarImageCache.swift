@@ -53,7 +53,8 @@ final class RadarImageCache {
     /// Item 4: one N0B scan raster per frame, shared by every local-site tile and zoom.
     nonisolated let rasterStore: RadarRasterStoreBox
 
-    private static func makeSession(cache: URLCache) -> URLSession {
+    /// Called from `RadarSessionBox` off the main actor when the window closes and the session is swapped.
+    private nonisolated static func makeSession(cache: URLCache) -> URLSession {
         let config = URLSessionConfiguration.default
         config.urlCache = cache
         config.requestCachePolicy = .useProtocolCachePolicy
@@ -133,13 +134,14 @@ final class RadarImageCache {
         sessionBox.resume()
         retryFailedNow()
         rasterStore.store.invalidateBackoff()
-        var bases: [String] = []
+        var collectedBases: [String] = []
         if frames.indices.contains(shownIndex), let base = RadarQC.rasterBase(in: frames[shownIndex].urlTemplate) {
-            bases.append(base)
+            collectedBases.append(base)
         }
         for (i, frame) in frames.enumerated() where i != shownIndex {
-            if let base = RadarQC.rasterBase(in: frame.urlTemplate) { bases.append(base) }
+            if let base = RadarQC.rasterBase(in: frame.urlTemplate) { collectedBases.append(base) }
         }
+        let bases = collectedBases
         let shownMask = frames.indices.contains(shownIndex) ? RadarQC.qcTemplate(in: frames[shownIndex].urlTemplate) : nil
         let rasters = rasterStore.store, masks = maskStore
         book.reopen {
