@@ -919,6 +919,7 @@ final class WeatherStore {
             for (id, task) in retryTasks where id != menuBarLocation?.id { task.cancel(); retryTasks[id] = nil }
         } else {
             RadarImageCache.shared.reopen(frames: radar.frames, shownIndex: radar.index)
+            MainWindowFrameHold.scheduleRestore()
         }
         startRefreshLoop() // re-arms with the cadence for the new state (and refreshes what's due now)
     }
@@ -1329,8 +1330,18 @@ extension WeatherStore {
             NSApp.activate()
             // On a cold launch the scenes may not have registered their window opener yet: retry briefly.
             Task { @MainActor in
+                var announced = false
                 for _ in 0..<20 {
-                    if let open = AppActions.openMainWindow { open(); NSApp.activate(); return }
+                    if AppActions.openMainWindow != nil {
+                        AppActions.performOpenMainWindow()
+                        NSApp.activate()
+                        return
+                    }
+                    if !announced {
+                        print("[open] handler missing")
+                        fflush(stdout)
+                        announced = true
+                    }
                     try? await Task.sleep(for: .milliseconds(250))
                 }
             }

@@ -4,7 +4,6 @@ import SkylineCore
 
 struct ContentView: View {
     @Environment(WeatherStore.self) private var store
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Group {
@@ -19,8 +18,8 @@ struct ContentView: View {
                                            onOpenChange: { open in store.setMainWindowOpen(open) }))
         .background(MainWindowRelease())
         .onAppear {
-            let open = openWindow
-            AppActions.openMainWindow = { open(id: SceneID.main) }
+            // MenuBarLabel owns openMainWindow for the life of the app. This window's openWindow
+            // goes stale once the window is released.
             AppActions.installSpaceShortcut(store: store)
         }
     }

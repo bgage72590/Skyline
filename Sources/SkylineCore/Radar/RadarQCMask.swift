@@ -193,6 +193,8 @@ public actor RadarQCMaskStore {
     private var packed: [String: Data] = [:]
     private var packedOrder: [String] = []
     private var packedBytes = 0
+    /// Bumped by `purge`. A fetch that started before that stores the RLE mask only.
+    private var purgeGeneration = 0
     private let maxMasks: Int, maxRaw: Int, compressedBudget: Int
     public private(set) var fetches = 0
     /// Half a megabyte of RLE masks. The decoded copies are what `cachedCount` reports.
@@ -204,6 +206,14 @@ public actor RadarQCMaskStore {
     public func purge() {
         masks = [:]; maskOrder = []
         raw = [:]; rawOrder = []
+        purgeGeneration += 1
+    }
+    /// Memory pressure (critical): decoded masks, raw alpha, and the RLE copies.
+    public func purgeAll() {
+        purge()
+        packed = [:]
+        packedOrder = []
+        packedBytes = 0
     }
     public var cachedCount: Int { masks.count + raw.count }
 
@@ -233,13 +243,16 @@ public actor RadarQCMaskStore {
             return m
         }
         if let task = inFlight[key] { return await task.value }
+        let generation = purgeGeneration
         let task = Task { await self.build(template: template, tile: t) }
         inFlight[key] = task
         let m = await task.value
         inFlight[key] = nil
         if let m {
-            remember(&masks, &maskOrder, key, m, limit: maxMasks)
             storePacked(key, m)
+            if generation == purgeGeneration {
+                remember(&masks, &maskOrder, key, m, limit: maxMasks)
+            }
         }
         return m
     }
@@ -273,6 +286,7 @@ public actor RadarQCMaskStore {
         guard let url = URL(string: s) else { return nil }
         // Adjacent masks share neighbours; concurrent builds join one request per raw tile.
         if let task = rawInFlight[s] { return await task.value }
+        let generation = purgeGeneration
         fetches += 1
         let fetch = fetchAlpha
         let task = Task { await fetch(url) }
@@ -280,7 +294,9 @@ public actor RadarQCMaskStore {
         let a = await task.value
         rawInFlight[s] = nil
         guard let a else { return nil }
-        remember(&raw, &rawOrder, s, a, limit: maxRaw)
+        if generation == purgeGeneration {
+            remember(&raw, &rawOrder, s, a, limit: maxRaw)
+        }
         return a
     }
 

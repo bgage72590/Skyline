@@ -5,63 +5,6 @@ import ImageIO
 import Network
 import SkylineCore
 
-/// The radar tile session and its disk-backed cache. Closing the window drops the in-memory cache
-/// and the session (connection pool, HTTP message bookkeeping) and opens a new session on the same
-/// disk cache, so a reopen is still a disk hit.
-final class RadarSessionBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var session: URLSession
-    let cache: URLCache
-    private var sharedMemory: Int?
-
-    init() {
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("com.briangage.Skyline/radar-tiles", isDirectory: true)
-        cache = URLCache(memoryCapacity: 4 << 20, diskCapacity: 300 << 20, directory: dir)
-        session = Self.make(cache: cache)
-    }
-
-    func current() -> URLSession {
-        lock.lock()
-        defer { lock.unlock() }
-        return session
-    }
-
-    /// RAM cache to zero, shared URLCache included. Disk entries stay. The old session finishes
-    /// what it already started, then goes away.
-    func suspend() {
-        lock.lock()
-        cache.memoryCapacity = 0
-        if sharedMemory == nil { sharedMemory = URLCache.shared.memoryCapacity }
-        let old = session
-        session = Self.make(cache: cache)
-        lock.unlock()
-        URLCache.shared.memoryCapacity = 0
-        old.finishTasksAndInvalidate()
-    }
-
-    func resume() {
-        lock.lock()
-        cache.memoryCapacity = 4 << 20
-        let memory = sharedMemory
-        lock.unlock()
-        if let memory { URLCache.shared.memoryCapacity = memory }
-    }
-
-    private static func make(cache: URLCache) -> URLSession {
-        let config = URLSessionConfiguration.default
-        config.urlCache = cache
-        config.requestCachePolicy = .useProtocolCachePolicy
-        config.httpMaximumConnectionsPerHost = 8
-        config.timeoutIntervalForRequest = 15
-        config.httpAdditionalHeaders = ["User-Agent": URLSessionHTTPClient.genericUserAgent]
-        config.httpCookieAcceptPolicy = .never
-        config.httpShouldSetCookies = false
-        config.httpCookieStorage = nil
-        return URLSession(configuration: config)
-    }
-}
-
 /// Decoded radar tiles shared by every radar map. Downloads go through a disk-backed URLCache
 /// (tile servers send `max-age`), decoding happens off the main thread, and concurrent requests
 /// for the same tile are coalesced.
@@ -69,21 +12,13 @@ final class RadarSessionBox: @unchecked Sendable {
 final class RadarImageCache {
     static let shared = RadarImageCache()
 
-    private let sessionBox = RadarSessionBox()
+    private let sessionBox: RadarSessionBox<URLSession>
     private var urlCache: URLCache { sessionBox.cache }
     private let images = NSCache<NSString, RadarTile>()
     /// Last loop's tiles as PNG bytes. Survives `closeForMenuBar` (the decoded cache does not).
     private var retainedTiles = EncodedTileCache()
-    /// Bumped on close so a download that finishes afterwards does not refill the decoded cache.
-    private var loadEpoch = 0
-    private var cachesSuspended = false
-    private struct Waiter {
-        /// Still needed? (false once the requesting map/zoom/frame set is gone) — checked before starting.
-        let wanted: () -> Bool
-        let completion: (RadarTile?) -> Void
-        let cancelled: () -> Void
-    }
-    private var waiters: [String: [Waiter]] = [:]
+    /// Epoch, waiter drain, suspended flag, retry generation, and the close→reopen task chain.
+    private let book = RadarCloseState<RadarTile>()
     /// Tiles the server says don't exist (404, or an empty/undecodable 200): "resolved, nothing to draw"
     /// for `missingTTL`, then asked again. Pruned by age so it can't grow without bound.
     private var failures: [String: Date] = [:]
@@ -93,8 +28,6 @@ final class RadarImageCache {
     static let missingTTL: TimeInterval = 120
     /// Posted (main queue) when failed tiles should be requested again: wake, network back, back-off over.
     static let retryNotification = Notification.Name("SkylineRadarRetryTiles")
-    private var retryScheduled = false
-    private var retryGeneration = 0
     private let pathMonitor = NWPathMonitor()
     private var lastPathSatisfied = true
     private var wakeObserver: NSObjectProtocol?
@@ -120,7 +53,24 @@ final class RadarImageCache {
     /// Item 4: one N0B scan raster per frame, shared by every local-site tile and zoom.
     nonisolated let rasterStore: RadarRasterStoreBox
 
+    private static func makeSession(cache: URLCache) -> URLSession {
+        let config = URLSessionConfiguration.default
+        config.urlCache = cache
+        config.requestCachePolicy = .useProtocolCachePolicy
+        config.httpMaximumConnectionsPerHost = 8
+        config.timeoutIntervalForRequest = 15
+        config.httpAdditionalHeaders = ["User-Agent": URLSessionHTTPClient.genericUserAgent]
+        config.httpCookieAcceptPolicy = .never
+        config.httpShouldSetCookies = false
+        config.httpCookieStorage = nil
+        return URLSession(configuration: config)
+    }
+
     private init() {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("com.briangage.Skyline/radar-tiles", isDirectory: true)
+        let cache = URLCache(memoryCapacity: 4 << 20, diskCapacity: 300 << 20, directory: dir)
+        sessionBox = RadarSessionBox(cache: cache, sharedCache: URLCache.shared, memoryCapacity: 4 << 20, make: Self.makeSession)
         provisionalImages.totalCostLimit = 8 << 20
         let box = sessionBox
         maskStore = RadarQCMaskStore { url in await Self.fetchMaskAlpha(session: box.current(), url: url) }
@@ -161,30 +111,25 @@ final class RadarImageCache {
     /// bookkeeping. Keeps the on-disk tile cache, compressed scan bytes, RLE masks, and the last
     /// loop's PNG tiles.
     func closeForMenuBar() {
-        cachesSuspended = true
-        loadEpoch += 1
-        retryGeneration += 1
-        retryScheduled = false
         images.removeAllObjects()
         provisionalImages.removeAllObjects()
         provisional.removeAll()
         queue.removeAll()
         inFlight = 0
-        let dropped = waiters
-        waiters.removeAll()
-        for callbacks in dropped.values { callbacks.forEach { $0.cancelled() } }
         transient.removeAll()
         failures.removeAll()
         gaveUp.removeAll()
         sessionBox.suspend()
         let rasters = rasterStore.store, masks = maskStore
-        Task { await rasters.purge(); await masks.purge() }
+        book.close {
+            await rasters.purge()
+            await masks.purge()
+        }
     }
 
     /// Window opened. Restores the RAM caches, drops a stale 5–10 s back-off, and starts re-decoding
     /// the shown loop before the radar card asks.
     func reopen(frames: [RadarFrame], shownIndex: Int) {
-        cachesSuspended = false
         sessionBox.resume()
         retryFailedNow()
         rasterStore.store.invalidateBackoff()
@@ -197,7 +142,7 @@ final class RadarImageCache {
         }
         let shownMask = frames.indices.contains(shownIndex) ? RadarQC.qcTemplate(in: frames[shownIndex].urlTemplate) : nil
         let rasters = rasterStore.store, masks = maskStore
-        Task {
+        book.reopen {
             await rasters.clearBackoff()
             await rasters.prewarmRetained(preferring: bases)
             await masks.prewarm(template: shownMask)
@@ -225,14 +170,14 @@ final class RadarImageCache {
 
     private func scheduleRetryTick(after delay: TimeInterval) {
         // Offline: no point waking every minute; `networkChanged` retries when the path is back.
-        guard !retryScheduled, lastPathSatisfied else { return }
-        retryScheduled = true
-        let generation = retryGeneration
+        guard !book.retryScheduled, lastPathSatisfied else { return }
+        book.retryScheduled = true
+        let generation = book.retryGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.5) { [weak self] in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                guard generation == self.retryGeneration else { self.retryScheduled = false; return }
-                self.retryScheduled = false
+                guard generation == self.book.retryGeneration else { self.book.retryScheduled = false; return }
+                self.book.retryScheduled = false
                 NotificationCenter.default.post(name: Self.retryNotification, object: nil)
             }
         }
@@ -259,10 +204,20 @@ final class RadarImageCache {
         // screen changes; only re-attach-without-network after a pan-back gets slower.
         images.totalCostLimit = critical ? 1 << 20 : Self.normalCacheBytes / 4
         if critical { images.removeAllObjects() }
-        // CR #7.5: scan rasters (~1 MB each) shrink too; the shown loop re-fetches what it needs.
+        // Warning and critical both drop the retained PNG set. Critical also drops compressed scans and masks.
+        retainedTiles.removeAll()
         let rasters = rasterStore.store
-        Task { await rasters.trim(keep: critical ? 2 : 12) }
-        if !cachesSuspended {
+        let masks = maskStore
+        if critical {
+            Task {
+                await rasters.trim(keep: 2)
+                await rasters.purgeAll()
+                await masks.purgeAll()
+            }
+        } else {
+            Task { await rasters.trim(keep: 12) }
+        }
+        if !book.suspended {
             urlCache.memoryCapacity = 0
             urlCache.memoryCapacity = 1 << 20
         }
@@ -270,7 +225,7 @@ final class RadarImageCache {
         restoreTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(120))
             guard !Task.isCancelled, let self else { return }
-            guard !self.cachesSuspended else { return }
+            guard !self.book.suspended else { return }
             self.images.totalCostLimit = Self.normalCacheBytes
             self.urlCache.memoryCapacity = 4 << 20
             await self.rasterStore.store.restore()
@@ -306,12 +261,8 @@ final class RadarImageCache {
               cancelled: @escaping () -> Void = {}, completion: @escaping (RadarTile?) -> Void) {
         let key = url.absoluteString
         if let hit = image(for: url) { return completion(hit) }
-        let waiter = Waiter(wanted: wanted, completion: completion, cancelled: cancelled)
-        if waiters[key] != nil {
-            waiters[key]?.append(waiter)
-            return
-        }
-        waiters[key] = [waiter]
+        let waiter = RadarCloseState<RadarTile>.Waiter(wanted: wanted, completion: completion, cancelled: cancelled)
+        guard book.add(key: key, waiter) else { return }
         queue.append(url)
         pump()
     }
@@ -326,17 +277,12 @@ final class RadarImageCache {
         while inFlight < maxInFlight, !queue.isEmpty {
             let url = queue.removeFirst()
             let key = url.absoluteString
+            book.dequeue(key)
             // Drop requests nobody needs any more (map collapsed, zoom changed, new scans), so stale
             // work can't starve the tiles that are on screen now.
-            let all = waiters[key] ?? []
-            let live = all.filter { $0.wanted() }
-            if live.isEmpty {
-                waiters[key] = nil
-                all.forEach { $0.cancelled() }
-                continue
-            }
-            waiters[key] = live
-            all.filter { !$0.wanted() }.forEach { $0.cancelled() }
+            let (live, dropped) = book.liveWaiters(for: key)
+            dropped.forEach { $0.cancelled() }
+            if live.isEmpty { continue }
             inFlight += 1
             start(url)
         }
@@ -345,11 +291,11 @@ final class RadarImageCache {
     private func start(_ url: URL) {
         let key = url.absoluteString
         let box = sessionBox
-        let epoch = loadEpoch
+        let epoch = book.epoch
         Task {
             let outcome = await Self.fetchDecoded(session: box.current(), url: url, masks: maskStore, rasters: rasterStore.store)
-            // A download that outlived the close must not occupy a slot the reopened window needs.
-            guard epoch == loadEpoch else { return }
+            // A download that started before close must not fill images or retained tiles, or call a waiter.
+            guard let callbacks = book.claim(epoch: epoch, key: key) else { return }
             inFlight -= 1
             defer { pump() }
             var image: RadarTile?
@@ -387,7 +333,6 @@ final class RadarImageCache {
                 scheduleRetryTick(after: delay)
             }
             if failures.count + transient.count > 2_000 { pruneFailures() }
-            let callbacks = waiters.removeValue(forKey: key) ?? []
             callbacks.forEach { $0.completion(image) }
         }
     }

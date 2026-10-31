@@ -6,13 +6,22 @@ import PackageDescription
 // so it is fully unit-testable, even on Linux CI. The `Skyline` executable holds
 // all SwiftUI / MapKit / CoreLocation code and is only built on macOS.
 
+// Linux has no Apple Compression framework. SkylineCore's PNG inflate links zlib there so the
+// same raster fixtures decode under `swift test`. macOS keeps Compression and does not link zlib.
+#if os(Linux)
+let skylineCoreLinker: [LinkerSetting] = [.linkedLibrary("z")]
+#else
+let skylineCoreLinker: [LinkerSetting] = []
+#endif
+
 var targets: [Target] = [
     // Strictest data-race checking (L30): threading mistakes in the core are compile errors/warnings,
     // and the build is held at 0 warnings.
     .target(
         name: "SkylineCore",
         path: "Sources/SkylineCore",
-        swiftSettings: [.enableExperimentalFeature("StrictConcurrency")]
+        swiftSettings: [.enableExperimentalFeature("StrictConcurrency")],
+        linkerSettings: skylineCoreLinker
     ),
     .testTarget(
         name: "SkylineCoreTests",

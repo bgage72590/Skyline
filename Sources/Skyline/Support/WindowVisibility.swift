@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import SkylineCore
 
 /// Reports whether the hosting window is actually visible on screen (not occluded, minimised or closed).
 /// Used to pause refreshes and radar animation when nobody can see them.
@@ -103,18 +104,19 @@ struct MainWindowRelease: NSViewRepresentable {
     func updateNSView(_ view: Probe, context: Context) { view.arm() }
 
     static func isMain(_ window: NSWindow) -> Bool {
-        if window is NSPanel { return false }
-        if window.frameAutosaveName.contains("com_apple_SwiftUI_Settings") || window.title.hasPrefix("Settings") {
-            return false
-        }
-        return window.identifier?.rawValue.hasPrefix(SceneID.main) == true || window.title == "Skyline"
+        MainWindowMatch.isMain(MainWindowAttributes(window: window))
     }
 
+    /// `-SkylineReleaseWhenClosed YES` (default off). Mac QA turns it on only if the closed-window
+    /// measurement misses by more than 3 MB without it. `strip` still swaps in an empty content view.
+    static var releaseWhenClosed: Bool { LaunchArguments.bool("SkylineReleaseWhenClosed") }
+
     /// Drops radar shells (including ones AppKit's key-view table is holding), the hosting view's
-    /// layer tree, and the content view. `isReleasedWhenClosed` lets AppKit free the NSWindow.
+    /// layer tree, and the content view. `isReleasedWhenClosed` lets AppKit free the NSWindow when
+    /// the launch argument is on.
     static func strip(_ window: NSWindow) {
         guard isMain(window), !window.isVisible else { return }
-        window.isReleasedWhenClosed = true
+        if releaseWhenClosed { window.isReleasedWhenClosed = true }
         var containers: [RadarMapContainer] = []
         func collect(_ view: NSView?) {
             guard let view else { return }
@@ -144,12 +146,13 @@ struct MainWindowRelease: NSViewRepresentable {
 
         func arm() {
             guard let window, MainWindowRelease.isMain(window) else { return }
-            window.isReleasedWhenClosed = true
+            if MainWindowRelease.releaseWhenClosed { window.isReleasedWhenClosed = true }
             guard observer == nil else { return }
             observer = NotificationCenter.default.addObserver(
                 forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak window] _ in
                 MainActor.assumeIsolated {
-                    window?.isReleasedWhenClosed = true
+                    if let window { MainWindowFrameHold.capture(window) }
+                    if MainWindowRelease.releaseWhenClosed { window?.isReleasedWhenClosed = true }
                     // After the close notification and the empty-root swap, drop whatever is left.
                     DispatchQueue.main.async {
                         DispatchQueue.main.async { [weak window] in
@@ -168,13 +171,79 @@ struct MainWindowRelease: NSViewRepresentable {
 }
 
 extension NSView {
-    /// AppKit's key-view table retains `previousKeyView` strongly, which is what kept empty radar
-    /// containers alive after the map was torn down.
+    /// Public path: drop `nextKeyView` and rebuild the loop. The private `previousKeyView` selector
+    /// runs only with `-SkylinePrivateKeyViewBreak YES` (default off). Mac QA removes that branch if
+    /// `maps=0` after close without it.
     func breakKeyViewLink() {
-        let sel = Selector(("previousKeyView"))
-        if responds(to: sel), let previous = perform(sel)?.takeUnretainedValue() as? NSView, previous.nextKeyView === self {
-            previous.nextKeyView = nil
+        if LaunchArguments.bool("SkylinePrivateKeyViewBreak") {
+            let sel = Selector(("previousKeyView"))
+            if responds(to: sel), let previous = perform(sel)?.takeUnretainedValue() as? NSView, previous.nextKeyView === self {
+                previous.nextKeyView = nil
+                print("[keyview] private previousKeyView break")
+                fflush(stdout)
+            }
         }
         nextKeyView = nil
+        window?.recalculateKeyViewLoop()
+    }
+}
+
+extension MainWindowAttributes {
+    init(window: NSWindow) {
+        self.init(
+            identifier: window.identifier?.rawValue,
+            title: window.title,
+            isPanel: window is NSPanel,
+            className: window.className,
+            frameAutosaveName: window.frameAutosaveName,
+            hasSheetParent: window.sheetParent != nil || window.isSheet,
+            isTitled: window.styleMask.contains(.titled)
+        )
+    }
+}
+
+/// Last closed main-window frame, in memory only (no new preferences key). Reopen puts it back when
+/// SwiftUI has handed the window a different frame.
+@MainActor
+enum MainWindowFrameHold {
+    private static var closed: NSRect?
+
+    static func capture(_ window: NSWindow) {
+        guard MainWindowRelease.isMain(window) else { return }
+        closed = window.frame
+    }
+
+    static func applyToVisible() {
+        guard let closed else { return }
+        for window in NSApp.windows where window.isVisible && MainWindowRelease.isMain(window) {
+            guard !matches(window.frame, closed) else { continue }
+            window.setFrame(closed, display: true)
+            print("[frame] restored \(describe(closed))")
+            fflush(stdout)
+        }
+    }
+
+    /// One pass on the next turn and another shortly after, covering a frame SwiftUI applies late.
+    static func scheduleRestore() {
+        DispatchQueue.main.async {
+            applyToVisible()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { applyToVisible() }
+        }
+    }
+
+    static func describeCurrent() -> String {
+        let frames = NSApp.windows.filter { $0.isVisible && MainWindowRelease.isMain($0) }.map { describe($0.frame) }
+        return frames.isEmpty ? "none" : frames.joined(separator: ";")
+    }
+
+    static func describe(_ rect: NSRect) -> String {
+        let x = Int(rect.origin.x.rounded()), y = Int(rect.origin.y.rounded())
+        let w = Int(rect.size.width.rounded()), h = Int(rect.size.height.rounded())
+        return "\(x),\(y) \(w)x\(h)"
+    }
+
+    private static func matches(_ a: NSRect, _ b: NSRect) -> Bool {
+        abs(a.origin.x - b.origin.x) < 1 && abs(a.origin.y - b.origin.y) < 1
+            && abs(a.size.width - b.size.width) < 1 && abs(a.size.height - b.size.height) < 1
     }
 }
