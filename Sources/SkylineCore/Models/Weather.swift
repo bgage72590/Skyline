@@ -345,6 +345,15 @@ public struct WeatherReport: Codable, Hashable, Sendable {
     /// How old the forecast data is at `now` (seconds).
     public func dataAge(at now: Date = Date()) -> TimeInterval { max(0, now.timeIntervalSince(dataAsOf)) }
 
+    /// When the shown forecast counts as fresh: Open-Meteo's download time, or `dataAsOf` when NWS is
+    /// the only source (and when an older saved report has no `forecastAsOf`).
+    public var freshnessDate: Date {
+        forecastMode == .nwsOnly ? dataAsOf : (forecastAsOf ?? dataAsOf)
+    }
+
+    /// How old the shown forecast is at `now` (seconds).
+    public func freshnessAge(at now: Date = Date()) -> TimeInterval { max(0, now.timeIntervalSince(freshnessDate)) }
+
     /// Alerts that haven't ended yet at `now` (display-time filter; the parser already drops ended ones).
     public func activeAlerts(at now: Date = Date()) -> [WeatherAlert] { alerts.filter { $0.isActive(at: now) } }
 

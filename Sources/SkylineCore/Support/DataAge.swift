@@ -12,7 +12,7 @@ public enum DataAge {
     }
 
     public static func updatedText(_ report: WeatherReport, now: Date = Date()) -> String {
-        "Updated " + relative(report.dataAge(at: now))
+        "Updated " + relative(report.freshnessAge(at: now))
     }
 
     /// Data older than this is treated as stale (dimmed, flagged) given the refresh interval in minutes:

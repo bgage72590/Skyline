@@ -56,8 +56,9 @@ public enum MenuSummary {
     }
 
     /// How old another city's row is, shown once it's stale ("45 min", "2 h"); nil while fresh.
+    /// Age is the shown forecast (`freshnessAge`), not the oldest input.
     public static func rowAge(_ report: WeatherReport, now: Date, staleAfter: TimeInterval) -> String? {
-        let age = report.dataAge(at: now)
+        let age = report.freshnessAge(at: now)
         guard age >= staleAfter else { return nil }
         return age < 3600 ? "\(Int(age / 60)) min" : (age < 86400 ? "\(Int(age / 3600)) h" : "\(Int(age / 86400)) d")
     }

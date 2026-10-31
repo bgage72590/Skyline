@@ -572,7 +572,7 @@ struct StaleDataBanner: View {
         HStack(spacing: 8) {
             Image(systemName: offline ? "wifi.slash" : "clock.arrow.circlepath")
             Text(RefreshBookkeeping.bannerLine(offline: offline, error: error,
-                                                dataTime: Fmt.dataTime(report.dataAsOf)))
+                                                dataTime: Fmt.dataTime(report.freshnessDate)))
                 .lineLimit(1)
             if isLoading {
                 ProgressView().controlSize(.mini)

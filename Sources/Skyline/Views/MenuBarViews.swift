@@ -280,7 +280,7 @@ struct MenuBarContentView: View {
             }
             .font(.caption.weight(stale ? .semibold : .regular))
             .foregroundStyle(stale ? Color.orange : Color.white.opacity(0.75))
-            .help(store.errors[report.location.id] ?? "Data from \(Fmt.dataTime(report.dataAsOf))")
+            .help(store.errors[report.location.id] ?? "Data from \(Fmt.dataTime(report.freshnessDate))")
         }
     }
 
@@ -435,7 +435,7 @@ struct MenuBarContentView: View {
 
     private func cityRow(_ location: WeatherLocation, now: Date) -> some View {
         let r = store.reports[location.id]
-        let age = r.flatMap { MenuSummary.rowAge($0, now: now, staleAfter: store.staleDataAge) }
+        let age = r.flatMap { MenuSummary.rowAge($0, now: now, staleAfter: store.displayStaleAge(for: location.id)) }
         return Button {
             store.selectedID = location.id
             AppExit.showMainWindow(); GlobalHotkey.closePanel()
@@ -447,7 +447,7 @@ struct MenuBarContentView: View {
                 if let age {
                     Label(age, systemImage: "clock").labelStyle(.titleAndIcon)
                         .font(.caption2.weight(.medium)).foregroundStyle(.orange)
-                        .help("Data from \(r.map { Fmt.dataTime($0.dataAsOf) } ?? "")")
+                        .help("Data from \(r.map { Fmt.dataTime($0.freshnessDate) } ?? "")")
                 }
                 if let r { WeatherSymbol(condition: r.current.condition, isDay: r.current.isDay, size: 13) }
                 Text(store.units.temperatureString(r?.current.temperature, withUnit: true)).monospacedDigit()
