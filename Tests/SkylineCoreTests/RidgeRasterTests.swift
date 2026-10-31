@@ -19,7 +19,7 @@ struct RidgeRasterTests {
     }
     static let tile = (z: 10, x: 307, y: 383)
 
-    @Test func decodesPaletteIndicesAndGeo() throws {
+    @Test(.rasterFixtures) func decodesPaletteIndicesAndGeo() throws {
         let r = try Self.raster()
         #expect(r.width == 1000 && r.height == 1000 && r.palette.count == 256)
         #expect(abs(r.dLon - 0.010969) < 1e-9 && abs(r.lat0 - 46.349683) < 1e-9)
@@ -103,7 +103,7 @@ struct RidgeRasterTests {
 
     // CR #7.3: every core keeps its raw maximum. For each 16×16-cell block of the raster inside the tile,
     // the highest rendered level equals the highest raw level of the cells whose centres fall inside it.
-    @Test func smoothingPreservesPeakReflectivityPerRegion() throws {
+    @Test(.rasterFixtures) func smoothingPreservesPeakReflectivityPerRegion() throws {
         let r = try Self.raster()
         for (z, x, y) in [(10, 307, 383), (9, 153, 191), (8, 76, 95)] {
             let px = r.renderTile(z: z, x: x, y: y)
@@ -227,7 +227,7 @@ struct RidgeRasterTests {
     }
 #endif
 
-    @Test func tilesOutsideTheRasterAreEmpty() throws {
+    @Test(.rasterFixtures) func tilesOutsideTheRasterAreEmpty() throws {
         let r = try Self.raster()
         #expect(r.renderTile(z: 10, x: 100, y: 383).allSatisfy { $0 == 0 })
     }
@@ -251,7 +251,7 @@ struct RidgeRasterTests {
     final class Flag: @unchecked Sendable { var down = true; var calls = 0 }
 
     // CR #7.4: failures are negative-cached with back-off (no storm), then retried.
-    @Test func rasterStoreBacksOffFailuresThenRetries() async throws {
+    @Test(.rasterFixtures) func rasterStoreBacksOffFailuresThenRetries() async throws {
         let png = try Self.fixture("OKX_N0B_202610161748", "png"), wld = try Self.fixture("OKX_N0B_202610161748", "wld")
         let clock = Clock(), flag = Flag()
         let store = RidgeRasterStore(clock: { clock.now }) { url in
@@ -272,7 +272,7 @@ struct RidgeRasterTests {
     }
 
     // CR #7.5: LRU, and memory pressure trims to the newest scans until restored.
-    @Test func rasterStoreIsLRUAndTrimsUnderPressure() async throws {
+    @Test(.rasterFixtures) func rasterStoreIsLRUAndTrimsUnderPressure() async throws {
         let png = try Self.fixture("OKX_N0B_202610161748", "png"), wld = try Self.fixture("OKX_N0B_202610161748", "wld")
         let store = RidgeRasterStore(limit: 3) { url in url.pathExtension == "png" ? png : wld }
         for k in 1...3 { _ = await store.raster(base: "https://a/\(k)") }
@@ -290,22 +290,77 @@ struct RidgeRasterTests {
         #expect(await store.count == 2)
     }
 
-    // Memory: closing the window purges every scan; the cap is unchanged and the next radar re-fetches.
-    @Test func rasterStorePurgeDropsEverythingAndKeepsTheCap() async throws {
+    // Closing the window drops decoded scans (~1 MB) and keeps the png + world file. The next ask
+    // re-decodes; it does not fetch, and it does not wait out the 10 s back-off.
+    @Test(.rasterFixtures) func rasterStorePurgeKeepsCompressedBytesAndTheCap() async throws {
         let png = try Self.fixture("OKX_N0B_202610161748", "png"), wld = try Self.fixture("OKX_N0B_202610161748", "wld")
-        let store = RidgeRasterStore(limit: 3) { url in url.pathExtension == "png" ? png : wld }
+        final class Flag: @unchecked Sendable { var down = false }
+        let flag = Flag()
+        let store = RidgeRasterStore(limit: 3) { url in
+            if flag.down { return nil }
+            return url.pathExtension == "png" ? png : wld
+        }
         for k in 1...3 { _ = await store.raster(base: "https://a/\(k)") }
         #expect(await store.count == 3)
+        #expect(await store.compressedBytes > 0)
+        #expect(await store.compressedBytes <= RidgeRasterStore.defaultCompressedBudget)
         await store.purge()
         #expect(await store.count == 0)
+        flag.down = true // a fetch now would fail and start the 10 s back-off
         #expect(await store.raster(base: "https://a/1") != nil)
-        #expect(await store.fetches == 4) // re-fetched after the purge
-        for k in 2...5 { _ = await store.raster(base: "https://a/\(k)") }
-        #expect(await store.count == 3) // same cap as before
+        #expect(await store.fetches == 3)
+        #expect(await store.count == 1)
+        flag.down = false
+        for k in 2...4 { _ = await store.raster(base: "https://a/\(k)") }
+        #expect(await store.count == 3) // decoded cap unchanged
+        #expect(await store.fetches == 4) // scans 2 and 3 came from compressed bytes; only 4 was fetched
+    }
+
+    @Test(.rasterFixtures) func clearBackoffRetriesWithoutWaiting() async throws {
+        let png = try Self.fixture("OKX_N0B_202610161748", "png"), wld = try Self.fixture("OKX_N0B_202610161748", "wld")
+        final class Flag: @unchecked Sendable { var down = true }
+        let flag = Flag()
+        let store = RidgeRasterStore { url in
+            flag.down ? nil : (url.pathExtension == "png" ? png : wld)
+        }
+        let base = "https://a/1"
+        #expect(await store.raster(base: base) == nil)
+        #expect(await store.isBackingOff(base))
+        store.invalidateBackoff()
+        #expect(await store.isBackingOff(base) == false)
+        flag.down = false
+        #expect(await store.raster(base: base) != nil)
+        #expect(await store.fetches == 2)
+    }
+
+    @Test(.rasterFixtures) func compressedScansStayInsideTheBudget() async throws {
+        let png = try Self.fixture("OKX_N0B_202610161748", "png"), wld = try Self.fixture("OKX_N0B_202610161748", "wld")
+        let one = png.count + wld.count
+        let store = RidgeRasterStore(limit: 5, compressedBudget: one) { url in url.pathExtension == "png" ? png : wld }
+        _ = await store.raster(base: "https://a/1")
+        _ = await store.raster(base: "https://a/2")
+        #expect(await store.compressedBytes == one)
+        await store.purge()
+        let fetches = await store.fetches
+        #expect(await store.raster(base: "https://a/2") != nil)
+        #expect(await store.fetches == fetches)
+        #expect(await store.raster(base: "https://a/1") != nil)
+        #expect(await store.fetches == fetches + 1)
+    }
+
+    @Test func frameTemplateExposesRasterBaseAndMask() {
+        let t = ISO8601DateFormatter().date(from: "2026-10-16T17:48:00Z")!
+        let base = "https://mesonet.agron.iastate.edu/archive/data/2026/10/16/GIS/ridge/OKX/N0B/OKX_N0B_202610161748"
+        let tile = "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/ridge::OKX-N0B-202610161748/{z}/{x}/{y}.png#raw=\(base)"
+        #expect(RadarQC.rasterBase(in: tile) == base)
+        #expect(RadarQC.qcTemplate(in: tile) == nil)
+        let masked = tile + "&qc=" + RadarQC.maskTemplate(at: t)
+        #expect(RadarQC.rasterBase(in: masked) == base)
+        #expect(RadarQC.qcTemplate(in: masked) == RadarQC.maskTemplate(at: t))
     }
 
     // CR #7.5: decodes run concurrently, off the actor (two slow fetches overlap).
-    @Test func decodesRunConcurrently() async throws {
+    @Test(.rasterFixtures) func decodesRunConcurrently() async throws {
         let png = try Self.fixture("OKX_N0B_202610161748", "png"), wld = try Self.fixture("OKX_N0B_202610161748", "wld")
         final class Gauge: @unchecked Sendable { let lock = NSLock(); var now = 0, peak = 0
             func enter() { lock.lock(); now += 1; peak = max(peak, now); lock.unlock() }
@@ -322,7 +377,7 @@ struct RidgeRasterTests {
         #expect(g.peak >= 3) // both scans' png + wld in flight together
     }
 
-    @Test func rasterStoreCachesPerScanAndRetriesFailures() async throws {
+    @Test(.rasterFixtures) func rasterStoreCachesPerScanAndRetriesFailures() async throws {
         let png = try Self.fixture("OKX_N0B_202610161748", "png"), wld = try Self.fixture("OKX_N0B_202610161748", "wld")
         final class Flag: @unchecked Sendable { var down = true }
         final class TestClock: @unchecked Sendable { var now = Date(timeIntervalSince1970: 0) }
@@ -339,7 +394,8 @@ struct RidgeRasterTests {
         #expect(await store.fetches == 2) // one failed + one good; the third came from cache
         let small = RidgeRasterStore(limit: 1) { url in url.pathExtension == "png" ? png : wld }
         _ = await small.raster(base: "https://a/1"); _ = await small.raster(base: "https://a/2"); _ = await small.raster(base: "https://a/1")
-        #expect(await small.fetches == 3) // evicted at the limit (memory bound)
+        #expect(await small.fetches == 2) // decoded scan was evicted; the third came from compressed bytes
+        #expect(await small.count == 1)
     }
 
     // CR #7 (final), item 4: the newest scan shows IEM's tile at once and swaps to smooth in place.

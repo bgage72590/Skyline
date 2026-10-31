@@ -6,10 +6,11 @@ import SkylineCore
 /// the physical footprint (Activity Monitor's "Memory") and quits at the end.
 /// * `-SkylineMemTest radar`: New York, expanded radar on the OKX site at `-SkylineMemZoom` (10),
 ///   playing; samples every 2 s for `-SkylineMemSeconds` (150).
-/// * `-SkylineMemTest cycles`: `-SkylineMemCycles` (20) rounds of radar expand → play 6 s → collapse,
-///   next city, refresh (the selected city forced; every 5th round the main window is closed and
-///   reopened), then settles with the window open and closed.
-/// Selection, radar site and play state are put back afterwards. Never adds or removes cities.
+/// * `-SkylineMemTest cycles` (Q2): `-SkylineMemCycles` (20) rounds of close then reopen.
+///   Each round expands and plays the radar first. It does not change the city, the radar site,
+///   units, or sync.json, and it does not write defaults. A cycle FAILs if maps=0 before close
+///   or the frame moves by more than 1 pt.
+/// The radar mode puts selection and radar site back afterwards. Never adds or removes cities.
 @MainActor
 enum MemoryTest {
     static func runIfRequested(store: WeatherStore) {
@@ -24,14 +25,17 @@ enum MemoryTest {
 
     static func run(_ mode: String, store: WeatherStore) async {
         let d = UserDefaults.standard
+        let reopenOnly = mode != "radar"
         let savedSelection = store.selectedID
         let savedSite = d.string(forKey: "radarSite")
         let radar = store.radar
         let start = Date()
         while store.selectedLocation.flatMap({ store.reports[$0.id] }) == nil, Date().timeIntervalSince(start) < 60 { await sleep(0.25) }
-        if let ny = store.allLocations.first(where: { !$0.isCurrentLocation && $0.name == "New York" }) { store.selectedID = ny.id }
-        radar.setSiteChoice(.site("OKX"))
-        await sleep(3)
+        if !reopenOnly {
+            if let ny = store.allLocations.first(where: { !$0.isCurrentLocation && $0.name == "New York" }) { store.selectedID = ny.id }
+            radar.setSiteChoice(.site("OKX"))
+            await sleep(3)
+        }
         log("start mode=\(mode) mem=\(mb()) cities=\(store.allLocations.count)")
         switch mode {
         case "radar":
@@ -52,48 +56,51 @@ enum MemoryTest {
             let steady = samples.suffix(max(1, samples.count * 2 / 3))
             log("RESULT radar steady min=\(steady.min()!) max=\(steady.max()!) avg=\(steady.reduce(0, +) / steady.count) peak=\(samples.max()!) z=\(radar.debugRadarZoom?() ?? -1)")
         default:
+            // Q2: close and reopen. Expand and play the radar, but do not change city, site, or defaults.
             let n = { let v = d.integer(forKey: "SkylineMemCycles"); return v > 0 ? v : 20 }()
-            let cities = store.allLocations
             var perCycle: [Int] = []
+            var failures: [String] = []
             for i in 1...n {
                 store.radarExpanded = true
-                await sleep(2)
                 radar.setPlaying(true)
-                await sleep(6)
-                radar.setPlaying(false)
-                store.radarExpanded = false
-                await sleep(2)
-                store.selectedID = cities[i % cities.count].id
-                await sleep(3)
-                if let sel = store.selectedLocation { await store.load(sel, force: true) }
-                if i % 5 == 0 {
-                    closeMainWindow()
-                    await sleep(4)
-                    AppExit.showMainWindow()
-                    await sleep(4)
+                let mapsDeadline = Date().addingTimeInterval(8)
+                while RadarMapContainer.live == 0, Date() < mapsDeadline { await sleep(0.1) }
+                let mapsBefore = RadarMapContainer.live
+                if mapsBefore == 0 { failures.append("cycle \(i) maps=0 before close") }
+                let beforeFrames = MainWindowFrameHold.currentFrames()
+                log("frame before close \(MainWindowFrameHold.describeCurrent()) maps=\(mapsBefore)")
+                closeMainWindow()
+                await sleep(4)
+                AppExit.showMainWindow()
+                await sleep(4) // past scheduleRestore's 0.6 s pass. Read the frame; do not apply it.
+                log("frame after reopen \(MainWindowFrameHold.describeCurrent())")
+                if MainWindowFrameHold.moved(from: beforeFrames, to: MainWindowFrameHold.currentFrames()) {
+                    failures.append("cycle \(i) frame changed")
                 }
-                await sleep(1)
                 perCycle.append(mb())
                 log("cycle \(i) mem=\(perCycle.last!) maps=\(RadarMapContainer.live) engines=\(RadarMapContainer.liveMaps) liveTiles=\(RadarLayerView.liveTiles)")
             }
-            store.selectedID = savedSelection
-            await sleep(30)
+            await sleep(2)
             let open = mb()
+            log("frame before close \(MainWindowFrameHold.describeCurrent())")
             closeMainWindow()
             await sleep(45)
-            log("RESULT cycles first=\(perCycle.first!) last=\(perCycle.last!) max=\(perCycle.max()!) settledOpen=\(open) settledClosed=\(mb()) maps=\(RadarMapContainer.live) engines=\(RadarMapContainer.liveMaps)")
+            let fail = failures.isEmpty ? "none" : failures.joined(separator: "; ")
+            log("RESULT cycles first=\(perCycle.first!) last=\(perCycle.last!) max=\(perCycle.max()!) settledOpen=\(open) settledClosed=\(mb()) maps=\(RadarMapContainer.live) engines=\(RadarMapContainer.liveMaps) fail=\(fail)")
         }
-        radar.setPlaying(false)
-        store.radarExpanded = false
-        store.selectedID = savedSelection
-        if let savedSite { d.set(savedSite, forKey: "radarSite"); radar.setSiteChoice(RadarSiteChoice(stored: savedSite)) }
+        if !reopenOnly {
+            radar.setPlaying(false)
+            store.radarExpanded = false
+            store.selectedID = savedSelection
+            if let savedSite { d.set(savedSite, forKey: "radarSite"); radar.setSiteChoice(RadarSiteChoice(stored: savedSite)) }
+        }
         log("done cities=\(store.allLocations.count)")
         await sleep(1)
         if d.bool(forKey: "SkylineMemQuit") { NSApp.terminate(nil) }
     }
 
     static func closeMainWindow() {
-        for window in NSApp.windows where window.title == "Skyline" || window.identifier?.rawValue.hasPrefix(SceneID.main) == true {
+        for window in NSApp.windows where MainWindowMatch.isMain(MainWindowAttributes(window: window)) {
             window.close()
         }
     }

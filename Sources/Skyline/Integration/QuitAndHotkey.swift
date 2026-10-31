@@ -27,7 +27,7 @@ enum AppExit {
     }
 
     static var mainWindowVisible: Bool {
-        NSApp.windows.contains { $0.isVisible && ($0.identifier?.rawValue.hasPrefix(SceneID.main) == true || $0.title == "Skyline") && isAppWindow($0) }
+        NSApp.windows.contains { $0.isVisible && MainWindowMatch.isMain(MainWindowAttributes(window: $0)) }
     }
 
     /// Brings the main window back (dropdown, Dock click, relaunch, hotkey fallback, Shortcuts).
@@ -44,13 +44,15 @@ enum AppExit {
     }
 
     static func showMainWindow() {
-        AppActions.openMainWindow?()
+        AppActions.performOpenMainWindow()
         NSApp.activate()
     }
 
     /// Hidden QA hook: `-SkylineQuitKeyTest YES` sends ⌘Q through the app's own main menu (in-process,
     /// no events to other apps), checks Skyline is still running with the window closed and the
-    /// menu-bar item present, reopens the window, logs PASS/FAIL and quits completely.
+    /// menu-bar item present, then closes and reopens five times. Logs one PASS/FAIL line and quits.
+    /// Show in Dock off is `-showInDock NO` in the argument domain; this hook never writes that default.
+    /// Not swift-testable: reopen goes through SwiftUI's `openWindow` environment.
     static func runQuitKeyTestIfRequested() {
         guard UserDefaults.standard.bool(forKey: "SkylineQuitKeyTest") else { return }
         Task {
@@ -67,10 +69,34 @@ enum AppExit {
             let statusItem = NSApp.windows.contains { $0.className == "NSStatusBarWindow" }
             if !statusItem { failures.append("menu-bar item missing") }
             print("[quit-test] after ⌘Q: alive=yes window=\(mainWindowVisible ? "open" : "closed") statusItem=\(statusItem)")
-            _ = AppDelegateReopen.simulateReopen()
-            try? await Task.sleep(for: .seconds(2))
-            if !mainWindowVisible { failures.append("reopen did not bring the window back") }
-            print("[quit-test] after reopen: window=\(mainWindowVisible ? "open" : "closed")")
+            for cycle in 1...5 {
+                let beforeFrames = MainWindowFrameHold.currentFrames()
+                let appearsBefore = MainWindowContentAppear.count
+                print("[quit-test] frame before close \(MainWindowFrameHold.describeCurrent())")
+                MemoryTest.closeMainWindow()
+                let mapsDeadline = Date().addingTimeInterval(8)
+                while RadarMapContainer.live != 0 && Date() < mapsDeadline {
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+                if RadarMapContainer.live != 0 { failures.append("cycle \(cycle) maps=\(RadarMapContainer.live)") }
+                _ = AppDelegateReopen.simulateReopen()
+                let visibleDeadline = Date().addingTimeInterval(8)
+                while !mainWindowVisible && Date() < visibleDeadline {
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+                if !mainWindowVisible { failures.append("cycle \(cycle) window not visible") }
+                // Past the app's own scheduleRestore (next turn, then 0.6 s). Read only; do not apply.
+                try? await Task.sleep(for: .seconds(1.2))
+                print("[quit-test] frame after reopen \(MainWindowFrameHold.describeCurrent())")
+                if MainWindowFrameHold.moved(from: beforeFrames, to: MainWindowFrameHold.currentFrames()) {
+                    failures.append("cycle \(cycle) frame changed")
+                }
+                let appears = MainWindowContentAppear.count
+                let contentOpen = IntentStore.shared?.isMainWindowOpen == true
+                if !contentOpen || appears != appearsBefore + 1 {
+                    failures.append("cycle \(cycle) content open=\(contentOpen) appears=\(appears) was=\(appearsBefore)")
+                }
+            }
             print(failures.isEmpty ? "[quit-test] PASS" : "[quit-test] FAIL: \(failures.joined(separator: "; "))")
             fflush(stdout)
             perform(.quitCompletely)

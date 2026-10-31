@@ -97,8 +97,19 @@ enum SceneID {
 /// Bridges AppKit lifecycle events that SwiftUI scenes don't expose.
 @MainActor
 enum AppActions {
-    /// Set by views that have access to `openWindow`, used when the Dock icon is clicked with no window open.
+    /// Set by MenuBarLabel, which lives as long as the app. The main window must not replace it:
+    /// that view's `openWindow` goes stale once the window is released.
     static var openMainWindow: (() -> Void)?
+
+    /// Opens the main window. One log line and a return when no handler is registered yet.
+    static func performOpenMainWindow() {
+        guard let openMainWindow else {
+            print("[open] handler missing")
+            fflush(stdout)
+            return
+        }
+        openMainWindow()
+    }
 
     private static var spaceMonitor: Any?
 
@@ -111,8 +122,7 @@ enum AppActions {
         spaceMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak store] event in
             guard event.keyCode == 49,
                   event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
-                  let window = event.window, window.identifier?.rawValue.hasPrefix(SceneID.main) == true
-                    || window.title == "Skyline",
+                  let window = event.window, MainWindowMatch.isMain(MainWindowAttributes(window: window)),
                   !spaceBelongsTo(window.firstResponder), !event.isARepeat,
                   let store, store.selectedLocation != nil else { return event }
             store.radar.togglePlay()
@@ -183,7 +193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
-            MainActor.assumeIsolated { AppActions.openMainWindow?() }
+            MainActor.assumeIsolated { AppActions.performOpenMainWindow() }
         }
         return true
     }

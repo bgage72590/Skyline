@@ -2,25 +2,32 @@ import AppKit
 import SwiftUI
 import SkylineCore
 
+/// How many times the main window's content view appeared. The quit-key hook FAILs if a cycle
+/// does not increase this by one. Not read by the view, so bumping it does not rebuild the window.
+@MainActor
+enum MainWindowContentAppear {
+    static var count = 0
+}
+
 struct ContentView: View {
     @Environment(WeatherStore.self) private var store
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Group {
             if store.isMainWindowOpen {
                 windowContent
+                    .onAppear { MainWindowContentAppear.count += 1 }
             } else {
-                // Window closed (menu bar only): nothing heavy stays alive. SwiftUI keeps the closed
-                // window and this root view; the map, radar layers and backgrounds are rebuilt on reopen.
+                // Fallback while the closed window is released. Reopen builds this view again.
                 Color.black
             }
         }
         .background(WindowVisibilityReader(onChange: { visible in store.setMainWindowVisible(visible) },
                                            onOpenChange: { open in store.setMainWindowOpen(open) }))
+        .background(MainWindowRelease())
         .onAppear {
-            let open = openWindow
-            AppActions.openMainWindow = { open(id: SceneID.main) }
+            // MenuBarLabel owns openMainWindow for the life of the app. This window's openWindow
+            // goes stale once the window is released.
             AppActions.installSpaceShortcut(store: store)
         }
     }

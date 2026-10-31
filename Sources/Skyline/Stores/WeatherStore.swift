@@ -93,6 +93,9 @@ final class WeatherStore {
     /// False while the main window is closed (menu bar only): ContentView then drops its content, which
     /// frees the MKMapView, radar layers and living background; it's rebuilt when the window reopens.
     private(set) var isMainWindowOpen = true
+    /// Returns freed malloc pages after the close purge, then again about 2 s later if still closed.
+    /// The relief function is nonisolated: `MemoryRelief.relieve` hops to its utility queue.
+    @ObservationIgnored private let closeRelief = CloseReliefScheduler(relief: MemoryRelief.relieve)
     /// Bumped when a report crosses its staleness deadline or an alert ends, so views that show data age
     /// (menu-bar dimming, the offline banner) re-render without polling.
     private(set) var staleTick = 0
@@ -897,9 +900,9 @@ final class WeatherStore {
         }
     }
 
-    /// Window closed → menu bar only: stop radar playback, drop the window content (ContentView swaps it
-    /// for an empty view, deallocating the map and layers), trim radar caches, and slow the refresh loop.
-    /// Reopened → rebuild and refresh. Called on the main queue's next turn (never inside layout).
+    /// Window closed → menu bar only: stop radar playback, release the window, trim radar caches, and
+    /// slow the refresh loop. Reopened → a new window, radar prewarmed, then refresh.
+    /// Called on the main queue's next turn (never inside layout).
     func setMainWindowOpen(_ open: Bool) {
         guard open != isMainWindowOpen else { return }
         isMainWindowOpen = open
@@ -909,14 +912,16 @@ final class WeatherStore {
             setMainWindowVisible(false)
             radar.setPlaying(false)
             isScrubbing = false
-            RadarImageCache.shared.trim()
-            MemoryRelief.soon(after: 5) // after SwiftUI has deallocated the window content
-            // MapKit/VectorKit tear their engine down asynchronously; relieve again once that is done.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
-                if self?.isMainWindowOpen == false { MemoryRelief.soon(after: 0) }
+            RadarImageCache.shared.closeForMenuBar()
+            closeRelief.noteClosed {
+                await RadarImageCache.waitForSharedCloseChain()
             }
             // Window gone: retries are only for the menu-bar location.
             for (id, task) in retryTasks where id != menuBarLocation?.id { task.cancel(); retryTasks[id] = nil }
+        } else {
+            closeRelief.noteOpened()
+            RadarImageCache.shared.reopen(frames: radar.frames, shownIndex: radar.index)
+            MainWindowFrameHold.scheduleRestore()
         }
         startRefreshLoop() // re-arms with the cadence for the new state (and refreshes what's due now)
     }
@@ -1327,8 +1332,18 @@ extension WeatherStore {
             NSApp.activate()
             // On a cold launch the scenes may not have registered their window opener yet: retry briefly.
             Task { @MainActor in
+                var announced = false
                 for _ in 0..<20 {
-                    if let open = AppActions.openMainWindow { open(); NSApp.activate(); return }
+                    if AppActions.openMainWindow != nil {
+                        AppActions.performOpenMainWindow()
+                        NSApp.activate()
+                        return
+                    }
+                    if !announced {
+                        print("[open] handler missing")
+                        fflush(stdout)
+                        announced = true
+                    }
                     try? await Task.sleep(for: .milliseconds(250))
                 }
             }
