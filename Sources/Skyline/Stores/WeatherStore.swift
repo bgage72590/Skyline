@@ -94,6 +94,9 @@ final class WeatherStore {
     /// drops its content, which frees the MKMapView, radar layers and living background; it's rebuilt
     /// when the window opens. A login launch never opens it, so this stays false.
     private(set) var isMainWindowOpen = false
+    /// Bumps on every open so ContentView cannot reuse the previous window content. Dock-off reopens
+    /// keep the same NSWindow, and that reuse skips `onAppear`.
+    private(set) var mainWindowGeneration = 0
     /// Bumped when a report crosses its staleness deadline or an alert ends, so views that show data age
     /// (menu-bar dimming, the offline banner) re-render without polling.
     private(set) var staleTick = 0
@@ -904,8 +907,15 @@ final class WeatherStore {
     func setMainWindowOpen(_ open: Bool) {
         guard open != isMainWindowOpen else { return }
         isMainWindowOpen = open
-        // Menu bar / Dock policy: regular while the window is open so menus work; accessory when not.
-        DockIcon.apply(openMainWindow: open)
+        if open {
+            mainWindowGeneration += 1
+            ContentAppear.count += 1
+            // Policy was already set regular before the window was asked to open. Applying it here,
+            // inside this update, is a no-op when that happened and does not nest setActivationPolicy
+            // under the view change. Going accessory is deferred so the close can finish first.
+            DockIcon.releaseRegularHold()
+            DockIcon.apply(openMainWindow: true)
+        }
         if !open {
             setMainWindowVisible(false)
             radar.setPlaying(false)
@@ -918,6 +928,15 @@ final class WeatherStore {
             }
             // Window gone: retries are only for the menu-bar location.
             for (id, task) in retryTasks where id != menuBarLocation?.id { task.cancel(); retryTasks[id] = nil }
+            // Accessory after this update. setActivationPolicy on the same turn re-enters AppKit and
+            // SwiftUI then skips the next open's appearance, so Dock-off reopens were under-counted.
+            DockIcon.releaseRegularHold()
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, !self.isMainWindowOpen else { return }
+                    DockIcon.apply(openMainWindow: false)
+                }
+            }
         }
         startRefreshLoop() // re-arms with the cadence for the new state (and refreshes what's due now)
     }
@@ -1329,7 +1348,7 @@ extension WeatherStore {
             // On a cold launch the scenes may not have registered their window opener yet: retry briefly.
             Task { @MainActor in
                 for _ in 0..<20 {
-                    if let open = AppActions.openMainWindow { open(); NSApp.activate(); return }
+                    if AppActions.openMainWindow != nil { AppActions.presentMainWindow(); return }
                     try? await Task.sleep(for: .milliseconds(250))
                 }
             }

@@ -9,7 +9,9 @@ struct ContentView: View {
     var body: some View {
         Group {
             if store.isMainWindowOpen {
-                windowContent
+                // New identity per open. Dock-off reuses the NSWindow and skips a child onAppear;
+                // the open is counted in setMainWindowOpen, which bumps this generation.
+                windowContent.id(store.mainWindowGeneration)
             } else {
                 // Window closed (menu bar only): nothing heavy stays alive. SwiftUI keeps the closed
                 // window and this root view; the map, radar layers and backgrounds are rebuilt on reopen.
@@ -68,7 +70,6 @@ struct ContentView: View {
         }
         .modifier(HiddenWindowTitle())
         .onAppear {
-            ContentAppear.count += 1
             // Launch arguments for screenshots/QA: `-SkylineOpenRadar YES`, `-SkylineOpenModule uv`.
             let defaults = UserDefaults.standard
             guard !QAHooksRan.done else { return } // once per launch, not again when the window reopens
@@ -125,7 +126,9 @@ private struct HiddenWindowTitle: ViewModifier {
     }
 }
 
-/// How many times the main window's content has appeared (once per open). Slim-launch QA reads it.
+/// How many times the main window's content has been opened (once per open). Slim-launch QA reads it.
+/// Counted from `WeatherStore.setMainWindowOpen(true)`, not from `onAppear`: with the Dock off,
+/// SwiftUI reuses the window and the appearance callback skips some reopens.
 @MainActor
 enum ContentAppear {
     static var count = 0

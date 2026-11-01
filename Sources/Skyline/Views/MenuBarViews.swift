@@ -10,6 +10,7 @@ import SkylineCore
 struct MenuBarLabel: View {
     let store: WeatherStore
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     struct Spec: Equatable {
         var symbol: String
@@ -23,8 +24,11 @@ struct MenuBarLabel: View {
             .onAppear {
                 // The label lives as long as the app, so the Dock icon, a relaunch and Shortcuts can
                 // reopen the window even before the dropdown or window has ever been shown (batch 6).
+                // Settings uses the same scene action: showSettingsWindow: does nothing with no window.
                 let open = openWindow
                 AppActions.openMainWindow = { open(id: SceneID.main) }
+                let showSettings = openSettings
+                AppActions.openSettings = { showSettings() }
             }
     }
 

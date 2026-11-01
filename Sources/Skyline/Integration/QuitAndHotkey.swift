@@ -20,7 +20,13 @@ enum AppExit {
     /// Closes Skyline's ordinary windows (main, Settings); the menu-bar extra's panel isn't one of them.
     static func closeWindows() {
         GlobalHotkey.closePanel() // the hotkey panel is an NSPanel, so close it explicitly (QA batch 6 Q1)
-        for w in NSApp.windows where w.isVisible && isAppWindow(w) { w.performClose(nil) }
+        for w in NSApp.windows where w.isVisible && isAppWindow(w) {
+            let id = w.identifier?.rawValue ?? ""
+            // Dock-off reuses this window and can drop the visibility reader's close event.
+            // Clear the flag here so the next open is a new content generation and counts once.
+            if id == SceneID.main || id.hasPrefix("main-") { IntentStore.shared?.setMainWindowOpen(false) }
+            w.performClose(nil)
+        }
     }
 
     static func isAppWindow(_ w: NSWindow) -> Bool {
@@ -35,18 +41,21 @@ enum AppExit {
     /// Opens Settings from any context (main window, menu-bar dropdown, or ⌃⌥W panel). SettingsLink
     /// only works inside an app Scene; the hotkey panel hosts the dropdown outside one (QA #3).
     static func openSettings() {
-        DockIcon.apply(openMainWindow: true) // Settings needs the app menu bar too
+        // The menu-bar scene's openSettings action. showSettingsWindow: presents nothing when
+        // Skyline is accessory and has no window, and the forced regular policy then sticks.
+        DockIcon.holdRegularForPresentation()
         NSApp.activate()
-        // Private but stable selector used by System Settings / SwiftUI SettingsLink on macOS.
+        if let open = AppActions.openSettings {
+            open()
+            return
+        }
         let sel = Selector(("showSettingsWindow:"))
         if NSApp.sendAction(sel, to: nil, from: nil) { return }
-        // Older fallback.
         NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
     }
 
     static func showMainWindow() {
-        AppActions.openMainWindow?()
-        NSApp.activate()
+        AppActions.presentMainWindow()
     }
 
     /// Hidden QA hook: `-SkylineQuitKeyTest YES` sends ⌘Q through the app's own main menu (in-process,
@@ -324,13 +333,17 @@ enum SlimOpen {
             return
         }
         guard ["reopen", "dropdown", "hotkey", "intent"].contains(mode) else {
-            SlimLog.line("[slim] open FAIL reason=mode n=\(SlimWindows.count) mode=\(mode)")
+            SlimLog.line("[slim] open FAIL reason=mode n=\(SlimWindows.count) visible=\(SlimWindows.visible) mode=\(mode)")
             return
         }
-        guard SlimLaunchRuntime.waitForHandler() else {
-            SlimLog.line("[slim] open FAIL reason=handler nil n=\(SlimWindows.count) appear=\(ContentAppear.count) mode=\(mode)")
+        guard await SlimLaunchRuntime.waitForHandler() else {
+            SlimLog.line("[slim] open FAIL reason=handler nil n=\(SlimWindows.count) visible=\(SlimWindows.visible) appear=\(ContentAppear.count) mode=\(mode)")
             return
         }
+        let restoreSelection = mode == "hotkey" || mode == "intent"
+        let startSelection = IntentStore.shared?.selectedID
+        let startRadar = IntentStore.shared?.radarExpanded ?? false
+        let startModule = IntentStore.shared?.activeModule
         var reasons: [String] = []
         for cycle in 1...cycles {
             let before = ContentAppear.count
@@ -340,7 +353,7 @@ enum SlimOpen {
                 let remain = mark - Date().timeIntervalSince(opened)
                 if remain > 0 { try? await Task.sleep(for: .seconds(remain)) }
                 let n = SlimWindows.count
-                if n != 1 { reasons.append("windows cycle=\(cycle) t=\(Int(mark)) n=\(n)") }
+                if n != 1 { reasons.append("windows cycle=\(cycle) t=\(Int(mark)) n=\(n) visible=\(SlimWindows.visible)") }
                 if ContentAppear.count != before + 1 {
                     reasons.append("appear cycle=\(cycle) t=\(Int(mark)) appear=\(ContentAppear.count) expected=\(before + 1)")
                 }
@@ -351,7 +364,15 @@ enum SlimOpen {
                 reasons.append("policy cycle=\(cycle) policy=\(SlimWindows.policyLabel(NSApp.activationPolicy())) expected=\(SlimWindows.policyLabel(want))")
             }
         }
-        let fields = "mode=\(mode) cycles=\(cycles) n=\(SlimWindows.count) appear=\(ContentAppear.count) policy=\(SlimWindows.policyLabel(NSApp.activationPolicy()))"
+        if restoreSelection, let store = IntentStore.shared {
+            // ShowRadarIntent selects the menu-bar city and expands the radar, in memory only.
+            // hotkey uses the store-nil window fallback and should not move the city either.
+            if store.selectedID != startSelection { store.selectedID = startSelection }
+            if store.radarExpanded != startRadar { store.radarExpanded = startRadar }
+            if store.activeModule != startModule { store.activeModule = startModule }
+        }
+        let restored = IntentStore.shared?.selectedID ?? "nil"
+        let fields = "mode=\(mode) cycles=\(cycles) n=\(SlimWindows.count) visible=\(SlimWindows.visible) appear=\(ContentAppear.count) policy=\(SlimWindows.policyLabel(NSApp.activationPolicy())) restored=\(restored)"
         if reasons.isEmpty {
             SlimLog.line("[slim] open PASS \(fields)")
         } else {

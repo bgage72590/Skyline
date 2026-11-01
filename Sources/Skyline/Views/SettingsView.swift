@@ -214,9 +214,30 @@ extension DistanceUnit: UnitLabelled {}
 enum DockIcon {
     static let key = "showInDock"
 
-    /// True when Show-in-Dock is on (default).
+    /// True when Show-in-Dock is on (default). A launch argument overrides this read only;
+    /// the stored setting is left alone. `-showInDock NO` arrives as the string "NO", which
+    /// `object(forKey:) as? Bool` would ignore and treat as on.
     static var prefersDockIcon: Bool {
-        UserDefaults.standard.object(forKey: key) as? Bool ?? true
+        if let override = LaunchArguments.bool(key) { return override }
+        return UserDefaults.standard.object(forKey: key) as? Bool ?? true
+    }
+
+    /// Keeps `.regular` for a moment while a window or Settings is being asked to appear.
+    /// An accessory app drops back to `.accessory` if policy is recomputed before the window exists.
+    private static var regularHold = false
+
+    static func holdRegularForPresentation() {
+        regularHold = true
+        apply(openMainWindow: true)
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            if !needsMenuBar() { regularHold = false }
+            apply()
+        }
+    }
+
+    static func releaseRegularHold() {
+        regularHold = false
     }
 
     /// Windows that need the app menu bar (main Skyline window or Settings).
@@ -232,7 +253,7 @@ enum DockIcon {
     }
 
     static func apply(openMainWindow: Bool? = nil) {
-        let wantRegular = prefersDockIcon || needsMenuBar(openMainWindow: openMainWindow)
+        let wantRegular = prefersDockIcon || regularHold || needsMenuBar(openMainWindow: openMainWindow)
         let policy: NSApplication.ActivationPolicy = wantRegular ? .regular : .accessory
         guard NSApp.activationPolicy() != policy else { return }
         NSApp.setActivationPolicy(policy)

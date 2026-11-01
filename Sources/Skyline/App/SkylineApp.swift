@@ -102,6 +102,36 @@ enum SceneID {
 enum AppActions {
     /// Set by views that have access to `openWindow`, used when the Dock icon is clicked with no window open.
     static var openMainWindow: (() -> Void)?
+    /// Set by MenuBarLabel from the menu-bar scene. `showSettingsWindow:` does not present Settings
+    /// when Skyline has no window.
+    static var openSettings: (() -> Void)?
+
+    /// Regular policy first, then the registered opener. An accessory app will not show a reused
+    /// window, and the visibility reader then never reports the open.
+    static func presentMainWindow() {
+        DockIcon.holdRegularForPresentation()
+        NSApp.activate()
+        openMainWindow?()
+        Task { @MainActor in
+            // The visibility reader misses some Dock-off reopens of a reused window.
+            // If the window is on screen and the flag is still false, count the open here.
+            for _ in 0..<10 {
+                await Task.yield()
+                try? await Task.sleep(for: .milliseconds(50))
+                guard mainWindowIsOnScreen else { continue }
+                IntentStore.shared?.setMainWindowOpen(true)
+                return
+            }
+        }
+    }
+
+    private static var mainWindowIsOnScreen: Bool {
+        NSApp.windows.contains { window in
+            guard window.isVisible else { return false }
+            let id = window.identifier?.rawValue ?? ""
+            return id == SceneID.main || id.hasPrefix("main-")
+        }
+    }
 
     private static var spaceMonitor: Any?
 
@@ -169,7 +199,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated {
-            // Pumping the run loop while waiting for the window handler can re-enter this method.
+            // One classification. The handler wait no longer pumps the run loop, so this does not
+            // re-enter, and the guard stays so a second call cannot open the window twice.
             guard !didFinishStarted else { return }
             didFinishStarted = true
             SlimLaunchRuntime.didFinishAt = Date()
@@ -200,10 +231,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { _ in
                 MainActor.assumeIsolated { DockIcon.apply() }
             }
-            center.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { note in
+            center.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { _ in
                 MainActor.assumeIsolated {
                     // After this window closes, recompute (main window may still be open).
-                    DispatchQueue.main.async { DockIcon.apply() }
+                    DispatchQueue.main.async {
+                        if !DockIcon.needsMenuBar() { DockIcon.releaseRegularHold() }
+                        DockIcon.apply()
+                    }
                 }
             }
         }
@@ -211,7 +245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
-            MainActor.assumeIsolated { AppActions.openMainWindow?() }
+            MainActor.assumeIsolated { AppActions.presentMainWindow() }
         }
         return true
     }
@@ -258,21 +292,30 @@ enum SlimLaunchRuntime {
     static var decision: SlimLaunchDecision?
     static var handlerMissing = false
 
-    static func waitForHandler(seconds: TimeInterval = 2) -> Bool {
+    /// Poll on the main actor. A nested run loop in the common-modes pseudo-mode returns immediately
+    /// and busy-spins, so MenuBarLabel never gets a turn to register the handler.
+    static func waitForHandler(seconds: TimeInterval = 2) async -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
-        while AppActions.openMainWindow == nil && Date() < deadline {
-            _ = RunLoop.current.run(mode: .common, before: Date().addingTimeInterval(0.05))
+        while AppActions.openMainWindow == nil {
+            if Date() >= deadline { return false }
+            await Task.yield()
+            if AppActions.openMainWindow != nil { return true }
+            let slice = min(0.05, deadline.timeIntervalSinceNow)
+            if slice <= 0 { return AppActions.openMainWindow != nil }
+            try? await Task.sleep(for: .seconds(slice))
         }
-        return AppActions.openMainWindow != nil
+        return true
     }
 
     static func openMainWindowForLaunch() {
-        guard waitForHandler() else {
-            handlerMissing = true
-            print("[open] handler missing at launch")
-            fflush(stdout)
-            return
+        Task { @MainActor in
+            guard await waitForHandler() else {
+                handlerMissing = true
+                print("[open] handler missing at launch")
+                fflush(stdout)
+                return
+            }
+            AppActions.presentMainWindow()
         }
-        AppActions.openMainWindow?()
     }
 }

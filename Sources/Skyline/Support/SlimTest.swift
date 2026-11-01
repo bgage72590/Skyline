@@ -48,6 +48,29 @@ enum LaunchArguments {
         }
     }
 
+    /// Argument-domain bool. Accepts a real boolean and the text YES/NO, true/false, 1/0.
+    /// Nil when the argument is absent or not one of those, so callers can keep the stored value.
+    static func bool(_ key: String) -> Bool? {
+        guard let raw = value(key) else { return nil }
+        if let n = raw as? NSNumber {
+            let isBoolean = CFGetTypeID(n) == CFBooleanGetTypeID() || String(cString: n.objCType) == "c"
+            if isBoolean { return n.boolValue }
+            switch n.stringValue.lowercased() {
+            case "1": return true
+            case "0": return false
+            default: return nil
+            }
+        }
+        if let s = raw as? String {
+            switch s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "yes", "true", "1": return true
+            case "no", "false", "0": return false
+            default: return nil
+            }
+        }
+        return nil
+    }
+
     /// Present, and not an explicit NO. Bare YES and a boolean true both count.
     static func enabled(_ key: String) -> Bool {
         guard value(key) != nil else { return false }
@@ -72,12 +95,16 @@ enum SlimLog {
 @MainActor
 enum SlimWindows {
     /// Identifier only (`main` or `main-…`). The updater's progress window is also titled Skyline.
-    static var count: Int {
-        NSApp.windows.filter { window in
-            let id = window.identifier?.rawValue ?? ""
-            return id == SceneID.main || id.hasPrefix("main-")
-        }.count
+    private static func isMain(_ window: NSWindow) -> Bool {
+        let id = window.identifier?.rawValue ?? ""
+        return id == SceneID.main || id.hasPrefix("main-")
     }
+
+    static var count: Int { NSApp.windows.filter { isMain($0) }.count }
+
+    /// Same identifier match, but only windows actually on screen. Logged next to `n=` so a hidden
+    /// placeholder is visible in the line. The PASS rule still uses `count`.
+    static var visible: Int { NSApp.windows.filter { $0.isVisible && isMain($0) }.count }
 
     static func policyLabel(_ policy: NSApplication.ActivationPolicy) -> String {
         switch policy {
@@ -97,7 +124,7 @@ enum SlimWindows {
 
     static func fields(expected: Int) -> String {
         let open = IntentStore.shared?.isMainWindowOpen == true ? 1 : 0
-        return "n=\(count) expected=\(expected) appear=\(ContentAppear.count) open=\(open) policy=\(policyLabel(NSApp.activationPolicy()))"
+        return "n=\(count) visible=\(visible) expected=\(expected) appear=\(ContentAppear.count) open=\(open) policy=\(policyLabel(NSApp.activationPolicy()))"
     }
 }
 
@@ -212,18 +239,32 @@ enum SlimSettings {
     }
 }
 
-/// App-menu commands with no window. Fails if a main window appears or the synced snapshot changes.
+/// App-menu commands with no window. Fails only if a main window appears, units, cities or the
+/// synced settings change, or a command is missing, disabled or doesn't fire. Next then Previous
+/// must return to the start city when Next can move, and ⌘1 must select city 1. The starting city
+/// is always restored.
 @MainActor
 enum SlimMenu {
     static func run() async {
         await SlimLog.waitFromLaunch(1)
         guard let store = IntentStore.shared else {
-            SlimLog.line("[slim] menu FAIL reason=store n=0")
+            SlimLog.line("[slim] menu FAIL reason=store n=0 visible=0")
             return
         }
         let before = snapshot(store)
+        let startSelection = store.selectedID
+        let startRadar = store.radarExpanded
+        let startPlaying = store.radar.isPlaying
+        let startModule = store.activeModule
+        let cities = store.allLocations
+        let startIndex = cities.firstIndex { $0.id == startSelection } ?? 0
+        let nextCanMove = cities.count > 1 && startIndex < cities.count - 1
+        let firstCity = cities.first?.id
         var reasons: [String] = []
-        if SlimWindows.count != 0 { reasons.append("window at start n=\(SlimWindows.count)") }
+        var nextFired = false
+        if SlimWindows.count != 0 {
+            reasons.append("window at start n=\(SlimWindows.count) visible=\(SlimWindows.visible)")
+        }
         let commands: [(String, () -> NSMenuItem?)] = [
             ("Show Radar Map", { item(titled: "Show Radar Map") }),
             ("Next Location", { item(titled: "Next Location") }),
@@ -238,18 +279,37 @@ enum SlimMenu {
                 continue
             }
             if !item.isEnabled { reasons.append("disabled \(name)") }
-            if !fire(item) { reasons.append("unfired \(name)") }
+            if !fire(item) {
+                reasons.append("unfired \(name)")
+                continue
+            }
+            switch name {
+            case "Next Location":
+                nextFired = true
+            case "Previous Location":
+                if nextFired && nextCanMove && store.selectedID != startSelection {
+                    reasons.append("next-previous")
+                }
+            case "⌘1":
+                if store.selectedID != firstCity { reasons.append("command-1") }
+            default:
+                break
+            }
             try? await Task.sleep(for: .milliseconds(200))
-            if SlimWindows.count != 0 { reasons.append("window after \(name) n=\(SlimWindows.count)") }
+            if SlimWindows.count != 0 {
+                reasons.append("window after \(name) n=\(SlimWindows.count) visible=\(SlimWindows.visible)")
+            }
         }
         let after = snapshot(store)
         if before.units != after.units { reasons.append("units") }
         if before.cities != after.cities { reasons.append("cities") }
-        // Next / Previous / ⌘1 change the selected city in memory. The snapshot includes that id,
-        // so a command list that does not end on the starting city fails here.
-        if before.selection != after.selection { reasons.append("selection") }
         if before.sync != after.sync { reasons.append("sync") }
-        let fields = "n=\(SlimWindows.count) appear=\(ContentAppear.count) selection=\(after.selection ?? "nil")"
+        if store.selectedID != startSelection { store.selectedID = startSelection }
+        if store.radarExpanded != startRadar { store.radarExpanded = startRadar }
+        if store.radar.isPlaying != startPlaying { store.radar.setPlaying(startPlaying) }
+        if store.activeModule != startModule { store.activeModule = startModule }
+        let restored = store.selectedID ?? "nil"
+        let fields = "n=\(SlimWindows.count) visible=\(SlimWindows.visible) appear=\(ContentAppear.count) restored=\(restored)"
         if reasons.isEmpty {
             SlimLog.line("[slim] menu PASS \(fields)")
         } else {
@@ -312,7 +372,7 @@ enum SlimMenu {
         guard let menu = item.menu else { return false }
         let index = menu.index(of: item)
         guard index >= 0 else { return false }
-        menu.performAction(forItemAt: index)
+        menu.performActionForItem(at: index)
         return true
     }
 }
