@@ -83,7 +83,7 @@ AI_DIR="$BUILD_DIR/appintents"; rm -rf "$AI_DIR"; mkdir -p "$AI_DIR"
 SDK="$(xcrun --show-sdk-path)"
 NATIVE_BIN="$(swift build -c release --show-bin-path)"
 [[ -d "$NATIVE_BIN/Modules" ]] || swift build -c release >/dev/null
-TRIPLE="$(uname -m)-apple-macosx14.0"
+TRIPLE="$(uname -m)-apple-macosx15.0"
 TOOLCHAIN="$(dirname "$(dirname "$(dirname "$(xcrun -f swiftc)")")")"
 SOURCES=$(find "$ROOT/Sources/Skyline" -name '*.swift' | sort)
 printf '%s\n' $SOURCES > "$AI_DIR/sources.txt"
@@ -104,7 +104,7 @@ done
 if [[ $ai_ok -eq 1 ]] && xcrun appintentsmetadataprocessor --output "$APP/Contents/Resources" \
     --toolchain-dir "$TOOLCHAIN" --module-name "$APP_NAME" \
     --sdk-root "$SDK" --xcode-version "$(xcodebuild -version | awk '/Build version/ {print $3}')" \
-    --platform-family macOS --deployment-target 14.0 --target-triple "$TRIPLE" \
+    --platform-family macOS --deployment-target 15.0 --target-triple "$TRIPLE" \
     --source-file-list "$AI_DIR/sources.txt" --swift-const-vals-list "$CV_LIST" \
     --no-app-shortcuts-localization --deployment-aware-processing >"$AI_DIR/processor.log" 2>&1 &&
    [[ -d "$APP/Contents/Resources/Metadata.appintents" ]]; then

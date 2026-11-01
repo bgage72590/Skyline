@@ -5,6 +5,8 @@ import SkylineCore
 /// Hidden QA hook: `-SkylineStressTest <seconds>` hammers the radar UI (expand/collapse, play/pause,
 /// scrub, zoom, opacity, module panels, provider switches) at human-ish speed, logs progress to stdout,
 /// and quits cleanly at the end. Used to verify the layout-loop crash fix; inert unless the argument is set.
+/// It runs from the window content, which a manual launch opens. A `-SkylineLaunchKind login` run
+/// needs `-SkylineSlimMode NO` or this never starts.
 @MainActor
 enum StressTest {
     static func runIfRequested(store: WeatherStore) {

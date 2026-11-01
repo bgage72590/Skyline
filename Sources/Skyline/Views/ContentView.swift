@@ -68,6 +68,7 @@ struct ContentView: View {
         }
         .modifier(HiddenWindowTitle())
         .onAppear {
+            ContentAppear.count += 1
             // Launch arguments for screenshots/QA: `-SkylineOpenRadar YES`, `-SkylineOpenModule uv`.
             let defaults = UserDefaults.standard
             guard !QAHooksRan.done else { return } // once per launch, not again when the window reopens
@@ -120,12 +121,14 @@ struct EmptyStateView: View {
 /// Apple Weather shows no window title; the gradient runs under a transparent toolbar.
 private struct HiddenWindowTitle: ViewModifier {
     func body(content: Content) -> some View {
-        if #available(macOS 15.0, *) {
-            content.toolbar(removing: .title).toolbarBackground(.hidden, for: .windowToolbar)
-        } else {
-            content.toolbarBackground(.hidden, for: .windowToolbar)
-        }
+        content.toolbar(removing: .title).toolbarBackground(.hidden, for: .windowToolbar)
     }
+}
+
+/// How many times the main window's content has appeared (once per open). Slim-launch QA reads it.
+@MainActor
+enum ContentAppear {
+    static var count = 0
 }
 
 @MainActor

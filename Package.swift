@@ -52,7 +52,7 @@ products.append(.executable(name: "SkylineWidget", targets: ["SkylineWidget"]))
 
 let package = Package(
     name: "Skyline",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS("15.0")],
     products: products,
     targets: targets
 )

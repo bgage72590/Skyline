@@ -1,3 +1,4 @@
+import AppIntents
 import AppKit
 import Carbon.HIToolbox
 import SwiftUI
@@ -51,6 +52,8 @@ enum AppExit {
     /// Hidden QA hook: `-SkylineQuitKeyTest YES` sends ⌘Q through the app's own main menu (in-process,
     /// no events to other apps), checks Skyline is still running with the window closed and the
     /// menu-bar item present, reopens the window, logs PASS/FAIL and quits completely.
+    /// A manual launch opens the window first. With `-SkylineLaunchKind login`, pass `-SkylineSlimMode NO`
+    /// or the window is still closed when this starts.
     static func runQuitKeyTestIfRequested() {
         guard UserDefaults.standard.bool(forKey: "SkylineQuitKeyTest") else { return }
         Task {
@@ -217,6 +220,41 @@ enum GlobalHotkey {
             NSApp.terminate(nil)
         }
     }
+
+    /// `-SkylineDropdownCycles N [-SkylineDropdownAt s]`: open the hotkey dropdown for 3 s, close it
+    /// for 3 s, N times. Fails if it is not open or the store is missing.
+    static func runDropdownCyclesIfRequested() {
+        guard let n = LaunchArguments.int("SkylineDropdownCycles") else { return }
+        let at = LaunchArguments.double("SkylineDropdownAt") ?? 0
+        Task { @MainActor in await dropdownCycles(n: n, at: at) }
+    }
+
+    private static func dropdownCycles(n: Int, at: Double) async {
+        await SlimLog.waitFromLaunch(at)
+        guard n > 0 else {
+            SlimLog.line("[slim] cycles FAIL reason=cycles n=\(n)")
+            return
+        }
+        guard IntentStore.shared != nil else {
+            SlimLog.line("[slim] cycles FAIL reason=store=nil n=\(n)")
+            return
+        }
+        var failures: [String] = []
+        for i in 1...n {
+            fire()
+            try? await Task.sleep(for: .seconds(3))
+            if IntentStore.shared == nil { failures.append("store=nil cycle=\(i)") }
+            if !isPanelOpen { failures.append("open=false cycle=\(i)") }
+            fire()
+            try? await Task.sleep(for: .seconds(3))
+            if isPanelOpen { failures.append("close cycle=\(i)") }
+        }
+        if failures.isEmpty {
+            SlimLog.line("[slim] cycles PASS n=\(n)")
+        } else {
+            SlimLog.line("[slim] cycles FAIL reason=\(failures.joined(separator: ";")) n=\(n)")
+        }
+    }
 }
 
 /// Borderless key panel hosting the dropdown content for the global hotkey.
@@ -264,5 +302,101 @@ final class HotkeyPanel: NSPanel {
         // in front of whatever the user was looking at (QA #9).
         orderFrontRegardless()
         makeKey()
+    }
+}
+
+/// `-SkylineSlimOpenTest reopen|dropdown|hotkey|intent [-SkylineSlimOpenCycles n] [-SkylineSlimOpenAt s]`.
+/// Each entry point is the real code path. The handler must appear within 2 s.
+@MainActor
+enum SlimOpen {
+    static func runIfRequested() {
+        guard let mode = LaunchArguments.string("SkylineSlimOpenTest")?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !mode.isEmpty else { return }
+        let cycles = LaunchArguments.int("SkylineSlimOpenCycles") ?? 1
+        let at = LaunchArguments.double("SkylineSlimOpenAt") ?? 0
+        Task { @MainActor in await run(mode: mode, cycles: cycles, at: at) }
+    }
+
+    private static func run(mode: String, cycles: Int, at: Double) async {
+        await SlimLog.waitFromLaunch(at)
+        guard cycles > 0 else {
+            SlimLog.line("[slim] open FAIL reason=cycles n=0 mode=\(mode)")
+            return
+        }
+        guard ["reopen", "dropdown", "hotkey", "intent"].contains(mode) else {
+            SlimLog.line("[slim] open FAIL reason=mode n=\(SlimWindows.count) mode=\(mode)")
+            return
+        }
+        guard SlimLaunchRuntime.waitForHandler() else {
+            SlimLog.line("[slim] open FAIL reason=handler nil n=\(SlimWindows.count) appear=\(ContentAppear.count) mode=\(mode)")
+            return
+        }
+        var reasons: [String] = []
+        for cycle in 1...cycles {
+            let before = ContentAppear.count
+            if let problem = await trigger(mode) { reasons.append("\(problem) cycle=\(cycle)") }
+            let opened = Date()
+            for mark in [3.0, 5.0] {
+                let remain = mark - Date().timeIntervalSince(opened)
+                if remain > 0 { try? await Task.sleep(for: .seconds(remain)) }
+                let n = SlimWindows.count
+                if n != 1 { reasons.append("windows cycle=\(cycle) t=\(Int(mark)) n=\(n)") }
+                if ContentAppear.count != before + 1 {
+                    reasons.append("appear cycle=\(cycle) t=\(Int(mark)) appear=\(ContentAppear.count) expected=\(before + 1)")
+                }
+            }
+            AppExit.closeWindows()
+            let want = SlimWindows.expectedPolicy(windows: 0)
+            if !(await policy(want, within: 1)) {
+                reasons.append("policy cycle=\(cycle) policy=\(SlimWindows.policyLabel(NSApp.activationPolicy())) expected=\(SlimWindows.policyLabel(want))")
+            }
+        }
+        let fields = "mode=\(mode) cycles=\(cycles) n=\(SlimWindows.count) appear=\(ContentAppear.count) policy=\(SlimWindows.policyLabel(NSApp.activationPolicy()))"
+        if reasons.isEmpty {
+            SlimLog.line("[slim] open PASS \(fields)")
+        } else {
+            SlimLog.line("[slim] open FAIL reason=\(reasons.joined(separator: ";")) \(fields)")
+        }
+    }
+
+    /// nil when the entry point ran. reopen calls the delegate as if no windows are visible.
+    private static func trigger(_ mode: String) async -> String? {
+        switch mode {
+        case "reopen":
+            _ = AppDelegateReopen.simulateReopen()
+            return nil
+        case "dropdown":
+            // Same calls as the dropdown's "Open Skyline" button.
+            AppExit.showMainWindow()
+            GlobalHotkey.closePanel()
+            NSApp.activate()
+            return nil
+        case "hotkey":
+            // fire() opens the main window only when the store is not ready yet (the fallback).
+            // The live hotkey opens the dropdown panel; that path is -SkylineDropdownCycles.
+            let saved = IntentStore.shared
+            IntentStore.shared = nil
+            GlobalHotkey.fire()
+            IntentStore.shared = saved
+            return nil
+        case "intent":
+            do {
+                _ = try await ShowRadarIntent().perform()
+                return nil
+            } catch {
+                return "intent"
+            }
+        default:
+            return "mode"
+        }
+    }
+
+    private static func policy(_ expected: NSApplication.ActivationPolicy, within seconds: Double) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if NSApp.activationPolicy() == expected { return true }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return NSApp.activationPolicy() == expected
     }
 }

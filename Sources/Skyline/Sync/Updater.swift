@@ -152,6 +152,8 @@ enum Updater {
         let a = NSAlert()
         a.messageText = "Couldn’t update Skyline"
         a.informativeText = body
+        // A slim launch can be .accessory, which would leave this alert behind other apps.
+        NSApp.activate()
         a.runModal()
     }
 

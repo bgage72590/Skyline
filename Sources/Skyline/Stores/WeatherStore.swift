@@ -90,9 +90,10 @@ final class WeatherStore {
     var focusContentRequest = 0
 
     private(set) var isMainWindowVisible = false
-    /// False while the main window is closed (menu bar only): ContentView then drops its content, which
-    /// frees the MKMapView, radar layers and living background; it's rebuilt when the window reopens.
-    private(set) var isMainWindowOpen = true
+    /// False while the main window is closed (menu bar only), including at launch. ContentView then
+    /// drops its content, which frees the MKMapView, radar layers and living background; it's rebuilt
+    /// when the window opens. A login launch never opens it, so this stays false.
+    private(set) var isMainWindowOpen = false
     /// Bumped when a report crosses its staleness deadline or an alert ends, so views that show data age
     /// (menu-bar dimming, the offline banner) re-render without polling.
     private(set) var staleTick = 0
