@@ -313,6 +313,8 @@ public enum BiasCorrection {
     public static let offStationPending = "off: station (pending)"
     /// Siting failure after back-off or for a non-US / failed key.
     public static let offStation = "off: station"
+    /// Copy only. Mirrors evaluateAutoOff's re-enable rule (≥ autoOffReenableDays new scored days AND ≥ hysteresis better).
+    public static let autoOffLine = "paused: worse recently · rechecks after \(autoOffReenableDays)+ new days"
 
     public static func statusLine(entry: CorrectionEntry?, gated: Bool, sitingOK: Bool,
                                   switchOn: Bool, nDays: Int, units: (Double) -> Double,
@@ -322,7 +324,7 @@ public enum BiasCorrection {
                                   stationPending: Bool = false) -> String {
         if !switchOn { return "off: switched off" }
         if !sitingOK { return stationPending ? offStationPending : offStation }
-        if let e = entry, e.autoOff { return "off: worse on recent days" }
+        if let e = entry, e.autoOff { return autoOffLine }
         if !gated {
             let needDays = dayThreshold(for: target)
             let needPairs = pairThreshold(for: target)

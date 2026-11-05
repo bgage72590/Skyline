@@ -68,6 +68,12 @@ struct AccuracyPanel: View {
                 .font(.title3.weight(.medium))
                 .fixedSize(horizontal: false, vertical: true)
             if let r {
+                if r.verifiedPairs > 0 {
+                    Text(AccuracyCorrectionCopy.scoresCaption)
+                        .font(.caption)
+                        .foregroundStyle(Glass.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if r.status == .collecting { collecting(r) }
                 if r.verifiedPairs > 0 { scores(r) }
             } else {
@@ -75,7 +81,7 @@ struct AccuracyPanel: View {
             }
             benchmarkSection()
             correctionSection
-            Text("How it works: every few hours Skyline saves what each source predicted for this place, then compares it with what the \(AccuracyStationCopy.stationPhrase(isUS: location.isLikelyInNWSCoverage)) measured. Typical error is the mean absolute difference; rain calls count hours with ≥ 50 % chance (or ≥ 0.2 mm) against hours the station reported precipitation. Once there are \(Int(r?.minDays ?? 3))+ days of pairs, the blend gives more weight to the sources that have been most accurate here, and never drops any source entirely.")
+            Text("How it works: every few hours Skyline saves what each source predicted for this place, then compares it with what the \(AccuracyStationCopy.stationPhrase(isUS: location.isLikelyInNWSCoverage)) measured. Typical error is the mean absolute difference; rain calls count hours with ≥ 50 % chance (or ≥ 0.2 mm) against hours the station reported precipitation. Once there are \(Int(r?.minDays ?? 3))+ days of pairs, the blend gives more weight to the sources that have been most accurate here, and never drops any source entirely.\(AccuracyCorrectionCopy.howItWorksSuffix)")
                 .font(.caption)
                 .foregroundStyle(Glass.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
@@ -127,6 +133,15 @@ struct AccuracyPanel: View {
                             .foregroundStyle(Glass.secondaryText)
                     }
                     .padding(.vertical, 1)
+                }
+                // Only while a line is actually paused: auto-off, switch on, and siting OK.
+                // "off: switched off" and "off: station" take precedence, so no footnote then.
+                if SkylineAccuracyCorrection.isEnabled(),
+                   correctionLines.contains(where: { $0.autoOff && $0.sitingOK }) {
+                    Text(AccuracyCorrectionCopy.autoOffFootnote)
+                        .font(.caption2)
+                        .foregroundStyle(Glass.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(12)
