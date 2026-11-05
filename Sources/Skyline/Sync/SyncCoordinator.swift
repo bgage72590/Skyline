@@ -15,9 +15,7 @@ final class SyncCoordinator {
 
     /// UserDefaults keys worth carrying between Macs. Window state, notification history, the last GPS
     /// fix and caches stay per-Mac.
-    static let settingKeys = ["unitPreference", "unit.temperature", "unit.speed", "unit.precipitation", "unit.pressure",
-                              "unit.distance", "clockStyle", "refreshMinutes", "menuBarLocationID",
-                              "notifications.prefs.v1", "notifications.locations.v1"]
+    static let settingKeys = SyncDocument.syncedSettingKeys
 
     private unowned let store: WeatherStore
     private let defaults: UserDefaults

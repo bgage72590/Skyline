@@ -2,7 +2,9 @@ import AppKit
 import SwiftUI
 import SkylineCore
 
-/// Hidden memory measurement hook (inert unless `-SkylineMemTest` is set). Logs `[mem] …` lines with
+/// Hidden memory measurement hook (inert unless `-SkylineMemTest` is set). It runs from the window
+/// content, which a manual launch opens. A `-SkylineLaunchKind login` run needs `-SkylineSlimMode NO`
+/// or this never starts. Logs `[mem] …` lines with
 /// the physical footprint (Activity Monitor's "Memory") and quits at the end.
 /// * `-SkylineMemTest radar`: New York, expanded radar on the OKX site at `-SkylineMemZoom` (10),
 ///   playing; samples every 2 s for `-SkylineMemSeconds` (150).

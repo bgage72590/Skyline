@@ -9,7 +9,9 @@ struct ContentView: View {
     var body: some View {
         Group {
             if store.isMainWindowOpen {
-                windowContent
+                // New identity per open. Dock-off reuses the NSWindow and skips a child onAppear;
+                // the open is counted in setMainWindowOpen, which bumps this generation.
+                windowContent.id(store.mainWindowGeneration)
             } else {
                 // Window closed (menu bar only): nothing heavy stays alive. SwiftUI keeps the closed
                 // window and this root view; the map, radar layers and backgrounds are rebuilt on reopen.
@@ -120,12 +122,16 @@ struct EmptyStateView: View {
 /// Apple Weather shows no window title; the gradient runs under a transparent toolbar.
 private struct HiddenWindowTitle: ViewModifier {
     func body(content: Content) -> some View {
-        if #available(macOS 15.0, *) {
-            content.toolbar(removing: .title).toolbarBackground(.hidden, for: .windowToolbar)
-        } else {
-            content.toolbarBackground(.hidden, for: .windowToolbar)
-        }
+        content.toolbar(removing: .title).toolbarBackground(.hidden, for: .windowToolbar)
     }
+}
+
+/// How many times the main window's content has been opened (once per open). Slim-launch QA reads it.
+/// Counted from `WeatherStore.setMainWindowOpen(true)`, not from `onAppear`: with the Dock off,
+/// SwiftUI reuses the window and the appearance callback skips some reopens.
+@MainActor
+enum ContentAppear {
+    static var count = 0
 }
 
 @MainActor

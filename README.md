@@ -1,6 +1,6 @@
 # Skyline
 
-A native macOS weather app (SwiftUI, macOS 14+) with an Apple-Weather-style main window **and** a
+A native macOS weather app (SwiftUI, macOS 15+) with an Apple-Weather-style main window **and** a
 menu bar extra in one bundle. Forecasts are a weighted blend of several free models plus the official
 National Weather Service forecast; radar is real NEXRAD (US) or RainViewer (global) on an
 interactive MapKit map with an animated timeline. No API keys, nothing paid.

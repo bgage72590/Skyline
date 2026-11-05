@@ -415,7 +415,7 @@ struct HourlyCard: View {
                 VStack(spacing: 1) {
                     WeatherSymbol(condition: isNow ? report.current.condition : hour.condition,
                                   isDay: isNow ? report.current.isDay : hour.isDay)
-                    Text(popText(hour))
+                    Text(HourlyDisplay.popText(hour) ?? " ")
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(Color(red: 0.55, green: 0.82, blue: 1.0))
                 }
@@ -450,11 +450,6 @@ struct HourlyCard: View {
             if let s = day.sunset, s > first.time, s < last.time { items.append(.sun(s, sunrise: false)) }
         }
         return items.sorted { $0.time < $1.time }
-    }
-
-    private func popText(_ hour: HourlyForecast) -> String {
-        guard let p = hour.precipitationProbability, p >= 20 else { return " " }
-        return "\(Int((p / 10).rounded() * 10))%"
     }
 
     /// The day's forecast text (first two whole sentences), or nothing.
@@ -514,8 +509,8 @@ struct DailyCard: View {
                         .foregroundStyle(.white)
                         .lineLimit(1).fixedSize()
                         .accessibilityLabel("Snow \(units.snowString(day.snowfallSum))")
-                } else if let p = day.precipitationProbability, p >= 20 {
-                    Text("\(Int((p / 10).rounded() * 10))%")
+                } else if let text = HourlyDisplay.popText(day) {
+                    Text(text)
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(Color(red: 0.55, green: 0.82, blue: 1.0))
                 }

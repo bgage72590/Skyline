@@ -23,6 +23,9 @@ struct SkylineApp: App {
         // T18: wide enough on a fresh install for the three-column layout (sidebar 290 + detail ≥ 1000);
         // macOS clamps it to smaller screens, where the narrow layout takes over as before.
         .defaultSize(width: 1360, height: 860)
+        // Static, and evaluated before the launch event can be read. didFinish opens the window
+        // for a manual launch; a login launch leaves it uncreated.
+        .defaultLaunchBehavior(.suppressed)
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .appInfo) {
@@ -99,6 +102,36 @@ enum SceneID {
 enum AppActions {
     /// Set by views that have access to `openWindow`, used when the Dock icon is clicked with no window open.
     static var openMainWindow: (() -> Void)?
+    /// Set by MenuBarLabel from the menu-bar scene. `showSettingsWindow:` does not present Settings
+    /// when Skyline has no window.
+    static var openSettings: (() -> Void)?
+
+    /// Regular policy first, then the registered opener. An accessory app will not show a reused
+    /// window, and the visibility reader then never reports the open.
+    static func presentMainWindow() {
+        DockIcon.holdRegularForPresentation()
+        NSApp.activate()
+        openMainWindow?()
+        Task { @MainActor in
+            // The visibility reader misses some Dock-off reopens of a reused window.
+            // If the window is on screen and the flag is still false, count the open here.
+            for _ in 0..<10 {
+                await Task.yield()
+                try? await Task.sleep(for: .milliseconds(50))
+                guard mainWindowIsOnScreen else { continue }
+                IntentStore.shared?.setMainWindowOpen(true)
+                return
+            }
+        }
+    }
+
+    private static var mainWindowIsOnScreen: Bool {
+        NSApp.windows.contains { window in
+            guard window.isVisible else { return false }
+            let id = window.identifier?.rawValue ?? ""
+            return id == SceneID.main || id.hasPrefix("main-")
+        }
+    }
 
     private static var spaceMonitor: Any?
 
@@ -142,8 +175,14 @@ enum AppActions {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var didFinishStarted = false
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated {
+            // Evidence only: the launch event is usually not delivered yet. didFinish classifies.
+            let seen = LaunchEventSnapshot.read()
+            print("[launch] willFinish event=\(seen.eventCode)")
+            fflush(stdout)
             // Always dark, like the dropdown: in system Light Mode the sidebar material, sheets, alerts and
             // Settings otherwise turn light gray against the dark sky panel (UI/UX #3). App-wide, because
             // `.preferredColorScheme` on the window kept its content (map, radar) alive after closing,
@@ -160,6 +199,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated {
+            // One classification. The handler wait no longer pumps the run loop, so this does not
+            // re-enter, and the guard stays so a second call cannot open the window twice.
+            guard !didFinishStarted else { return }
+            didFinishStarted = true
+            SlimLaunchRuntime.didFinishAt = Date()
+            let event = LaunchEventSnapshot.read()
+            let decision = SlimLaunch.decide(
+                eventClass: event.eventClass,
+                eventID: event.eventID,
+                propData: event.propData,
+                launchKindArgument: LaunchArguments.string("SkylineLaunchKind"),
+                slimModeNo: LaunchArguments.slimModeNo,
+                showInDock: DockIcon.prefersDockIcon)
+            SlimLaunchRuntime.decision = decision
+            print("[launch] kind=\(decision.kind.rawValue) event=\(event.eventCode) prop=\(event.propCode)")
+            fflush(stdout)
+            if decision.opensWindow { SlimLaunchRuntime.openMainWindowForLaunch() }
             GlobalHotkey.apply()
             AppExit.runQuitKeyTestIfRequested()
             GlobalHotkey.runTestIfRequested()
@@ -167,15 +223,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             SearchTypeTest.runIfRequested()
             Updater.showUpdateResultIfNeeded()
             DockMenuTest.runIfRequested()
+            GlobalHotkey.runDropdownCyclesIfRequested()
+            SlimOpen.runIfRequested()
+            SlimHooks.runIfRequested()
             // Keep activation policy in sync when Settings becomes key or any window closes.
             let center = NotificationCenter.default
             center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { _ in
                 MainActor.assumeIsolated { DockIcon.apply() }
             }
-            center.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { note in
+            center.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { _ in
                 MainActor.assumeIsolated {
                     // After this window closes, recompute (main window may still be open).
-                    DispatchQueue.main.async { DockIcon.apply() }
+                    DispatchQueue.main.async {
+                        if !DockIcon.needsMenuBar() { DockIcon.releaseRegularHold() }
+                        DockIcon.apply()
+                    }
                 }
             }
         }
@@ -183,8 +245,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
-            MainActor.assumeIsolated { AppActions.openMainWindow?() }
+            MainActor.assumeIsolated { AppActions.presentMainWindow() }
         }
         return true
+    }
+}
+
+/// The launch Apple event, read at will-finish (evidence) and at the start of did-finish (the decision).
+@MainActor
+struct LaunchEventSnapshot {
+    var eventClass: UInt32?
+    var eventID: UInt32?
+    var propData: UInt32?
+    var eventCode: String { SlimLaunch.codeString(eventID) }
+    var propCode: String { SlimLaunch.codeString(propData) }
+
+    static func read() -> LaunchEventSnapshot {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent else {
+            return LaunchEventSnapshot(eventClass: nil, eventID: nil, propData: nil)
+        }
+        return LaunchEventSnapshot(eventClass: UInt32(event.eventClass), eventID: UInt32(event.eventID),
+                                   propData: propData(of: event))
+    }
+
+    /// keyAEPropData ('prdt'), as a typeType or typeEnumerated four-character code.
+    private static func propData(of event: NSAppleEventDescriptor) -> UInt32? {
+        guard let desc = event.paramDescriptor(forKeyword: AEKeyword(0x7072_6474)) else { return nil }
+        let kind = desc.descriptorType
+        let code: OSType
+        if kind == DescType(0x656E_756D) { // 'enum'
+            code = desc.enumCodeValue
+        } else if kind == DescType(0x7479_7065) { // 'type'
+            code = desc.typeCodeValue
+        } else {
+            return nil
+        }
+        return code == 0 ? nil : UInt32(code)
+    }
+}
+
+/// Clock and decision from did-finish, shared with the QA hooks. The window opens through
+/// `AppActions.openMainWindow`, which MenuBarLabel registers; that registration stays where it is.
+@MainActor
+enum SlimLaunchRuntime {
+    static var didFinishAt = Date()
+    static var decision: SlimLaunchDecision?
+    static var handlerMissing = false
+
+    /// Poll on the main actor. A nested run loop in the common-modes pseudo-mode returns immediately
+    /// and busy-spins, so MenuBarLabel never gets a turn to register the handler.
+    static func waitForHandler(seconds: TimeInterval = 2) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while AppActions.openMainWindow == nil {
+            if Date() >= deadline { return false }
+            await Task.yield()
+            if AppActions.openMainWindow != nil { return true }
+            let slice = min(0.05, deadline.timeIntervalSinceNow)
+            if slice <= 0 { return AppActions.openMainWindow != nil }
+            try? await Task.sleep(for: .seconds(slice))
+        }
+        return true
+    }
+
+    static func openMainWindowForLaunch() {
+        Task { @MainActor in
+            guard await waitForHandler() else {
+                handlerMissing = true
+                print("[open] handler missing at launch")
+                fflush(stdout)
+                return
+            }
+            AppActions.presentMainWindow()
+        }
     }
 }

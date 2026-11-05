@@ -11,6 +11,13 @@ import Foundation
 /// * Each setting is last-writer-wins by its own timestamp; a stamped key with no value means "reset".
 public struct SyncDocument: Codable, Equatable, Sendable {
     public static let currentFormat = 1
+
+    /// UserDefaults keys encoded into `settings`. The bef7a00 list; slim launch adds none.
+    public static let syncedSettingKeys = [
+        "unitPreference", "unit.temperature", "unit.speed", "unit.precipitation", "unit.pressure",
+        "unit.distance", "clockStyle", "refreshMinutes", "menuBarLocationID",
+        "notifications.prefs.v1", "notifications.locations.v1"
+    ]
     public var format: Int = SyncDocument.currentFormat
     public var locations: [WeatherLocation] = []
     /// When each city was last added or changed.
