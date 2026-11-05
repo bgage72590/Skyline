@@ -467,16 +467,34 @@ final class AccuracyTrustTests: XCTestCase {
         XCTAssertEqual(onDisk["london"]?.pairedHourly?.n, 24)
     }
 
+    /// Trust PR pinned bias files against 5c2663e. The bias-copy plan allows one
+    /// status-line edit in BiasCorrection.swift and nothing else in that file.
     func testT21NoBiasFilesInDiff() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let changed = try git(["diff", "--name-only", "5c2663ed177cdf665c3090b4973a1377d5507c99"], at: root)
+        let pin = "5c2663ed177cdf665c3090b4973a1377d5507c99"
+        let changed = try git(["diff", "--name-only", pin], at: root)
         let untracked = try git(["ls-files", "--others", "--exclude-standard"], at: root)
         let diff = changed + untracked
-        XCTAssertFalse(diff.contains("BiasCorrection.swift"), diff)
         XCTAssertFalse(diff.contains("WeatherService.swift"), diff)
+        let bias = try git(["diff", "--unified=0", "--no-color", pin, "--",
+                            "Sources/SkylineCore/Verification/BiasCorrection.swift"], at: root)
+        // Shallow CI checkouts may not contain the pin; git then prints nothing and the
+        // name list stays empty. When the pin is present, only the status-line copy may differ.
+        guard !bias.isEmpty || diff.contains("BiasCorrection.swift") else { return }
+        let lines = bias.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let added = lines.filter { $0.hasPrefix("+") && !$0.hasPrefix("+++") }
+        let removed = lines.filter { $0.hasPrefix("-") && !$0.hasPrefix("---") }
+        XCTAssertEqual(removed, [
+            #"-        if let e = entry, e.autoOff { return "off: worse on recent days" }"#
+        ])
+        XCTAssertEqual(added, [
+            #"+    /// Copy only. Mirrors evaluateAutoOff's re-enable rule (≥ autoOffReenableDays new scored days AND ≥ hysteresis better)."#,
+            #"+    public static let autoOffLine = "paused: worse recently · rechecks after \(autoOffReenableDays)+ new days""#,
+            #"+        if let e = entry, e.autoOff { return autoOffLine }"#
+        ])
     }
 
     // MARK: Helpers
