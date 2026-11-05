@@ -129,12 +129,17 @@ struct SkylineWidgetView: View {
                         .frame(width: 48, alignment: .leading)
                     Image(systemName: WeatherCondition(wmoCode: d.weatherCode).symbolName(isDay: true))
                         .symbolRenderingMode(.multicolor).frame(width: 24)
-                    if (d.snowfallSum ?? 0) >= 0.5 {
-                        Text(s.units.snowString(d.snowfallSum)).font(.caption2.weight(.bold)).frame(width: 46, alignment: .leading)
-                    } else if let text = HourlyDisplay.popText(probability: d.precipitationProbability,
-                                                                 isPrecipitationIcon: WeatherCondition(wmoCode: d.weatherCode).isPrecipitation) {
-                        Text(text).font(.caption2.weight(.bold))
-                            .foregroundStyle(Color(red: 0.7, green: 0.88, blue: 1)).frame(width: 46, alignment: .leading)
+                    let caption: DailyPrecipCaption? = HourlyDisplay.dailyCaption(d, units: s.units)
+                    if let caption {
+                        switch caption {
+                        case .snow(let text):
+                            Text(text).font(.caption2.weight(.bold)).foregroundStyle(.white)
+                                .frame(width: 46, alignment: .leading)
+                                .accessibilityLabel(caption.accessibilityLabel)
+                        case .chance(let text):
+                            Text(text).font(.caption2.weight(.bold))
+                                .foregroundStyle(Color(red: 0.7, green: 0.88, blue: 1)).frame(width: 46, alignment: .leading)
+                        }
                     } else { Spacer().frame(width: 46) }
                     Spacer()
                     Text(s.units.temperatureString(d.low)).opacity(0.75)

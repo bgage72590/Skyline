@@ -502,17 +502,20 @@ struct DailyCard: View {
                 }
             VStack(spacing: 0) {
                 WeatherSymbol(condition: day.condition, isDay: true, size: 18)
-                if day.hasSnow {
-                    // Snow days show the expected total instead of a percentage (T13).
-                    Text(units.snowString(day.snowfallSum))
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.white)
-                        .lineLimit(1).fixedSize()
-                        .accessibilityLabel("Snow \(units.snowString(day.snowfallSum))")
-                } else if let text = HourlyDisplay.popText(day) {
-                    Text(text)
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(Color(red: 0.55, green: 0.82, blue: 1.0))
+                let caption: DailyPrecipCaption? = HourlyDisplay.dailyCaption(day, units: units)
+                if let caption {
+                    switch caption {
+                    case .snow(let text):
+                        Text(text)
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1).fixedSize()
+                            .accessibilityLabel(caption.accessibilityLabel)
+                    case .chance(let text):
+                        Text(text)
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(Color(red: 0.55, green: 0.82, blue: 1.0))
+                    }
                 }
             }
             .frame(width: 34)
