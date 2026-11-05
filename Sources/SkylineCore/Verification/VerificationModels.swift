@@ -202,12 +202,18 @@ public struct MetarStationPick: Codable, Hashable, Sendable {
     public var distanceKm: Double
     public var elevationDeltaM: Double?
     public var pickedAt: Date
+    /// Nil on picks saved before the liveness check; those are treated as already verified.
+    public var verified: Bool?
+    /// When `verified == false`, `ensureStation` re-runs once this instant has passed.
+    public var verifiedRecheckAt: Date?
 
     public init(stationID: String, name: String? = nil, coordinate: Coordinate, elevationM: Double? = nil,
-                distanceKm: Double, elevationDeltaM: Double? = nil, pickedAt: Date) {
+                distanceKm: Double, elevationDeltaM: Double? = nil, pickedAt: Date,
+                verified: Bool? = nil, verifiedRecheckAt: Date? = nil) {
         self.stationID = stationID; self.name = name; self.coordinate = coordinate
         self.elevationM = elevationM; self.distanceKm = distanceKm
         self.elevationDeltaM = elevationDeltaM; self.pickedAt = pickedAt
+        self.verified = verified; self.verifiedRecheckAt = verifiedRecheckAt
     }
 }
 
@@ -301,6 +307,20 @@ public struct MetNorwayHour: Codable, Hashable, Sendable {
     }
 }
 
+/// Like-for-like hourly comparison: one MAE per source on the same set of hours.
+public struct PairedHourly: Codable, Hashable, Sendable, Equatable {
+    /// Mean absolute error (°C) for each source that shares the hour set.
+    public var kinds: [BenchmarkForecastKind: Double]
+    /// Shared hour count. Every included source uses this n.
+    public var n: Int
+    /// Window the pairs were drawn from, in days.
+    public var windowDays: Double
+
+    public init(kinds: [BenchmarkForecastKind: Double], n: Int, windowDays: Double) {
+        self.kinds = kinds; self.n = n; self.windowDays = windowDays
+    }
+}
+
 /// Summary row for the Accuracy "Skyline vs other forecasts" section (cached; view reads only this).
 public struct BenchmarkSummary: Codable, Hashable, Sendable, Equatable {
     public struct Row: Codable, Hashable, Sendable, Equatable {
@@ -326,12 +346,16 @@ public struct BenchmarkSummary: Codable, Hashable, Sendable, Equatable {
     public var stationName: String?
     public var stationDistanceKm: Double?
     public var metNorwayAttribution: String
+    /// Shared-hour comparison for the hourly box. Nil on summaries saved before H3.
+    public var pairedHourly: PairedHourly?
 
     public init(rows: [Row], stationID: String? = nil, stationName: String? = nil,
                 stationDistanceKm: Double? = nil,
-                metNorwayAttribution: String = "Data: MET Norway, CC BY 4.0") {
+                metNorwayAttribution: String = "Data: MET Norway, CC BY 4.0",
+                pairedHourly: PairedHourly? = nil) {
         self.rows = rows; self.stationID = stationID; self.stationName = stationName
         self.stationDistanceKm = stationDistanceKm; self.metNorwayAttribution = metNorwayAttribution
+        self.pairedHourly = pairedHourly
     }
 }
 

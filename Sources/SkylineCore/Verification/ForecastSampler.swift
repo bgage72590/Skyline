@@ -220,4 +220,31 @@ public enum ForecastSampler {
         }
         return out
     }
+
+    /// On-the-hour MET Norway temperatures from one fetch.
+    /// `valid` is the MET hour itself (already on the hour). Hours run from just after
+    /// `fetchedAt` through the same top lead as `leads` (Skyline's ladder).
+    public static func metNorwayHourlyValues(fetchedAt: Date,
+                                            hours: [MetNorwayHour]) -> [(valid: Date, t: Double)] {
+        let maxLead = TimeInterval(leads.max() ?? 0) * 3600
+        let horizon = fetchedAt.addingTimeInterval(maxLead)
+        var seen: Set<Int> = []
+        var out: [(Date, Double)] = []
+        for h in hours {
+            guard let t = h.temperatureC, isOnTheHour(h.time) else { continue }
+            guard h.time > fetchedAt, h.time <= horizon else { continue }
+            let bucket = hourBucket(h.time)
+            guard seen.insert(bucket).inserted else { continue }
+            out.append((h.time, t))
+        }
+        return out
+    }
+
+    static func isOnTheHour(_ date: Date) -> Bool {
+        abs(date.timeIntervalSince1970.truncatingRemainder(dividingBy: 3600)) < 1e-3
+    }
+
+    static func hourBucket(_ date: Date) -> Int {
+        Int(date.timeIntervalSince1970 / 3600)
+    }
 }

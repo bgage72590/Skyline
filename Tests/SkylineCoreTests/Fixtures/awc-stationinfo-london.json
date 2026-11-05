@@ -1,0 +1,34 @@
+[
+  {
+    "icaoId": "EGXX",
+    "site": "Synth Only",
+    "lat": 51.5074,
+    "lon": -0.1278,
+    "elev": 10,
+    "siteType": ["SYN"]
+  },
+  {
+    "icaoId": "EGRB",
+    "site": "London Weather",
+    "lat": 51.521,
+    "lon": -0.11,
+    "elev": 5,
+    "siteType": ["METAR"]
+  },
+  {
+    "icaoId": "EGLC",
+    "site": "London City",
+    "lat": 51.5053,
+    "lon": 0.0553,
+    "elev": 6,
+    "siteType": ["METAR", "TAF"]
+  },
+  {
+    "icaoId": "EGLL",
+    "site": "London Heathrow",
+    "lat": 51.4775,
+    "lon": -0.4614,
+    "elev": 25,
+    "siteType": ["METAR", "TAF"]
+  }
+]

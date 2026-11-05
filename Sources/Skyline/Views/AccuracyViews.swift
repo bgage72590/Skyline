@@ -19,7 +19,7 @@ struct AccuracyTile: View {
             } else {
                 TileValue(value: "Collecting",
                           label: r.map { "\(AccuracyFormat.days($0.daysCollected)) of \(Int($0.minDays)) days" } ?? "Starting",
-                          detail: "Skyline checks its forecasts against the nearest NWS station and learns which model is best here.")
+                          detail: "Skyline checks its forecasts against the \(AccuracyStationCopy.stationPhrase(isUS: location.isLikelyInNWSCoverage)) and learns which model is best here.")
             }
         }
     }
@@ -73,9 +73,9 @@ struct AccuracyPanel: View {
             } else {
                 collecting(nil)
             }
-            benchmarkSection(report: r)
+            benchmarkSection()
             correctionSection
-            Text("How it works: every few hours Skyline saves what each source predicted for this place, then compares it with what the nearest NWS weather station measured. Typical error is the mean absolute difference; rain calls count hours with ≥ 50 % chance (or ≥ 0.2 mm) against hours the station reported precipitation. Once there are \(Int(r?.minDays ?? 3))+ days of pairs, the blend gives more weight to the sources that have been most accurate here, and never drops any source entirely.")
+            Text("How it works: every few hours Skyline saves what each source predicted for this place, then compares it with what the \(AccuracyStationCopy.stationPhrase(isUS: location.isLikelyInNWSCoverage)) measured. Typical error is the mean absolute difference; rain calls count hours with ≥ 50 % chance (or ≥ 0.2 mm) against hours the station reported precipitation. Once there are \(Int(r?.minDays ?? 3))+ days of pairs, the blend gives more weight to the sources that have been most accurate here, and never drops any source entirely.")
                 .font(.caption)
                 .foregroundStyle(Glass.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
@@ -138,8 +138,8 @@ struct AccuracyPanel: View {
     /// Accuracy PR 1: measurement-only comparison. Hourly temperature MAE and daily high/low MAE are
     /// separate lists (never mix MET daily-high with Skyline/NWS/Best Match hourly).
     @ViewBuilder
-    private func benchmarkSection(report: AccuracyReport?) -> some View {
-        let hourly = hourlyBenchmarkRows(report: report)
+    private func benchmarkSection() -> some View {
+        let hourly = hourlyBenchmarkRows()
         let daily = dailyBenchmarkRows()
         if !hourly.isEmpty || !daily.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
@@ -157,6 +157,10 @@ struct AccuracyPanel: View {
                             Text(row.value).font(.callout.monospacedDigit())
                         }
                         .padding(.vertical, 2)
+                    }
+                    if let paired = benchmark?.pairedHourly {
+                        Text("Compared on the same \(paired.n) hours (last \(Int(paired.windowDays)) days)")
+                            .font(.caption).foregroundStyle(Glass.secondaryText)
                     }
                 }
                 if !daily.isEmpty {
@@ -195,43 +199,14 @@ struct AccuracyPanel: View {
         var value: String
     }
 
-    /// Hourly temperature MAE only — comparable across sources that have hourly verified pairs.
-    private func hourlyBenchmarkRows(report: AccuracyReport?) -> [BenchRow] {
-        var out: [BenchRow] = []
-        // Prefer existing AccuracyReport scores for Skyline / NWS / Best Match (lock §7.4).
-        if let report {
-            if let s = report.overall[.blend], s.tempHours >= 20, let mae = s.tempMAE {
-                out.append(BenchRow(title: "Skyline", value: "±" + AccuracyFormat.delta(mae, units)))
-            }
-            if let s = report.overall[.nws], s.tempHours >= 20, let mae = s.tempMAE {
-                out.append(BenchRow(title: "NWS", value: "±" + AccuracyFormat.delta(mae, units)))
-            }
-            if let s = report.overall[.bestMatch], s.tempHours >= 20, let mae = s.tempMAE {
-                out.append(BenchRow(title: "Best Match", value: "±" + AccuracyFormat.delta(mae, units)))
-            }
+    /// Hourly temperature MAE on one shared set of hours. The main-card AccuracyReport is not mixed in.
+    private func hourlyBenchmarkRows() -> [BenchRow] {
+        guard let paired = benchmark?.pairedHourly, paired.n >= 20 else { return [] }
+        let order: [BenchmarkForecastKind] = [.skyline, .metNorway, .nws, .bestMatch]
+        return order.compactMap { kind in
+            guard let mae = paired.kinds[kind] else { return nil }
+            return BenchRow(title: kind.displayName, value: "±" + AccuracyFormat.delta(mae, units))
         }
-        if let b = benchmark {
-            for row in b.rows where row.isVisible {
-                // Hourly temp MAE only — never fall back to daily highMAE here.
-                guard let mae = row.tempMAE, row.n >= 20 else { continue }
-                if row.kind == .metNorway {
-                    if BenchmarkScorer.showsMetNorwayRow(b) {
-                        out.append(BenchRow(title: "MET Norway", value: "±" + AccuracyFormat.delta(mae, units)))
-                    }
-                    continue
-                }
-                if row.kind == .skyline, report?.overall[.blend] == nil {
-                    out.append(BenchRow(title: "Skyline", value: "±" + AccuracyFormat.delta(mae, units)))
-                }
-                if row.kind == .nws, report?.overall[.nws] == nil {
-                    out.append(BenchRow(title: "NWS", value: "±" + AccuracyFormat.delta(mae, units)))
-                }
-                if row.kind == .bestMatch, report?.overall[.bestMatch] == nil {
-                    out.append(BenchRow(title: "Best Match", value: "±" + AccuracyFormat.delta(mae, units)))
-                }
-            }
-        }
-        return out
     }
 
     /// Daily high/low MAE from the isolated store for all four kinds (same metric, same issues).
@@ -260,10 +235,15 @@ struct AccuracyPanel: View {
                 .tint(Color(red: 0.45, green: 0.8, blue: 1))
             Text("\(AccuracyFormat.days(days)) of \(Int(need)) days · \(r?.verifiedPairs ?? 0) forecast checks · \(r?.pendingForecasts ?? 0) waiting for observations")
                 .font(.callout).monospacedDigit()
-            if let id = r?.stationID {
+            if !location.isLikelyInNWSCoverage, let id = benchmark?.stationID {
+                Text(AccuracyStationCopy.stationLine(name: benchmark?.stationName, stationID: id,
+                                                    distanceKm: benchmark?.stationDistanceKm))
+                    .font(.caption).foregroundStyle(Glass.secondaryText)
+            } else if let id = r?.stationID {
                 Text("Station: \(r?.stationName ?? id) (\(id))").font(.caption).foregroundStyle(Glass.secondaryText)
-            } else if !(location.isLikelyInNWSCoverage) {
-                Text("Verification uses NWS stations, so it is only available in the US.").font(.caption).foregroundStyle(Glass.secondaryText)
+            } else if let line = AccuracyStationCopy.collectingUnavailableLine(
+                isUS: location.isLikelyInNWSCoverage, benchmarkStationID: benchmark?.stationID) {
+                Text(line).font(.caption).foregroundStyle(Glass.secondaryText)
             }
             Text("Until then the blend uses Skyline's standard weights. Early numbers below are based on few samples.")
                 .font(.caption).foregroundStyle(Glass.secondaryText)

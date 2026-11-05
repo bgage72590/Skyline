@@ -258,11 +258,68 @@ public enum BenchmarkScorer {
     }
 
     /// Fix 4: MET Norway credit and row share one visibility rule.
+    /// A summary that has not been recomputed (`pairedHourly == nil`) keeps the raw row/daily rule.
+    /// Once `pairedHourly` is set, the hourly credit requires MET in that shared set (n ≥ 20), or a daily score.
     public static func showsMetNorwayRow(_ summary: BenchmarkSummary) -> Bool {
-        summary.rows.contains { row in
+        if let paired = summary.pairedHourly {
+            let metHourly = paired.kinds[.metNorway] != nil && paired.n >= 20
+            let daily = summary.rows.contains { $0.kind == .metNorway && $0.dailyN >= 20 }
+            return metHourly || daily
+        }
+        return summary.rows.contains { row in
             row.kind == .metNorway && row.isVisible
                 && ((row.tempMAE != nil && row.n >= 20) || row.dailyN >= 20)
         }
+    }
+
+    /// One unweighted MAE per source on the hours every included source actually forecast.
+    /// Kind order is Skyline, then MET Norway, NWS, Best Match. A later kind is skipped when
+    /// intersecting it would leave fewer than `minN` hours.
+    public static func pairedHourly(_ pairs: [BenchmarkHourlyPair], loc: String,
+                                    minLeadH: Double = 1, minN: Int = 20) -> PairedHourly {
+        let empty = PairedHourly(kinds: [:], n: 0, windowDays: BenchmarkStore.retentionDays)
+        let minLead = minLeadH * 3600
+        let filtered = pairs.filter { pair in
+            pair.loc == loc
+                && ForecastSampler.isOnTheHour(pair.valid)
+                && pair.valid.timeIntervalSince(pair.issued) >= minLead
+        }
+        struct Dup: Hashable { var kind: BenchmarkForecastKind; var issued: Date; var valid: Date }
+        var seen = Set<Dup>()
+        let deduped = filtered.filter {
+            seen.insert(Dup(kind: $0.kind, issued: $0.issued, valid: $0.valid)).inserted
+        }
+        struct HourKey: Hashable { var kind: BenchmarkForecastKind; var valid: Date }
+        var latest: [HourKey: BenchmarkHourlyPair] = [:]
+        for pair in deduped {
+            let key = HourKey(kind: pair.kind, valid: pair.valid)
+            if let cur = latest[key] {
+                if pair.issued > cur.issued { latest[key] = pair }
+            } else {
+                latest[key] = pair
+            }
+        }
+        var byKind: [BenchmarkForecastKind: [Date: BenchmarkHourlyPair]] = [:]
+        for (key, pair) in latest {
+            byKind[key.kind, default: [:]][key.valid] = pair
+        }
+        guard var shared = byKind[.skyline].map({ Set($0.keys) }), shared.count >= minN else { return empty }
+        var included: [BenchmarkForecastKind] = [.skyline]
+        for kind in [BenchmarkForecastKind.metNorway, .nws, .bestMatch] {
+            guard let hours = byKind[kind], !hours.isEmpty else { continue }
+            let intersection = shared.intersection(hours.keys)
+            guard intersection.count >= minN else { continue }
+            shared = intersection
+            included.append(kind)
+        }
+        var maes: [BenchmarkForecastKind: Double] = [:]
+        for kind in included {
+            let rows = shared.compactMap { byKind[kind]?[$0] }
+            guard rows.count == shared.count, !rows.isEmpty else { continue }
+            let sum = rows.reduce(0.0) { $0 + abs($1.forecastC - $1.observedC) }
+            maes[kind] = sum / Double(rows.count)
+        }
+        return PairedHourly(kinds: maes, n: shared.count, windowDays: BenchmarkStore.retentionDays)
     }
 
     // MARK: Accuracy PR 2 — training / gate helpers
@@ -276,5 +333,27 @@ public enum BenchmarkScorer {
     /// Distinct local days represented in training rows for a target.
     public static func distinctTrainingDays(_ rows: [TrainingRow]) -> Int {
         Set(rows.map { Int($0.localDay.timeIntervalSince1970) }).count
+    }
+}
+
+/// City-aware station wording for the Accuracy panel. Text only.
+public enum AccuracyStationCopy {
+    /// US cities name the NWS station; everywhere else names the airport METAR.
+    public static func stationPhrase(isUS: Bool) -> String {
+        isUS ? "nearest NWS station" : "nearest airport weather station (METAR)"
+    }
+
+    /// Shown only for a non-US city that still has no benchmark METAR station.
+    public static func collectingUnavailableLine(isUS: Bool, benchmarkStationID: String?) -> String? {
+        guard !isUS, benchmarkStationID == nil else { return nil }
+        return "No reporting weather station found near this city yet."
+    }
+
+    public static func stationLine(name: String?, stationID: String, distanceKm: Double?) -> String {
+        let who = name ?? stationID
+        if let km = distanceKm {
+            return String(format: "Station: %@ (%@) · %.0f km", who, stationID, km)
+        }
+        return "Station: \(who) (\(stationID))"
     }
 }

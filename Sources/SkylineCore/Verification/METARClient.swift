@@ -14,9 +14,13 @@ public enum METARClient {
         public var name: String?
         public var coordinate: Coordinate
         public var elevationM: Double?
+        /// AWC `siteType` values such as `METAR` and `TAF`. Nil when the payload omits the field.
+        public var siteTypes: [String]?
 
-        public init(id: String, name: String? = nil, coordinate: Coordinate, elevationM: Double? = nil) {
+        public init(id: String, name: String? = nil, coordinate: Coordinate, elevationM: Double? = nil,
+                    siteTypes: [String]? = nil) {
             self.id = id; self.name = name; self.coordinate = coordinate; self.elevationM = elevationM
+            self.siteTypes = siteTypes
         }
     }
 
@@ -34,9 +38,10 @@ public enum METARClient {
             // Some payloads encode lat/lon as strings.
             var latString: String?
             var lonString: String?
+            var siteType: [String]?
 
             enum CodingKeys: String, CodingKey {
-                case icaoId, id, site, name, lat, lon, elev
+                case icaoId, id, site, name, lat, lon, elev, siteType
             }
 
             init(from decoder: Decoder) throws {
@@ -52,6 +57,13 @@ public enum METARClient {
                 if let d = try? c.decodeIfPresent(Double.self, forKey: .elev) { elev = d }
                 else if let i = try? c.decodeIfPresent(Int.self, forKey: .elev) { elev = Double(i) }
                 else if let s = try? c.decodeIfPresent(String.self, forKey: .elev) { elev = Double(s) }
+                if c.contains(.siteType) {
+                    if let one = try? c.decode(String.self, forKey: .siteType) { siteType = [one] }
+                    else if let many = try? c.decode([String].self, forKey: .siteType) { siteType = many }
+                    else { siteType = nil }
+                } else {
+                    siteType = nil
+                }
             }
         }
         let rows = (try? JSONDecoder().decode([Row].self, from: data)) ?? []
@@ -60,20 +72,39 @@ public enum METARClient {
             guard ident.range(of: "^[A-Z][A-Z0-9]{3}$", options: .regularExpression) != nil,
                   let lat = r.lat, let lon = r.lon, lat.isFinite, lon.isFinite else { return nil }
             return StationInfo(id: ident, name: r.site ?? r.name,
-                               coordinate: Coordinate(latitude: lat, longitude: lon), elevationM: r.elev)
+                               coordinate: Coordinate(latitude: lat, longitude: lon), elevationM: r.elev,
+                               siteTypes: r.siteType)
         }
+    }
+
+    /// Stations within 50 km that report METARs (`siteTypes` nil or contains "METAR"), nearest first.
+    /// Equal distance prefers a station that also carries a TAF.
+    public static func rankCandidates(_ stations: [StationInfo], near point: Coordinate,
+                                      maxDistanceKm: Double = maxStationDistanceKm) -> [StationInfo] {
+        stations.compactMap { station -> (StationInfo, Double)? in
+            let distance = NexradStation.distanceKm(point, station.coordinate)
+            guard distance <= maxDistanceKm else { return nil }
+            if let types = station.siteTypes, !types.contains("METAR") { return nil }
+            return (station, distance)
+        }
+        .sorted { a, b in
+            if a.1 != b.1 { return a.1 < b.1 }
+            let aTAF = a.0.siteTypes?.contains("TAF") == true
+            let bTAF = b.0.siteTypes?.contains("TAF") == true
+            if aTAF != bTAF { return aTAF }
+            return a.0.id < b.0.id
+        }
+        .map(\.0)
     }
 
     /// Nearest station within 50 km (great-circle). None → nil (no verification).
     public static func pickNearest(_ stations: [StationInfo], near point: Coordinate,
                                    cityElevationM: Double? = nil) -> MetarStationPick? {
-        let ranked = stations.map { ($0, NexradStation.distanceKm(point, $0.coordinate)) }
-            .filter { $0.1 <= maxStationDistanceKm }
-            .sorted { $0.1 < $1.1 }
-        guard let best = ranked.first else { return nil }
-        let elevDelta = cityElevationM.flatMap { c in best.0.elevationM.map { $0 - c } }
-        return MetarStationPick(stationID: best.0.id, name: best.0.name, coordinate: best.0.coordinate,
-                                elevationM: best.0.elevationM, distanceKm: best.1,
+        guard let best = rankCandidates(stations, near: point).first else { return nil }
+        let distance = NexradStation.distanceKm(point, best.coordinate)
+        let elevDelta = cityElevationM.flatMap { c in best.elevationM.map { $0 - c } }
+        return MetarStationPick(stationID: best.id, name: best.name, coordinate: best.coordinate,
+                                elevationM: best.elevationM, distanceKm: distance,
                                 elevationDeltaM: elevDelta, pickedAt: Date())
     }
 
