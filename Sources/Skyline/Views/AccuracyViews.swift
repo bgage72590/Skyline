@@ -258,7 +258,7 @@ struct AccuracyPanel: View {
             Text("Collecting data").font(.title2.weight(.semibold))
             ProgressView(value: min(days / need, 1))
                 .tint(Color(red: 0.45, green: 0.8, blue: 1))
-            Text("\(AccuracyFormat.days(days)) of \(Int(need)) days · \(r?.verifiedPairs ?? 0) forecast hours verified · \(r?.pendingForecasts ?? 0) waiting for observations")
+            Text("\(AccuracyFormat.days(days)) of \(Int(need)) days · \(r?.verifiedPairs ?? 0) forecast checks · \(r?.pendingForecasts ?? 0) waiting for observations")
                 .font(.callout).monospacedDigit()
             if let id = r?.stationID {
                 Text("Station: \(r?.stationName ?? id) (\(id))").font(.caption).foregroundStyle(Glass.secondaryText)
@@ -293,7 +293,7 @@ struct AccuracyPanel: View {
                  blend?.falseAlarmRatio.map { "\(AccuracyFormat.percent($0)) false alarms" } ?? "No wet hours yet")
             stat("Winning lately", r.recentWinner?.displayName ?? "Too early",
                  r.recentWinnerMAE.map { "±" + AccuracyFormat.delta($0, units) + " · last 7 days" } ?? "Needs a few days")
-            stat("Data collected", AccuracyFormat.days(r.daysCollected), "\(r.verifiedPairs) hours verified")
+            stat("Data collected", AccuracyFormat.days(r.daysCollected), "\(r.verifiedPairs) forecast checks")
         }
 
         Picker("Lead time", selection: $bucket) {
