@@ -104,6 +104,22 @@ final class BlendingTests: XCTestCase {
         XCTAssertEqual(ForecastBlender.reconcile(code: 45, precipitationProbability: 90, precipitation: 3, temperature: 10), 45)
     }
 
+    func testHourlyPrecipitationIconMinPoP() {
+        XCTAssertEqual(ForecastBlender.hourlyPrecipitationIconMinPoP, 40)
+        // Dry code + 54 % + ≥0.2 mm promotes (the old 60 floor left this cloudy).
+        let promoted = ForecastBlender.reconcile(code: 3, precipitationProbability: 54, precipitation: 0.2, temperature: 10)
+        XCTAssertTrue(WeatherCondition(wmoCode: promoted).isPrecipitation, "pop 54 with 0.2 mm promotes a dry code")
+        XCTAssertEqual(promoted, 61)
+        // Just under the floor stays dry even when the amount gate is met.
+        let below = ForecastBlender.reconcile(code: 3, precipitationProbability: 39, precipitation: 0.2, temperature: 10)
+        XCTAssertEqual(below, 3)
+        XCTAssertFalse(WeatherCondition(wmoCode: below).isPrecipitation)
+        // At 50 % but under 0.2 mm stays dry.
+        let light = ForecastBlender.reconcile(code: 3, precipitationProbability: 50, precipitation: 0.19, temperature: 10)
+        XCTAssertEqual(light, 3)
+        XCTAssertFalse(WeatherCondition(wmoCode: light).isPrecipitation)
+    }
+
     func testNowcast() {
         let now = Date(timeIntervalSince1970: 1_000_000)
         func series(_ v: [Double]) -> [MinutelyPrecipitation] {
