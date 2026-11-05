@@ -127,4 +127,49 @@ public enum HourlyDisplay {
     public static func popText(_ day: DailyForecast) -> String? {
         popText(probability: day.precipitationProbability, isPrecipitationIcon: day.condition.isPrecipitation)
     }
+
+    /// Caption under a daily icon. Snow depth only for a snow icon with at least 0.5 cm; every other
+    /// icon uses `popText` (a missing probability stays blank, including when models still have snow).
+    public static func dailyCaption(weatherCode: Int, snowfallSum: Double?, precipitationProbability: Double?,
+                                     units: DisplayUnits) -> DailyPrecipCaption? {
+        let condition = WeatherCondition(wmoCode: weatherCode)
+        if condition.category == .snow, (snowfallSum ?? 0) >= 0.5 {
+            return .snow(units.snowString(snowfallSum) + " snow")
+        }
+        return popText(probability: precipitationProbability, isPrecipitationIcon: condition.isPrecipitation)
+            .map { .chance($0) }
+    }
+
+    public static func dailyCaption(_ day: DailyForecast, units: DisplayUnits) -> DailyPrecipCaption? {
+        dailyCaption(weatherCode: day.weatherCode, snowfallSum: day.snowfallSum,
+                     precipitationProbability: day.precipitationProbability, units: units)
+    }
+
+    public static func dailyCaption(_ day: WidgetSnapshot.Day, units: DisplayUnits) -> DailyPrecipCaption? {
+        dailyCaption(weatherCode: day.weatherCode, snowfallSum: day.snowfallSum,
+                     precipitationProbability: day.precipitationProbability, units: units)
+    }
+}
+
+/// What the 10-day card and the large widget print under the daily icon.
+public enum DailyPrecipCaption: Equatable, Sendable {
+    case chance(String)
+    case snow(String)
+
+    public var text: String {
+        switch self {
+        case .chance(let text), .snow(let text): return text
+        }
+    }
+
+    /// VoiceOver. A snow amount is `Snow, 0.6 in` — the unit string once, not the visible word again.
+    public var accessibilityLabel: String {
+        switch self {
+        case .chance(let text):
+            return text
+        case .snow(let text):
+            let amount = text.hasSuffix(" snow") ? String(text.dropLast(" snow".count)) : text
+            return "Snow, \(amount)"
+        }
+    }
 }
