@@ -1,0 +1,14 @@
+[
+  {
+    "icaoId": "EGLC",
+    "obsTime": 1760185800,
+    "temp": 11.0,
+    "rawOb": "METAR EGLC 111230Z 18008KT 9999 FEW020 11/08 Q1015"
+  },
+  {
+    "icaoId": "EGLL",
+    "obsTime": 1760185800,
+    "temp": 12.0,
+    "rawOb": "METAR EGLL 111230Z 20010KT 9999 SCT025 12/07 Q1014"
+  }
+]

@@ -14,8 +14,18 @@ public actor BenchmarkStore {
     public static let secondsPerDay: TimeInterval = 86_400
     /// Fix 4: drop pending whose valid is older than this without an observation.
     public static let metPendingExpiry: TimeInterval = 2 * secondsPerDay
-    /// Fix 4: hard cap on met-pending.jsonl rows (oldest first).
+    /// Fix 4: hard cap on met-pending.jsonl rows (global backstop).
     public static let metPendingCap = 10_000
+    /// H1: per-city pending cap (~12 fetches × 120 hours). Non-binding, but at least six fetches.
+    public static let metPendingPerCityCap = 1_500
+    /// H1: cap eviction never drops a row whose valid time is inside this many hours.
+    public static let metPendingProtectHours: Double = 6
+    /// H2: a station with no METAR rows after this long is retired on the next successful batch.
+    static let metarDeadStationAfter: TimeInterval = 3 * 3600
+    /// H2: unverified picks (and network failures) recheck after this long, not the 7-day cache.
+    static let unverifiedStationRecheck: TimeInterval = 6 * 3600
+    /// H2: liveness check covers the nearest this-many METAR candidates in one AWC request.
+    static let livenessCandidateCount = 5
 
     public struct Meta: Codable, Sendable {
         var station: MetarStationPick?
@@ -28,15 +38,18 @@ public actor BenchmarkStore {
         var lastDailyIssue: Date?
         /// Fix 3: 24 h negative cache after a failed US NWS stations seed.
         var noUSStationSeedUntil: Date?
+        /// H2: station IDs that returned no METARs, with the time they were marked dead (TTL 7 days).
+        var deadStationIDs: [String: Date]?
         init(station: MetarStationPick? = nil, lastMetNorwayFetch: Date? = nil, lastMetarBatch: Date? = nil,
              lastSummaryAt: Date? = nil, cityElevationM: Double? = nil,
              noStationUntil: Date? = nil, lastDailyIssue: Date? = nil,
-             noUSStationSeedUntil: Date? = nil) {
+             noUSStationSeedUntil: Date? = nil, deadStationIDs: [String: Date]? = nil) {
             self.station = station; self.lastMetNorwayFetch = lastMetNorwayFetch
             self.lastMetarBatch = lastMetarBatch; self.lastSummaryAt = lastSummaryAt
             self.cityElevationM = cityElevationM
             self.noStationUntil = noStationUntil; self.lastDailyIssue = lastDailyIssue
             self.noUSStationSeedUntil = noUSStationSeedUntil
+            self.deadStationIDs = deadStationIDs
         }
     }
 
@@ -264,20 +277,46 @@ public actor BenchmarkStore {
         return metCache[key]?.fetchedAt
     }
 
-    /// Append MET pending samples for future valid hours (dedupe loc/issued/valid). Freshness gated.
+    /// Pending rows for one city (tests and migration checks).
+    public func metPendingSamples(for key: String? = nil) -> [MetPendingSample] {
+        load()
+        guard let key else { return metPending }
+        return metPending.filter { $0.loc == key }
+    }
+
+    /// Append MET pending samples once per MET fetch. Freshness guard is unchanged.
+    /// New rows store `issued` = `fetchedAt` (when the forecast was obtained), not the refresh clock.
+    /// Dedupe key is (loc, fetchedAt, valid hour). An unchanged value from an earlier fetch within 1 h is skipped.
     public func recordMetPending(key: String, issued: Date, hours: [MetNorwayHour], fetchedAt: Date?) {
         load()
         assertOffMain()
         guard let fetchedAt, issued.timeIntervalSince(fetchedAt) <= Self.metNorwaySampleMaxAge,
               issued.timeIntervalSince(fetchedAt) >= 0 else { return }
-        let leads = ForecastSampler.metNorwayLeadValues(location: key, issued: issued, hours: hours)
-        struct K: Hashable { var loc: String; var issued: Date; var valid: Date }
-        var seen = Set(metPending.map { K(loc: $0.loc, issued: $0.issued, valid: $0.valid) })
+        let aligned = ForecastSampler.metNorwayHourlyValues(fetchedAt: fetchedAt, hours: hours)
+        // Lead-ladder samples (valid = issued + lead, often off the hour) are kept only when the
+        // series has no on-the-hour times. Live MET hours are on the hour, so this is the pre-H1 path.
+        let values: [(valid: Date, t: Double)] = aligned.isEmpty
+            ? ForecastSampler.metNorwayLeadValues(location: key, issued: issued, hours: hours).filter { $0.valid > issued }
+            : aligned
+        let mine = metPending.filter { $0.loc == key }
+        struct FK: Hashable { var fetched: Date; var hour: Int }
+        var seen = Set(mine.compactMap { row -> FK? in
+            guard let f = row.fetchedAt else { return nil }
+            return FK(fetched: f, hour: ForecastSampler.hourBucket(row.valid))
+        })
         var fresh: [MetPendingSample] = []
-        for (valid, t) in leads where valid > issued {
-            let k = K(loc: key, issued: issued, valid: valid)
-            guard seen.insert(k).inserted else { continue }
-            fresh.append(MetPendingSample(loc: key, issued: issued, valid: valid, forecastC: t))
+        for (valid, t) in values {
+            let hour = ForecastSampler.hourBucket(valid)
+            let fetchKey = FK(fetched: fetchedAt, hour: hour)
+            guard seen.insert(fetchKey).inserted else { continue }
+            let sameValueRecently = mine.contains { existing in
+                guard let earlier = existing.fetchedAt else { return false }
+                guard ForecastSampler.hourBucket(existing.valid) == hour, existing.forecastC == t else { return false }
+                let delta = fetchedAt.timeIntervalSince(earlier)
+                return delta > 0 && delta <= 3600
+            }
+            if sameValueRecently { continue }
+            fresh.append(MetPendingSample(loc: key, issued: fetchedAt, valid: valid, forecastC: t, fetchedAt: fetchedAt))
         }
         guard !fresh.isEmpty else { return }
         metPending.append(contentsOf: fresh)
@@ -300,7 +339,7 @@ public actor BenchmarkStore {
             if s.valid <= expiryCutoff { removed = true; continue }
             if s.valid <= dueCutoff, let o = ObservationAggregator.observe(obs, validTime: s.valid),
                let ot = o.t {
-                pairs.append(BenchmarkHourlyPair(loc: s.loc, issued: s.issued, valid: s.valid,
+                pairs.append(BenchmarkHourlyPair(loc: s.loc, issued: s.fetchedAt ?? s.issued, valid: s.valid,
                                                  kind: .metNorway, forecastC: s.forecastC, observedC: ot))
                 removed = true
                 continue
@@ -315,45 +354,168 @@ public actor BenchmarkStore {
     }
 
     private func pruneMetPendingIfNeeded(rewrite: Bool) {
-        let expiryCutoff = now().addingTimeInterval(-Self.metPendingExpiry)
+        let t = now()
+        let expiryCutoff = t.addingTimeInterval(-Self.metPendingExpiry)
         let before = metPending.count
         metPending = metPending.filter { $0.valid > expiryCutoff }
-        if metPending.count > Self.metPendingCap {
-            metPending.sort { $0.valid < $1.valid }
-            metPending.removeFirst(metPending.count - Self.metPendingCap)
-        }
+        metPending = migrateMetPending(metPending)
+        metPending = applyMetPendingCaps(metPending, now: t)
         if rewrite || metPending.count != before {
             writeAll(metPending, to: "met-pending.jsonl")
         }
     }
 
-    /// US cities keep the NWS/ASOS path; non-US cities pick a METAR within 50 km.
+    /// Drop off-hour legacy rows (no fetchedAt) and collapse the rest to one per (loc, hour, value).
+    private func migrateMetPending(_ rows: [MetPendingSample]) -> [MetPendingSample] {
+        let modern = rows.filter { $0.fetchedAt != nil }
+        let legacy = rows.filter { $0.fetchedAt == nil && ForecastSampler.isOnTheHour($0.valid) }
+        struct LK: Hashable { var loc: String; var hour: Int; var forecastC: Double }
+        var best: [LK: MetPendingSample] = [:]
+        for row in legacy {
+            let k = LK(loc: row.loc, hour: ForecastSampler.hourBucket(row.valid), forecastC: row.forecastC)
+            if let cur = best[k] {
+                if row.issued > cur.issued { best[k] = row }
+            } else {
+                best[k] = row
+            }
+        }
+        return modern + best.values
+    }
+
+    private func applyMetPendingCaps(_ rows: [MetPendingSample], now t: Date) -> [MetPendingSample] {
+        let protectUntil = t.addingTimeInterval(Self.metPendingProtectHours * 3600)
+        var byCity = Dictionary(grouping: rows, by: \.loc)
+        for city in byCity.keys {
+            byCity[city] = capMetPendingCity(byCity[city] ?? [], protectUntil: protectUntil)
+        }
+        var all = byCity.values.flatMap { $0 }
+        if all.count > Self.metPendingCap {
+            all = capMetPendingGlobal(all, protectUntil: protectUntil)
+        }
+        return all
+    }
+
+    /// Evict unprotected rows until the city is within the cap. Protected rows are never dropped (I2).
+    private func capMetPendingCity(_ rows: [MetPendingSample], protectUntil: Date) -> [MetPendingSample] {
+        let protectedCount = rows.reduce(0) { $0 + ($1.valid <= protectUntil ? 1 : 0) }
+        let unprotectedCount = rows.count - protectedCount
+        let room = max(Self.metPendingPerCityCap, protectedCount)
+        let allowedUnprotected = room - protectedCount
+        guard unprotectedCount > allowedUnprotected else { return rows }
+        let dropCount = unprotectedCount - allowedUnprotected
+        let unprotected = rows.enumerated().filter { $0.element.valid > protectUntil }
+        let drop = Set(metPendingEvictionOrder(unprotected).prefix(dropCount))
+        return rows.enumerated().compactMap { drop.contains($0.offset) ? nil : $0.element }
+    }
+
+    /// Same eviction order as a city, taking from the largest city first, never a protected row.
+    private func capMetPendingGlobal(_ rows: [MetPendingSample], protectUntil: Date) -> [MetPendingSample] {
+        var byCity = Dictionary(grouping: rows, by: \.loc)
+        func total() -> Int { byCity.values.reduce(0) { $0 + $1.count } }
+        var spins = rows.count + 1
+        while total() > Self.metPendingCap && spins > 0 {
+            spins -= 1
+            let cities = byCity.keys.sorted { a, b in
+                let ca = byCity[a]?.count ?? 0, cb = byCity[b]?.count ?? 0
+                return ca == cb ? a < b : ca > cb
+            }
+            var evicted = false
+            for city in cities {
+                var cityRows = byCity[city] ?? []
+                let unprotected = cityRows.enumerated().filter { $0.element.valid > protectUntil }
+                guard let victim = metPendingEvictionOrder(unprotected).first else { continue }
+                cityRows.remove(at: victim)
+                byCity[city] = cityRows
+                evicted = true
+                break
+            }
+            if !evicted { break }
+        }
+        return byCity.values.flatMap { $0 }
+    }
+
+    /// Indices to evict first: superseded (oldest issued) copies, then farthest-future rows.
+    private func metPendingEvictionOrder(_ rows: [(offset: Int, element: MetPendingSample)]) -> [Int] {
+        let groups = Dictionary(grouping: rows) { ForecastSampler.hourBucket($0.element.valid) }
+        var superseded: [(offset: Int, element: MetPendingSample)] = []
+        var keepers: [(offset: Int, element: MetPendingSample)] = []
+        for (_, group) in groups {
+            let sorted = group.sorted { a, b in
+                let ia = a.element.fetchedAt ?? a.element.issued
+                let ib = b.element.fetchedAt ?? b.element.issued
+                if ia != ib { return ia < ib }
+                return a.offset < b.offset
+            }
+            if sorted.count > 1 {
+                superseded.append(contentsOf: sorted.dropLast())
+                if let last = sorted.last { keepers.append(last) }
+            } else {
+                keepers.append(contentsOf: sorted)
+            }
+        }
+        superseded.sort { a, b in
+            let ia = a.element.fetchedAt ?? a.element.issued
+            let ib = b.element.fetchedAt ?? b.element.issued
+            if ia != ib { return ia < ib }
+            return a.offset < b.offset
+        }
+        keepers.sort { a, b in
+            if a.element.valid != b.element.valid { return a.element.valid > b.element.valid }
+            return a.offset < b.offset
+        }
+        return (superseded + keepers).map(\.offset)
+    }
+
+    /// US cities keep the NWS/ASOS path; non-US cities pick a METAR within 50 km that has reported recently.
     public func ensureStation(key: String, near point: Coordinate, isUS: Bool,
                               cityElevationM: Double? = nil) async -> MetarStationPick? {
         load()
         assertOffMain()
         if isUS { return nil }
-        if let s = meta[key]?.station, now().timeIntervalSince(s.pickedAt) < METARClient.stationCacheDays * 86400 {
-            return s
+        if let s = meta[key]?.station {
+            let fresh = now().timeIntervalSince(s.pickedAt) < METARClient.stationCacheDays * Self.secondsPerDay
+            let recheckDue = s.verified == false && s.verifiedRecheckAt.map { now() >= $0 } == true
+            if fresh && !recheckDue { return s }
         }
-        if let until = meta[key]?.noStationUntil, now() < until { return nil }
+        if meta[key]?.station == nil, let until = meta[key]?.noStationUntil, now() < until { return nil }
         let box = METARClient.searchBBox(around: point)
         let url = Endpoints.awcStationInfo(bbox: box.0, box.1, box.2, box.3)
         guard noteRequest(),
               let result = try? await client.fetch(url, headers: ["Accept": "application/json"]),
               (200..<300).contains(result.statusCode) || result.isNoContent else {
-            if meta[key]?.station == nil { meta[key, default: Meta()].noStationUntil = now().addingTimeInterval(6 * 3600); saveMeta() }
+            noteStationNetworkFailure(key: key)
             return meta[key]?.station
         }
         let stations = result.isNoContent ? [] : METARClient.decodeStations(result.data)
-        guard let pick = METARClient.pickNearest(stations, near: point, cityElevationM: cityElevationM) else {
-            meta[key, default: Meta()].noStationUntil = now().addingTimeInterval(METARClient.stationCacheDays * 86400)
+        let dead = activeDeadStationIDs(key: key)
+        let ranked = METARClient.rankCandidates(stations, near: point).filter { !dead.contains($0.id) }
+        guard !ranked.isEmpty else {
+            var m = meta[key] ?? Meta()
+            m.station = nil
+            m.noStationUntil = now().addingTimeInterval(METARClient.stationCacheDays * Self.secondsPerDay)
+            m.cityElevationM = cityElevationM
+            meta[key] = m
             saveMeta()
             return nil
         }
+        let top = Array(ranked.prefix(Self.livenessCandidateCount))
+        guard noteRequest(),
+              let live = try? await client.fetch(Endpoints.awcMetar(ids: top.map(\.id), hours: 6),
+                                                 headers: ["Accept": "application/json"]),
+              (200..<300).contains(live.statusCode) || live.isNoContent else {
+            noteStationNetworkFailure(key: key)
+            return meta[key]?.station
+        }
+        let reported = Set(METARClient.decodeMetars(live.isNoContent ? Data() : live.data, loc: key, reference: now()).map(\.stationID))
+        let chosen = top.first { reported.contains($0.id) } ?? ranked[0]
+        let verified = reported.contains(chosen.id)
+        let pick = stationPick(chosen, near: point, cityElevationM: cityElevationM,
+                               verified: verified,
+                               recheck: verified ? nil : now().addingTimeInterval(Self.unverifiedStationRecheck))
         var m = meta[key] ?? Meta()
         m.station = pick
         m.cityElevationM = cityElevationM
+        m.noStationUntil = nil
         meta[key] = m
         if !global.knownStationIDs.contains(pick.stationID) {
             global.knownStationIDs.append(pick.stationID)
@@ -361,6 +523,38 @@ public actor BenchmarkStore {
         }
         saveMeta()
         return pick
+    }
+
+    /// Network failure keeps today's retry (6 h) and does not start the 7-day station cache.
+    private func noteStationNetworkFailure(key: String) {
+        if meta[key]?.station == nil {
+            meta[key, default: Meta()].noStationUntil = now().addingTimeInterval(Self.unverifiedStationRecheck)
+        } else if meta[key]?.station?.verified == false {
+            meta[key]?.station?.verifiedRecheckAt = now().addingTimeInterval(Self.unverifiedStationRecheck)
+        }
+        saveMeta()
+    }
+
+    private func stationPick(_ station: METARClient.StationInfo, near point: Coordinate, cityElevationM: Double?,
+                             verified: Bool, recheck: Date?) -> MetarStationPick {
+        let dist = NexradStation.distanceKm(point, station.coordinate)
+        let elevDelta = cityElevationM.flatMap { c in station.elevationM.map { $0 - c } }
+        return MetarStationPick(stationID: station.id, name: station.name, coordinate: station.coordinate,
+                                elevationM: station.elevationM, distanceKm: dist, elevationDeltaM: elevDelta,
+                                pickedAt: now(), verified: verified, verifiedRecheckAt: recheck)
+    }
+
+    /// Dead IDs younger than the 7-day TTL. Expired entries are dropped.
+    private func activeDeadStationIDs(key: String) -> Set<String> {
+        let t = now()
+        let ttl = METARClient.stationCacheDays * Self.secondsPerDay
+        let dead = meta[key]?.deadStationIDs ?? [:]
+        let live = dead.filter { t.timeIntervalSince($0.value) < ttl }
+        if live.count != dead.count {
+            meta[key]?.deadStationIDs = live.isEmpty ? nil : live
+            saveMeta()
+        }
+        return Set(live.keys)
     }
 
     /// One batched AWC METAR request per hour for all known non-US stations.
@@ -406,7 +600,36 @@ public actor BenchmarkStore {
             pruneIfDue()
             recomputeSummaries()
         }
+        if (try? JSONSerialization.jsonObject(with: result.data)) is [Any] {
+            retireDeadStations(now: t)
+        }
         return added.filter { $0.loc == key }
+    }
+
+    /// A station with no METAR rows 3 h after it was picked is dead. The next ensureStation skips it.
+    private func retireDeadStations(now t: Date) {
+        var retired: [String] = []
+        var updates: [String: Meta] = [:]
+        let ttl = METARClient.stationCacheDays * Self.secondsPerDay
+        for (city, m) in meta {
+            guard let station = m.station else { continue }
+            guard t.timeIntervalSince(station.pickedAt) >= Self.metarDeadStationAfter else { continue }
+            let hasRow = metars.contains { $0.loc == city && $0.stationID == station.stationID }
+            if hasRow { continue }
+            var dead = (m.deadStationIDs ?? [:]).filter { t.timeIntervalSince($0.value) < ttl }
+            dead[station.stationID] = t
+            var updated = m
+            updated.deadStationIDs = dead
+            updated.station = nil
+            updates[city] = updated
+            retired.append(station.stationID)
+        }
+        for (city, updated) in updates { meta[city] = updated }
+        guard !retired.isEmpty else { return }
+        let stillUsed = Set(meta.values.compactMap(\.station?.stationID))
+        global.knownStationIDs.removeAll { retired.contains($0) && !stillUsed.contains($0) }
+        saveMeta()
+        saveGlobal()
     }
 
     /// Fetch MET Norway at most once per city per 3 h issuance; honour Expires / If-Modified-Since.
@@ -737,12 +960,15 @@ public actor BenchmarkStore {
             .union(hourlyBench.map(\.loc))
             .union(dailyObs.map(\.loc))
         for key in keys {
-            summaries[key] = BenchmarkScorer.summary(
-                hourly: hourlyBench.filter { $0.loc == key },
+            let hourly = hourlyBench.filter { $0.loc == key }
+            var summary = BenchmarkScorer.summary(
+                hourly: hourly,
                 dailyIssues: dailyIssues.filter { $0.loc == key },
                 dailyObs: dailyObs.filter { $0.loc == key },
                 station: meta[key]?.station
             )
+            summary.pairedHourly = BenchmarkScorer.pairedHourly(hourly, loc: key)
+            summaries[key] = summary
         }
         saveSummaries()
     }
@@ -967,9 +1193,12 @@ public struct MetPendingSample: Codable, Hashable, Sendable {
     public var issued: Date
     public var valid: Date
     public var forecastC: Double
+    /// When the MET forecast was fetched. Nil on rows written before H1.
+    public var fetchedAt: Date?
 
-    public init(loc: String, issued: Date, valid: Date, forecastC: Double) {
+    public init(loc: String, issued: Date, valid: Date, forecastC: Double, fetchedAt: Date? = nil) {
         self.loc = loc; self.issued = issued; self.valid = valid; self.forecastC = forecastC
+        self.fetchedAt = fetchedAt
     }
 }
 
