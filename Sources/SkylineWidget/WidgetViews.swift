@@ -131,8 +131,9 @@ struct SkylineWidgetView: View {
                         .symbolRenderingMode(.multicolor).frame(width: 24)
                     if (d.snowfallSum ?? 0) >= 0.5 {
                         Text(s.units.snowString(d.snowfallSum)).font(.caption2.weight(.bold)).frame(width: 46, alignment: .leading)
-                    } else if let p = d.precipitationProbability, p >= 20 {
-                        Text("\(Int((p / 10).rounded() * 10))%").font(.caption2.weight(.bold))
+                    } else if let text = HourlyDisplay.popText(probability: d.precipitationProbability,
+                                                                 isPrecipitationIcon: WeatherCondition(wmoCode: d.weatherCode).isPrecipitation) {
+                        Text(text).font(.caption2.weight(.bold))
                             .foregroundStyle(Color(red: 0.7, green: 0.88, blue: 1)).frame(width: 46, alignment: .leading)
                     } else { Spacer().frame(width: 46) }
                     Spacer()
