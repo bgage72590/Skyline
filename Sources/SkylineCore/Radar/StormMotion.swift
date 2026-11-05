@@ -7,6 +7,7 @@ public struct StormCell: Hashable, Sendable, Identifiable {
     public var stormID: String
     public var coordinate: Coordinate
     public var maxDBZ: Int
+    /// Travel heading, degrees clockwise from north (toward). IEM raw `drct` is meteorological FROM; `parseGeoJSON` stores toward.
     public var directionDegrees: Double
     public var speedKnots: Double
     public var valid: Date
@@ -65,9 +66,12 @@ public enum StormMotion {
             guard let coords = f.geometry?.coordinates, coords.count >= 2 else { return nil }
             let valid = iso.date(from: f.properties.valid) ?? isoBasic.date(from: f.properties.valid) ?? Date()
             let id = "\(f.properties.nexrad)-\(f.properties.storm_id)-\(f.properties.valid)"
+            // IEM `drct` is meteorological FROM (like wind). After parse, StormCell.directionDegrees is travel TOWARD.
+            let toward = ((f.properties.drct + 180).truncatingRemainder(dividingBy: 360) + 360)
+                .truncatingRemainder(dividingBy: 360)
             return StormCell(id: id, radar: f.properties.nexrad, stormID: f.properties.storm_id,
                              coordinate: Coordinate(latitude: coords[1], longitude: coords[0]),
-                             maxDBZ: f.properties.max_dbz, directionDegrees: f.properties.drct,
+                             maxDBZ: f.properties.max_dbz, directionDegrees: toward,
                              speedKnots: f.properties.sknt, valid: valid)
         }
     }
