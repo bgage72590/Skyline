@@ -1071,6 +1071,18 @@ public actor BenchmarkStore {
            let s = try? Self.decoder.decode([String: BenchmarkSummary].self, from: data) { summaries = s }
         prune()
         pruneTrainingIfDue(force: true)
+        // 147 summaries omit pairedHourly. Rebuild from hourly pairs already on disk so the
+        // comparison box does not stay hidden until the next observation.
+        backfillPairedHourlyIfNeeded()
+    }
+
+    /// One-time upgrade: any summary still missing `pairedHourly`, or hourly pairs with no such summary.
+    private func backfillPairedHourlyIfNeeded() {
+        let summaryMissing = summaries.values.contains { $0.pairedHourly == nil }
+        let pairsWithout = hourlyBench.contains { summaries[$0.loc]?.pairedHourly == nil }
+        if summaryMissing || pairsWithout {
+            recomputeSummaries()
+        }
     }
 
     /// Apply ForecastSampler DST scrub to in-memory daily issues + daily training (load/prune hook).

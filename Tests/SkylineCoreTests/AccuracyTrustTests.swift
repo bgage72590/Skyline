@@ -431,6 +431,42 @@ final class AccuracyTrustTests: XCTestCase {
         XCTAssertNil(AccuracyStationCopy.collectingUnavailableLine(isUS: true, benchmarkStationID: nil))
     }
 
+    /// 147 summaries.json has no pairedHourly. Load must fill it from hourly pairs already on disk.
+    func testLoadBackfillsPairedHourlyFromExistingPairs() async throws {
+        let now = base.addingTimeInterval(30 * 3600)
+        let dir = try scratch()
+        var pairs: [BenchmarkHourlyPair] = []
+        for hour in 0..<24 {
+            let valid = base.addingTimeInterval(Double(hour) * 3600)
+            let issued = valid.addingTimeInterval(-2 * 3600)
+            pairs.append(BenchmarkHourlyPair(loc: "london", issued: issued, valid: valid,
+                                              kind: .skyline, forecastC: 10, observedC: 12))
+            pairs.append(BenchmarkHourlyPair(loc: "london", issued: issued, valid: valid,
+                                              kind: .metNorway, forecastC: 11, observedC: 12))
+        }
+        try writeJSONL(pairs, name: "hourly.jsonl", dir: dir)
+        let legacy = """
+        {"london":{"rows":[{"kind":"skyline","tempMAE":9,"n":24,"dailyN":0},{"kind":"met_norway","tempMAE":9,"n":24,"dailyN":0}],"metNorwayAttribution":"Data: MET Norway, CC BY 4.0"}}
+        """
+        try legacy.write(to: dir.appendingPathComponent("summaries.json"), atomically: true, encoding: .utf8)
+        XCTAssertFalse(legacy.contains("pairedHourly"))
+
+        let store = BenchmarkStore(directory: dir, client: ClosedHTTP(), now: { now })
+        let loaded = await store.summary(for: "london")
+        let summary = try XCTUnwrap(loaded)
+        let paired = try XCTUnwrap(summary.pairedHourly)
+        XCTAssertEqual(paired.n, 24)
+        XCTAssertEqual(paired.kinds[.skyline], 2)
+        XCTAssertEqual(paired.kinds[.metNorway], 1)
+        XCTAssertNil(paired.kinds[.nws])
+
+        let saved = try Data(contentsOf: dir.appendingPathComponent("summaries.json"))
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .secondsSince1970
+        let onDisk = try dec.decode([String: BenchmarkSummary].self, from: saved)
+        XCTAssertEqual(onDisk["london"]?.pairedHourly?.n, 24)
+    }
+
     func testT21NoBiasFilesInDiff() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -466,6 +502,10 @@ final class AccuracyTrustTests: XCTestCase {
     }
 
     private func writePending(_ rows: [MetPendingSample], dir: URL) throws {
+        try writeJSONL(rows, name: "met-pending.jsonl", dir: dir)
+    }
+
+    private func writeJSONL<T: Encodable>(_ rows: [T], name: String, dir: URL) throws {
         let enc = JSONEncoder()
         enc.dateEncodingStrategy = .secondsSince1970
         var data = Data()
@@ -473,7 +513,7 @@ final class AccuracyTrustTests: XCTestCase {
             data.append(try enc.encode(row))
             data.append(0x0A)
         }
-        try data.write(to: dir.appendingPathComponent("met-pending.jsonl"))
+        try data.write(to: dir.appendingPathComponent(name))
     }
 
     private func pair(_ kind: BenchmarkForecastKind, valid: Date, leadH: Double, forecast: Double, obs: Double) -> BenchmarkHourlyPair {
