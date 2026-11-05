@@ -236,7 +236,7 @@ struct ForecastColumn: View {
                     HourlyCard(report: report, units: units) { onOpen(.conditions, nil) }
                     DailyCard(report: report, units: units) { onOpen(.conditions, $0) }
                         .id(ScrollProbe.dailyID)
-                    OutlookCard(report: report, units: units)
+                    OutlookCard(report: report, units: units) { onOpen(.confidence, nil) }
                         .id("forecast-outlook")
                     ModelComparisonCard(report: report, units: units)
                         .id("forecast-models")
