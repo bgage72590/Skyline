@@ -21,11 +21,13 @@ enum InsightFormat {
 struct OutlookCard: View {
     let report: WeatherReport
     let units: DisplayUnits
+    var onOpen: () -> Void = {}
 
     var body: some View {
         let days = Array(report.daily.prefix(2))
         let changes = InsightFormat.changes(report, units: units)
         if !days.isEmpty {
+            Button(action: onOpen) {
             Card(title: "Forecast Confidence", systemImage: "gauge.with.dots.needle.50percent") {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(days.enumerated()), id: \.element.id) { offset, day in
@@ -53,6 +55,8 @@ struct OutlookCard: View {
                     }
                 }
             }
+            }
+            .buttonStyle(.plain)
         }
     }
 

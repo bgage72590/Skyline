@@ -4,19 +4,22 @@ import SkylineCore
 
 /// Modules that open a detail panel when tapped (as in Apple Weather).
 enum DetailModule: String, CaseIterable, Identifiable {
-    case conditions, uv, wind, precipitation, feelsLike, humidity, visibility, pressure, confidence, accuracy
+    case conditions, uv, sun, wind, precipitation, feelsLike, humidity, visibility, pressure, airQuality, moon, confidence, accuracy
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .conditions: "Conditions"
         case .uv: "UV Index"
+        case .sun: "Sun"
         case .wind: "Wind"
         case .precipitation: "Precipitation"
         case .feelsLike: "Feels Like"
         case .humidity: "Humidity"
         case .visibility: "Visibility"
         case .pressure: "Pressure"
+        case .airQuality: "Air Quality"
+        case .moon: "Moon"
         case .confidence: "Forecast Confidence"
         case .accuracy: "Forecast Accuracy"
         }
@@ -26,12 +29,15 @@ enum DetailModule: String, CaseIterable, Identifiable {
         switch self {
         case .conditions: "thermometer.medium"
         case .uv: "sun.max.fill"
+        case .sun: "sunrise.fill"
         case .wind: "wind"
         case .precipitation: "drop.fill"
         case .feelsLike: "thermometer.medium"
         case .humidity: "humidity.fill"
         case .visibility: "eye.fill"
         case .pressure: "gauge.with.dots.needle.33percent"
+        case .airQuality: "aqi.medium"
+        case .moon: "moon.fill"
         case .confidence: "checkmark.seal.fill"
         case .accuracy: "scope"
         }
@@ -116,16 +122,25 @@ struct ModuleDetailView: View {
                 headline(d)
                 if module == .confidence {
                     confidenceTable(d)
+                    confidenceChanges
+                } else if module == .sun {
+                    sunBody(d)
+                } else if module == .moon {
+                    moonBody(d)
+                } else if module == .airQuality {
+                    airBody(d)
                 } else {
                     chart(d)
                 }
-                Text(summary(d))
-                    .font(.callout)
-                    .foregroundStyle(.white)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                if !summary(d).isEmpty {
+                    Text(summary(d))
+                        .font(.callout)
+                        .foregroundStyle(.white)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
             }
             }
         }
@@ -196,6 +211,12 @@ struct ModuleDetailView: View {
             case .pressure:
                 Text(units.pressureString(d.hours(from: report.hourly, timeZone: tz).compactMap(\.pressure).first ?? report.current.pressure))
                     .font(.system(size: 40, weight: .medium))
+            case .sun:
+                sunHeadline(d)
+            case .moon:
+                moonHeadline(d)
+            case .airQuality:
+                airHeadline(d)
             case .accuracy:
                 EmptyView()
             case .confidence:
@@ -220,7 +241,7 @@ struct ModuleDetailView: View {
             case .humidity: v = h.humidity
             case .visibility: v = h.visibility.map(units.distance)
             case .pressure: v = h.pressure.map { units.pressure($0) }
-            case .confidence, .accuracy: v = nil
+            case .sun, .moon, .airQuality, .confidence, .accuracy: v = nil
             }
             let spread = (module == .conditions) ? h.temperatureSpread.map(units.temperatureDelta) : nil
             return v.map { ChartPoint(time: h.time, value: $0, spread: spread) }
@@ -238,6 +259,7 @@ struct ModuleDetailView: View {
         case .conditions, .feelsLike: 8
         case .uv: 4
         case .pressure: units.pressureStep
+        case .sun, .moon, .airQuality: 4
         default: 4
         }
         if hi - lo < minSpan { let mid = (hi + lo) / 2; lo = mid - minSpan / 2; hi = mid + minSpan / 2 }
@@ -255,7 +277,7 @@ struct ModuleDetailView: View {
         case .humidity: "\(Int(v.rounded()))%"
         case .visibility: String(format: "%.1f", v)
         case .pressure: units.pressure == .inHg ? String(format: "%.2f inHg", v) : "\(Int(v.rounded())) hPa"
-        case .confidence, .accuracy: ""
+        case .sun, .moon, .airQuality, .confidence, .accuracy: ""
         }
     }
 
@@ -362,6 +384,8 @@ struct ModuleDetailView: View {
         case .uv: [.green, .yellow, .orange, .red]
         case .wind: [Color(red: 0.6, green: 0.9, blue: 1.0), .white]
         case .humidity: [Color(red: 0.4, green: 0.7, blue: 1.0), Color(red: 0.6, green: 0.85, blue: 1.0)]
+        case .sun: [.yellow, .orange]
+        case .moon, .airQuality: [.white.opacity(0.7), .white]
         default: [.white.opacity(0.7), .white]
         }
     }
@@ -448,10 +472,234 @@ struct ModuleDetailView: View {
             return "Visibility through the day. Below 1 mi (1.6 km) usually means fog or heavy precipitation."
         case .pressure:
             return "Falling pressure often signals unsettled weather; rising pressure, clearing."
+        case .sun:
+            let rise = d.sunrise.map { Fmt.time($0, tz) }
+            let set = d.sunset.map { Fmt.time($0, tz) }
+            switch (rise, set) {
+            case let (r?, s?): return "Sunrise \(r), sunset \(s)."
+            case let (r?, nil): return "Sunrise \(r). No sunset."
+            case let (nil, s?): return "Sunset \(s). No sunrise."
+            case (nil, nil): return "No sunrise or sunset this day."
+            }
+        case .moon:
+            let moon = moonPhase(on: d)
+            let lit = Int((moon.illumination * 100).rounded())
+            return "\(moon.name). Illumination \(lit)%."
+        case .airQuality:
+            guard report.airQuality != nil, !aqiPoints(d).isEmpty else { return "" }
+            return "US AQI through the day. 50 or below is good. 101–150 is unhealthy for sensitive groups."
         case .accuracy:
             return ""
         case .confidence:
             return "Skyline weights each source by its typical skill: HRRR dominates the first 18 hours in the US, the NWS official forecast and ECMWF carry the most weight after that. When sources disagree, confidence drops."
         }
+    }
+
+    // MARK: Sun, moon, air quality (no hourly series on the forecast)
+
+    /// Change lines already shown on the Outlook card. Display only; the comparison stays in `ForecastInsight`.
+    @ViewBuilder
+    private var confidenceChanges: some View {
+        let lines = InsightFormat.changes(report, units: units)
+        if !lines.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Since the earlier forecast")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Glass.secondaryText)
+                ForEach(lines, id: \.self) { note in
+                    Label {
+                        Text(note).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    } icon: {
+                        Image(systemName: note.contains(" up ") ? "arrow.up.right" : "arrow.down.right")
+                    }
+                }
+            }
+        }
+    }
+
+    private func sunHeadline(_ d: DailyForecast) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            labeledTime(d.sunrise, caption: "Sunrise")
+            labeledTime(d.sunset, caption: "Sunset")
+            if let length = daylightLength(d) {
+                Text(length).font(.title3).opacity(0.85)
+            }
+        }
+    }
+
+    private func labeledTime(_ time: Date?, caption: String) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(time.map { Fmt.time($0, tz) } ?? "--")
+                .font(.system(size: 32, weight: .medium))
+                .lineLimit(1).minimumScaleFactor(0.6)
+            Text(caption).font(.callout).opacity(0.85)
+        }
+    }
+
+    /// Hours and minutes between rise and set. Nil when either instant is missing or the interval is not positive.
+    private func daylightLength(_ d: DailyForecast) -> String? {
+        guard let rise = d.sunrise, let set = d.sunset, set > rise else { return nil }
+        let minutes = Int((set.timeIntervalSince(rise) / 60).rounded())
+        return "\(minutes / 60)h \(minutes % 60)m"
+    }
+
+    @ViewBuilder
+    private func sunBody(_ d: DailyForecast) -> some View {
+        let isToday = d.date == report.daily.first?.date
+        let progress: Double? = {
+            guard isToday, let rise = d.sunrise, let set = d.sunset, set > rise else { return nil }
+            let now = Date()
+            guard now > rise, now < set else { return nil }
+            return now.timeIntervalSince(rise) / set.timeIntervalSince(rise)
+        }()
+        SunCurve(progress: progress)
+            .frame(height: inspector ? 120 : 140)
+            .accessibilityLabel("Sun path")
+    }
+
+    private func moonHeadline(_ d: DailyForecast) -> some View {
+        let moon = moonPhase(on: d)
+        return HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(moon.name)
+                .font(.system(size: 34, weight: .medium))
+                .lineLimit(1).minimumScaleFactor(0.6)
+            Text("\(Int((moon.illumination * 100).rounded()))%")
+                .font(.title3).opacity(0.85)
+        }
+    }
+
+    /// Phase at local noon of the selected civil day. The tile keeps `MoonPhase(date: report.current.time)`.
+    private func moonPhase(on d: DailyForecast) -> MoonPhase {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        let start = cal.startOfDay(for: d.date)
+        let noon = cal.date(byAdding: .hour, value: 12, to: start) ?? d.date
+        return MoonPhase(date: noon)
+    }
+
+    @ViewBuilder
+    private func moonBody(_ d: DailyForecast) -> some View {
+        let moon = moonPhase(on: d)
+        HStack(alignment: .center, spacing: 16) {
+            Image(systemName: moon.symbolName)
+                .font(.system(size: 72, weight: .thin))
+                .symbolRenderingMode(.hierarchical)
+                .accessibilityHidden(true)
+            Text(moon.daysUntilFull < 0.5 ? "Full moon tonight" : "Full moon in \(Int(moon.daysUntilFull.rounded())) days")
+                .font(.title3)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, minHeight: 100, alignment: .leading)
+    }
+
+    private func airHeadline(_ d: DailyForecast) -> some View {
+        let isToday = d.date == report.daily.first?.date
+        return HStack(alignment: .firstTextBaseline, spacing: 10) {
+            if let aq = report.airQuality, isToday {
+                Text("\(aq.usAQI)").font(.system(size: 40, weight: .medium))
+                Text(aq.category).font(.title3).opacity(0.85).lineLimit(1).minimumScaleFactor(0.6)
+                Text("Now").font(.title3).opacity(0.85)
+            } else if let peak = aqiPoints(d).max(by: { $0.value < $1.value }) {
+                Text("\(Int(peak.value.rounded()))").font(.system(size: 40, weight: .medium))
+                Text(AirQuality.category(Int(peak.value.rounded())))
+                    .font(.title3).opacity(0.85).lineLimit(1).minimumScaleFactor(0.6)
+                Text("Peak").font(.title3).opacity(0.85)
+            } else {
+                Text("--").font(.system(size: 40, weight: .medium))
+                Text(report.airQuality == nil ? "Unavailable" : "No hourly data")
+                    .font(.title3).opacity(0.85)
+            }
+        }
+    }
+
+    private func aqiPoints(_ d: DailyForecast) -> [HourlyValue] {
+        guard let hourly = report.airQuality?.hourly else { return [] }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        return hourly.filter { cal.isDate($0.time, inSameDayAs: d.date) }
+    }
+
+    @ViewBuilder
+    private func airBody(_ d: DailyForecast) -> some View {
+        if report.airQuality == nil {
+            Text("Air quality isn’t available for this place.")
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            let pts = aqiPoints(d)
+            let isToday = d.date == report.daily.first?.date
+            if isToday, let line = nowPollutants {
+                Text(line).font(.callout).foregroundStyle(Glass.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if pts.isEmpty {
+                Text("No hourly air quality for this day.")
+                    .font(.callout)
+                    .frame(maxWidth: .infinity, minHeight: 80, alignment: .leading)
+            } else {
+                airChart(pts)
+                if let peak = pts.max(by: { $0.value < $1.value }) {
+                    Text("Peak \(Int(peak.value.rounded())) (\(AirQuality.category(Int(peak.value.rounded())))) at \(Fmt.hour(peak.time, tz))")
+                        .font(.caption).foregroundStyle(Glass.secondaryText)
+                }
+            }
+        }
+    }
+
+    private var nowPollutants: String? {
+        guard let aq = report.airQuality else { return nil }
+        var parts: [String] = []
+        if let pm = aq.pm25 { parts.append("PM2.5 \(Int(pm.rounded())) µg/m³") }
+        if let pm = aq.pm10 { parts.append("PM10 \(Int(pm.rounded())) µg/m³") }
+        if let ozone = aq.ozone { parts.append("Ozone \(Int(ozone.rounded())) µg/m³") }
+        guard !parts.isEmpty else { return nil }
+        return "Now · " + parts.joined(separator: " · ")
+    }
+
+    private func airChart(_ pts: [HourlyValue]) -> some View {
+        let now = report.current.time
+        let peak = pts.map(\.value).max() ?? 0
+        let top = max(50, peak) * 1.18
+        let selected = scrub.flatMap { s in pts.first { $0.time == s } }
+        let start = pts.first?.time ?? Date()
+        let end = pts.last?.time ?? start
+        let xDomain = start == end
+            ? start.addingTimeInterval(-1800)...end.addingTimeInterval(1800)
+            : start...end
+        return Chart {
+            ForEach(pts) { p in
+                BarMark(x: .value("Hour", p.time, unit: .hour), y: .value("AQI", p.value))
+                    .foregroundStyle(AQIColors.color(p.value).opacity(p.time < now ? 0.55 : 1))
+            }
+            if let selected {
+                RuleMark(x: .value("Selected", selected.time))
+                    .foregroundStyle(.white.opacity(0.8))
+                    .lineStyle(StrokeStyle(lineWidth: 1))
+                    .annotation(position: .top, spacing: 2,
+                                overflowResolution: .init(x: .fit(to: .chart), y: .fit(to: .chart))) {
+                        ScrubCallout(title: Fmt.time(selected.time, tz),
+                                     value: "\(Int(selected.value.rounded())) \(AirQuality.category(Int(selected.value.rounded())))")
+                    }
+            }
+        }
+        .chartYScale(domain: 0...top)
+        .chartXScale(domain: xDomain)
+        .chartXAxis {
+            AxisMarks(values: .stride(by: .hour, count: 6)) { v in
+                AxisGridLine().foregroundStyle(.white.opacity(0.15))
+                AxisValueLabel { if let date = v.as(Date.self) { Text(Fmt.hour(date, tz)) } }
+                    .foregroundStyle(Glass.secondaryText)
+            }
+        }
+        .chartYAxis {
+            AxisMarks(position: .trailing) { _ in
+                AxisGridLine().foregroundStyle(.white.opacity(0.15))
+                AxisValueLabel().foregroundStyle(Glass.secondaryText)
+            }
+        }
+        .chartScrubber(times: pts.map(\.time), selection: $scrub)
+        .environment(\.timeZone, tz)
+        .frame(height: inspector ? 230 : 260)
+        .accessibilityLabel("Hourly US air quality index")
     }
 }

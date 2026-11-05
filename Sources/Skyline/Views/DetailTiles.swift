@@ -12,15 +12,17 @@ struct DetailTilesGrid: View {
     var body: some View {
         LazyVGrid(columns: columns, spacing: 14) {
             tappable(.uv) { UVTile(report: report) }
-            SunTile(report: report)
+            tappable(.sun) { SunTile(report: report) }
             tappable(.wind) { WindTile(report: report, units: units) }
             tappable(.precipitation) { PrecipitationTile(report: report, units: units) }
             tappable(.feelsLike) { FeelsLikeTile(report: report, units: units) }
             tappable(.humidity) { HumidityTile(report: report, units: units) }
             tappable(.visibility) { VisibilityTile(report: report, units: units) }
             tappable(.pressure) { PressureTile(report: report, units: units) }
-            if let aq = report.airQuality { AirQualityTile(airQuality: aq, report: report) }
-            MoonTile(date: report.current.time)
+            if let aq = report.airQuality {
+                tappable(.airQuality) { AirQualityTile(airQuality: aq, report: report) }
+            }
+            tappable(.moon) { MoonTile(date: report.current.time) }
             tappable(.confidence) { ConfidenceTile(report: report, units: units) }
             tappable(.accuracy) { AccuracyTile(location: report.location, units: units) }
         }
