@@ -120,12 +120,37 @@ final class RadarFeaturesTests: XCTestCase {
         """
         let all = try StormMotion.parse(Data(json.utf8))
         XCTAssertEqual(all.count, 5)
+        // IEM drct 45 is FROM the northeast; travel is southwest (225°).
+        let a1 = try XCTUnwrap(all.first { $0.stormID == "A1" })
+        XCTAssertEqual(a1.directionDegrees, 225, accuracy: 1e-9)
         let near = Coordinate(latitude: 40.71, longitude: -74.01)
         let kept = StormMotion.relevant(all, near: near)
         // Weak (40 dBZ), erratic (2 kt), and Oklahoma cell are dropped; OKX+DIX dedupe to one.
         XCTAssertEqual(kept.count, 1)
         XCTAssertEqual(kept[0].stormID, "A1")
+        // motionLabel still takes a travel heading, not raw IEM FROM.
         XCTAssertEqual(StormMotion.motionLabel(directionDegrees: 45, speedKnots: 22), "moving NE at 25 mph")
+    }
+
+    /// Brian (Nov 5): BGM cell ~223° FROM labeled "moving SW" while the loop moved NE.
+    func testStormMotionParseConvertsFromHeadingToTravelNortheast() throws {
+        let json = """
+        {"type":"FeatureCollection","features":[
+          {"type":"Feature","properties":{"nexrad":"BGM","storm_id":"F6","max_dbz":55,"drct":223,"sknt":43,"valid":"2026-11-05T12:10:00Z"},
+           "geometry":{"type":"Point","coordinates":[-75.9,42.1]}}
+        ]}
+        """
+        let cells = try StormMotion.parseGeoJSON(Data(json.utf8))
+        XCTAssertEqual(cells.count, 1)
+        XCTAssertEqual(cells[0].directionDegrees, 43, accuracy: 1e-9)
+        XCTAssertEqual(Compass.abbreviation(cells[0].directionDegrees), "NE")
+        XCTAssertEqual(
+            StormMotion.motionLabel(directionDegrees: cells[0].directionDegrees, speedKnots: cells[0].speedKnots),
+            "moving NE at 49 mph"
+        )
+        let tip = StormMotion.arrowTipOffset(directionDegrees: cells[0].directionDegrees, length: 10)
+        XCTAssertGreaterThan(tip.dx, 0, "travel ~43° must point east (+x)")
+        XCTAssertGreaterThan(tip.dy, 0, "travel ~43° must point north (+y)")
     }
 
     func testStormMotionETAOnlyWhenPathPassesClose() {
