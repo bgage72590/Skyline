@@ -210,7 +210,7 @@ public enum ForecastBlender {
             let isDay = (models.lazy.compactMap { at(columns[$0]?["is_day"] ?? [], i) }.first ?? 1) >= 1
             let snow = weightedMean(samples("snowfall"))
             let code = precipitationType(reconcile(code: rawCode, precipitationProbability: pop, precipitation: precip,
-                                                   temperature: temp),
+                                                   temperature: temp, leadHours: lead),
                                          snowfall: snow, precipitation: precip, temperature: temp)
 
             result.append(HourlyForecast(
@@ -236,17 +236,25 @@ public enum ForecastBlender {
 
     /// Makes the categorical icon agree with the blended numbers.
     /// * precip icon but the chance is below the printed cutoff (20 %), or unlikely and dry → cloudy
-    /// * dry icon (not fog) but the chance is at least `hourlyPrecipitationIconMinPoP` → rain / snow
+    /// * dry icon (not fog) but the chance is at least `hourlyPrecipitationIconMinPoP` → rain / snow.
+    ///   When `leadHours` is ≤ `nearTermPrecipIconMaxLeadHours`, that promote also needs radar echo
+    ///   near the pin or blended amount ≥ `nearTermPrecipIconMinAmount`. A nil lead keeps the PoP-only rule.
     /// * snow icon but the temperature is above ~37 °F → the matching rain icon
     public static func reconcile(code: Int, precipitationProbability pop: Double?, precipitation: Double?,
-                                 temperature: Double) -> Int {
+                                 temperature: Double,
+                                 leadHours: Double? = nil,
+                                 radarEchoNearPin: Bool? = nil) -> Int {
         let condition = WeatherCondition(wmoCode: code)
         let p = pop ?? 0, amount = precipitation ?? 0
         // Dropdown review: a precipitation icon needs a chance the row prints (`HourlyDisplay.popCutoff`),
         // whatever one model's amount says. Before, 15 % + 0.1 mm kept a rain icon with no % under it.
         if condition.isPrecipitation, let pop, pop.rounded() < Double(HourlyDisplay.popCutoff) { return 3 }
         if condition.isPrecipitation, p < 25, amount < 0.05 { return 3 }
-        if !condition.isPrecipitation, condition.category != .fog, p >= hourlyPrecipitationIconMinPoP {
+        // NT1+NT2: lead ≤ 3 h does not promote on PoP alone. Nil lead and lead > 3 h stay PoP-only (PR #33).
+        let nearTerm = leadHours.map { $0 <= nearTermPrecipIconMaxLeadHours } ?? false
+        let nearTermAffirmed = radarEchoNearPin == true || amount >= nearTermPrecipIconMinAmount
+        if !condition.isPrecipitation, condition.category != .fog, p >= hourlyPrecipitationIconMinPoP,
+           !nearTerm || nearTermAffirmed {
             if temperature <= 0 { return amount >= 1 ? 73 : 71 }
             return amount >= 4 ? 65 : (amount >= 1 ? 63 : 61)
         }
@@ -257,6 +265,11 @@ public enum ForecastBlender {
     public static let snowToRainAbove = 2.8
     /// Below this blended hourly rain chance (%) a dry code is not promoted to a precipitation icon.
     public static let hourlyPrecipitationIconMinPoP = 40.0
+    /// Lead (hours) at or below which dry→precip promote needs radar echo OR short-range amount.
+    public static let nearTermPrecipIconMaxLeadHours = 3.0
+    /// Minimum blended precipitation (mm) to promote a dry hourly icon when lead ≤ `nearTermPrecipIconMaxLeadHours`
+    /// and radar echo is not affirmed. Restores the 0.2 mm gate dropped in PR #33, **near-term only**.
+    public static let nearTermPrecipIconMinAmount = 0.2
     /// Below this blended daily rain chance (%) the daily icon never shows precipitation.
     public static let dailyPrecipitationIconMinPoP = 30.0
 
