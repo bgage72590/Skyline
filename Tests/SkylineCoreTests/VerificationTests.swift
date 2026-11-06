@@ -113,7 +113,11 @@ final class VerificationTests: XCTestCase {
         XCTAssertEqual(m(.gfs), cfg.floor, accuracy: 1e-9, "worst source hits the floor, never zero")
         XCTAssertNil(w.multipliers[.temperature]?[.h0to6]?[.blend], "the blend never weights itself")
         XCTAssertEqual(w.multiplier(.temperature, .hrrr, leadHours: 30), 1)
-        XCTAssertLessThan(w.multiplier(.rain, .gfs, leadHours: 3), w.multiplier(.rain, .hrrr, leadHours: 3))
+        XCTAssertEqual(w.multiplier(.rain, .gfs, leadHours: 3), 1, "v1 temperature-only: rain stays 1")
+        XCTAssertEqual(w.multiplier(.rain, .hrrr, leadHours: 3), 1, "v1 temperature-only: rain stays 1")
+        XCTAssertEqual(w.multiplier(.wind, .gfs, leadHours: 3), 1, "v1 temperature-only: wind stays 1")
+        XCTAssertEqual(AdaptiveWeighting.Config().minDays, 3, "global minDays stays 3")
+        XCTAssertEqual(AdaptiveWeighting.Config().kinds, [.temperature])
 
         var cfg2 = AdaptiveWeighting.Config(); cfg2.floor = 0.01; cfg2.cap = 100
         let few = AdaptiveWeighting.weights(from: AccuracyScorer.score(fixture(n: 30, days: 10), now: t0, halfLifeDays: 0), config: cfg2)
