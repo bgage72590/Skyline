@@ -138,53 +138,140 @@ public struct BlendWeights: Codable, Hashable, Sendable {
 
 /// Inverse-error weighting with shrinkage, a floor and a cap.
 ///
-/// For each lead bucket, sources with at least `minSamples` (age-weighted) pairs on at least
-/// `minDays` distinct days get
-/// `m = (1/err) / mean(1/err)` (so the eligible sources average 1), shrunk toward 1 by
-/// `n / (n + shrink)` and clamped to [`floor`, `cap`]. Ineligible sources, buckets and kinds keep 1,
-/// which is exactly the fixed hand-tuned weighting, so nothing changes until there's enough data.
+/// v1 writes multipliers only for temperature. Wind and rain stay at 1, so precip / PoP stay on the
+/// blender's base weights. For each lead bucket, eligible sources get
+/// `m = (1/err) / mean(1/err)` (the eligible sources average 1), shrunk toward 1 by
+/// `n / (n + shrink)` and clamped to [`floor`, `cap`]. Ineligible sources and buckets keep 1,
+/// which is exactly the fixed hand-tuned weighting.
+///
+/// Eligibility is per bucket. `0-6h` keeps `minSamples` / `minDays` (20 and 3). When
+/// `longLeadStricterGates` is set (USA / NWS coverage only), `6-24h`, `day2` and `day3+` require
+/// `longLeadMinSamples` / `longLeadMinDays` (40 and 7). Global `minDays` stays 3 so the short-lead
+/// bucket is not tightened. The overall early-exit is still `scores.days >= minDays`. A bucket
+/// moves only when at least two sources clear its gate.
+///
+/// Locations outside NWS coverage leave `longLeadStricterGates` off, so they keep the tip
+/// eligibility (n≥20, distinct UTC days≥3) and do not use the applied-multiplier rate limit.
 public enum AdaptiveWeighting {
+    /// Largest step of an applied temperature multiplier on a new city-local calendar day.
+    public static let maxDailyMultiplierDelta = 0.25
+
     public struct Config: Sendable {
         public var minDays = 3.0
         public var minSamples = 20.0
         public var shrink = 40.0
         public var floor = 0.35
-        public var cap = 2.5
+        /// Temperature multiplier ceiling. Raised 2.5 → 3.0 by the cap amend; wind and rain stay at 1.
+        public var cap = 3.0
+        /// Kinds allowed to leave 1. v1 is temperature only.
+        public var kinds: [BlendWeights.Kind] = [.temperature]
+        /// USA long-lead buckets use `longLeadMinSamples` / `longLeadMinDays` instead of the globals.
+        public var longLeadStricterGates = false
+        public var longLeadMinSamples = 40.0
+        public var longLeadMinDays = 7.0
         public init() {}
     }
 
     public static func weights(from scores: AccuracyScorer.Scores, config: Config = Config()) -> BlendWeights {
         guard scores.days >= config.minDays else { return .neutral }
+        // v1: temperature only, even if `kinds` also lists wind or rain.
+        guard config.kinds.contains(.temperature) else { return .neutral }
+        let kind = BlendWeights.Kind.temperature
         var out = BlendWeights()
-        for kind in BlendWeights.Kind.allCases {
-            for (bucket, bySource) in scores.byBucket {
-                var errors: [VerificationSource: (err: Double, n: Double)] = [:]
-                for source in VerificationSource.inputs {
-                    guard let sc = bySource[source], let e = error(kind, sc) else { continue }
-                    // The same age-weighted n the Accuracy screen's "ready" uses (see `isReady`), and
-                    // evidence from several distinct days in this bucket, not one correlated afternoon.
-                    if e.n >= config.minSamples, Double(distinctDays(kind, sc)) >= config.minDays { errors[source] = e }
-                }
-                guard errors.count >= 2 else { continue }
-                let inverse = errors.mapValues { 1 / $0.err }
-                let mean = inverse.values.reduce(0, +) / Double(inverse.count)
-                var m: [VerificationSource: Double] = [:]
-                for (source, inv) in inverse {
-                    let raw = inv / mean
-                    let n = errors[source]!.n
-                    let shrunk = 1 + (raw - 1) * n / (n + config.shrink)
-                    m[source] = min(max(shrunk, config.floor), config.cap)
-                }
-                out.multipliers[kind, default: [:]][bucket] = m
+        for (bucket, bySource) in scores.byBucket {
+            let gate = eligibility(bucket, config)
+            var errors: [VerificationSource: (err: Double, n: Double)] = [:]
+            for source in VerificationSource.inputs {
+                guard let sc = bySource[source], let e = error(kind, sc) else { continue }
+                // The same age-weighted n the Accuracy screen's "ready" uses (see `isReady`), and
+                // evidence from several distinct days in this bucket, not one correlated afternoon.
+                if e.n >= gate.samples, Double(distinctDays(kind, sc)) >= gate.days { errors[source] = e }
             }
+            guard errors.count >= 2 else { continue }
+            let inverse = errors.mapValues { 1 / $0.err }
+            let mean = inverse.values.reduce(0, +) / Double(inverse.count)
+            var m: [VerificationSource: Double] = [:]
+            for (source, inv) in inverse {
+                let raw = inv / mean
+                let n = errors[source]!.n
+                let shrunk = 1 + (raw - 1) * n / (n + config.shrink)
+                let clamped = min(max(shrunk, config.floor), config.cap)
+                if clamped.isFinite { m[source] = clamped }
+            }
+            if !m.isEmpty { out.multipliers[kind, default: [:]][bucket] = m }
         }
         return out
     }
 
-    /// True when the learned weights are actually in use: some bucket and kind has at least two
-    /// eligible sources. The Accuracy screen's "ready" uses this, so it can't disagree with the blend.
+    /// Age-weighted sample count and distinct-UTC-day count a bucket must clear before m≠1.
+    static func eligibility(_ bucket: LeadBucket, _ config: Config) -> (samples: Double, days: Double) {
+        if config.longLeadStricterGates, bucket != .h0to6 {
+            return (config.longLeadMinSamples, config.longLeadMinDays)
+        }
+        return (config.minSamples, config.minDays)
+    }
+
+    /// True when the learned weights are actually in use: some temperature bucket has at least two
+    /// eligible sources. The Accuracy screen's "ready" uses this, so it agrees with non-neutral
+    /// temperature multipliers (wind and rain are not required to move).
     public static func isReady(_ scores: AccuracyScorer.Scores, config: Config = Config()) -> Bool {
         !weights(from: scores, config: config).isNeutral
+    }
+
+    /// One applied temperature multiplier. Same city-local day keeps a finite previous value.
+    /// A new local day moves at most `maxDailyMultiplierDelta` from that previous value (1 when
+    /// there is none). Non-finite proposal or previous falls back to the other, or to 1.
+    public static func rateLimited(previous: Double?, proposed: Double, sameLocalDay: Bool) -> Double {
+        let prior: Double
+        if let previous, previous.isFinite { prior = previous } else { prior = 1 }
+        guard proposed.isFinite else { return prior }
+        if sameLocalDay, let previous, previous.isFinite { return previous }
+        let delta = proposed - prior
+        if abs(delta) <= maxDailyMultiplierDelta { return proposed }
+        return prior + (delta > 0 ? maxDailyMultiplierDelta : -maxDailyMultiplierDelta)
+    }
+
+    /// Applied temperature multipliers after the same-day freeze and the per-day step.
+    /// Values that land on 1 are omitted (neutral). Wind and rain on `proposal` are ignored.
+    public static func rateLimitedTemperatureWeights(
+        proposal: BlendWeights,
+        previous: [LeadBucket: [VerificationSource: Double]]?,
+        sameLocalDay: Bool
+    ) -> [LeadBucket: [VerificationSource: Double]] {
+        if sameLocalDay {
+            return finiteTemperature(previous ?? [:])
+        }
+        let prior = previous ?? [:]
+        var buckets = Set(prior.keys)
+        if let proposed = proposal.multipliers[.temperature] { buckets.formUnion(proposed.keys) }
+        var out: [LeadBucket: [VerificationSource: Double]] = [:]
+        for bucket in buckets {
+            var row: [VerificationSource: Double] = [:]
+            for source in VerificationSource.inputs {
+                let proposed = proposal.multipliers[.temperature]?[bucket]?[source] ?? 1
+                let m = rateLimited(previous: prior[bucket]?[source], proposed: proposed, sameLocalDay: false)
+                if m.isFinite, abs(m - 1) > 1e-12 { row[source] = m }
+            }
+            if !row.isEmpty { out[bucket] = row }
+        }
+        return out
+    }
+
+    static func finiteTemperature(_ raw: [LeadBucket: [VerificationSource: Double]])
+        -> [LeadBucket: [VerificationSource: Double]] {
+        var out: [LeadBucket: [VerificationSource: Double]] = [:]
+        for (bucket, row) in raw {
+            var kept: [VerificationSource: Double] = [:]
+            for (source, m) in row where m.isFinite && abs(m - 1) > 1e-12 { kept[source] = m }
+            if !kept.isEmpty { out[bucket] = kept }
+        }
+        return out
+    }
+
+    static func blendWeights(temperature: [LeadBucket: [VerificationSource: Double]]) -> BlendWeights {
+        var w = BlendWeights()
+        if !temperature.isEmpty { w.multipliers[.temperature] = temperature }
+        return w
     }
 
     static func distinctDays(_ kind: BlendWeights.Kind, _ s: SourceScore) -> Int {

@@ -68,9 +68,10 @@ final class Batch2Tests: XCTestCase {
         }
         let s = AccuracyScorer.score(recs, now: t0.addingTimeInterval(16 * 86400), halfLifeDays: 0)
         let w = AdaptiveWeighting.weights(from: s)
-        XCTAssertGreaterThan(w.multiplier(.rain, .ecmwf, leadHours: 3), 1)
-        XCTAssertLessThan(w.multiplier(.rain, .gfs, leadHours: 3), 1)
-        XCTAssertEqual(w.multiplier(.rain, .nws, leadHours: 3), 1, "no amounts → not scored for rain weight")
+        XCTAssertEqual(w.multiplier(.rain, .ecmwf, leadHours: 3), 1, "v1 temperature-only: rain multiplier stays 1")
+        XCTAssertEqual(w.multiplier(.rain, .gfs, leadHours: 3), 1, "v1 temperature-only: rain multiplier stays 1")
+        XCTAssertEqual(w.multiplier(.rain, .nws, leadHours: 3), 1, "v1 temperature-only: rain multiplier stays 1")
+        XCTAssertTrue(w.isNeutral, "this fixture has no temperature, so v1 weights stay neutral")
         XCTAssertEqual(s.overall[.nws]?.hitRate ?? 0, 1, accuracy: 1e-9, "display tallies still use probability")
     }
 

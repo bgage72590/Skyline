@@ -92,6 +92,10 @@ public actor ForecastVerifier {
     private var metarWeightEligible: Set<String> = []
     /// Whether `cachedWeights[key]` was computed with the METAR merge; a mismatch (e.g. switch OFF) recomputes (H2).
     private var cachedWeightsMerged: [String: Bool] = [:]
+    /// City-local day stamp that `cachedWeights[key]` was rate-limited for. USA only; empty for other keys.
+    private var cachedAppliedDay: [String: String] = [:]
+    /// Last applied temperature multipliers (`applied-temperature-weights.json`). Not corrections.
+    private var appliedTemperature = AppliedTemperatureWeightStore()
     /// `-SkylineCorrectionQAOverride` from the launch arguments only (never defaults or data), clamped (H1).
     private let qaOverrideC: Double?
     /// In-memory: US keys that already tried a launch seed this process (sync insert before first await).
@@ -229,11 +233,13 @@ public actor ForecastVerifier {
     /// Accuracy PR 2 (B15): also clears benchmark/, corrections, training, metar-verified, and caches.
     public func reset() async {
         pending = []; verified = []; meta = [:]; cachedScores = [:]; cachedWeights = [:]
+        cachedWeightsMerged = [:]; cachedAppliedDay = [:]
+        appliedTemperature = AppliedTemperatureWeightStore()
         cachedOffsets = [:]; cachedStatuses = [:]; correctionsReady = false
         metarWeightInputs = [:]; metarWeightEligible = []
         lastNWSObs = [:]
         loaded = true
-        for name in ["pending.jsonl", "verified.jsonl", "meta.json"] {
+        for name in ["pending.jsonl", "verified.jsonl", "meta.json", AppliedTemperatureWeightStore.fileName] {
             try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
         }
         await benchmark.reset()
@@ -314,24 +320,74 @@ public actor ForecastVerifier {
         try? d.write(to: directory.appendingPathComponent("sync-reset.json"), options: .atomic)
     }
 
-    public func weights(_ key: String) -> BlendWeights {
+    /// Learned blend multipliers for `key`.
+    ///
+    /// Temperature only. USA keys (`isLikelyInNWSCoverage`) also use the stricter long-lead gates and
+    /// the persisted same-day rate limit. Other keys keep tip eligibility (n≥20, distinct days≥3)
+    /// and are not rate-limited. US METAR→weights merge stays off: US cities are not in
+    /// `metarWeightEligible`, so this path stays byte-identical to tip for that merge.
+    /// `timeZoneIdentifier`, when passed, is the city zone for the rate-limit calendar day.
+    public func weights(_ key: String, timeZoneIdentifier: String? = nil) -> BlendWeights {
         load()
+        if let timeZoneIdentifier { statusTimeZoneIdentifier[key] = timeZoneIdentifier }
         // Accuracy PR 2 (B17): non-US METAR pairs feed AdaptiveWeighting inputs when gated.
-        // Formula / bounds / eligibility unchanged. US cities stay byte-identical (no merge).
+        // US cities stay byte-identical (no merge).
         let extra = metarWeightInputs[key] ?? []
         let merge = BiasCorrection.Switch.isEnabled() && metarWeightEligible.contains(key) && !extra.isEmpty
+        let usa = AppliedTemperatureWeightStore.isUSALocationKey(key)
+        let dayStamp = usa ? appliedLocalDay(for: key) : ""
         // A cache built with a different merge state (switch flipped, eligibility lost) is stale (H2).
-        if let w = cachedWeights[key], (cachedWeightsMerged[key] ?? false) == merge { return w }
+        // USA also recomputes when the city-local day rolls, so the rate limit can take its step.
+        if let w = cachedWeights[key], (cachedWeightsMerged[key] ?? false) == merge,
+           !usa || cachedAppliedDay[key] == dayStamp { return w }
         // Learn from every member's full record (see `dedupingNOAAFamily(dropDuplicates:)`); display stays de-duplicated.
         var records = AccuracySync.collapsedForScoring(verified.filter { $0.r.loc == key })
         if merge {
             records = AccuracySync.collapsedForScoring(records + extra)
         }
         let learning = AccuracyScorer.score(records, now: now(), dedupe: false)
-        let w = AdaptiveWeighting.weights(from: learning, config: config)
+        var cfg = config
+        cfg.kinds = [.temperature]
+        cfg.longLeadStricterGates = usa
+        let proposal = AdaptiveWeighting.weights(from: learning, config: cfg)
+        let w = usa ? rateLimitedUSAWeights(key: key, proposal: proposal, localDay: dayStamp) : proposal
         cachedWeights[key] = w
         cachedWeightsMerged[key] = merge
+        cachedAppliedDay[key] = dayStamp
         return w
+    }
+
+    private func appliedLocalDay(for key: String) -> String {
+        AppliedTemperatureWeightStore.localDayStamp(now(), timeZone: timeZone(forWeightKey: key))
+    }
+
+    /// Saved city zone, else the longitude-band fallback for a coordinate key.
+    private func timeZone(forWeightKey key: String) -> TimeZone {
+        if let id = statusTimeZoneIdentifier[key], let tz = TimeZone(identifier: id) { return tz }
+        if let id = appliedTemperature.locations[key]?.timeZoneIdentifier, let tz = TimeZone(identifier: id) { return tz }
+        if let c = AppliedTemperatureWeightStore.coordinate(fromLocationKey: key) {
+            return AppliedTemperatureWeightStore.inferredTimeZone(for: c)
+        }
+        return TimeZone(secondsFromGMT: 0)!
+    }
+
+    /// Persist the rate-limited temperature multipliers. Same local day returns the stored set.
+    private func rateLimitedUSAWeights(key: String, proposal: BlendWeights, localDay: String) -> BlendWeights {
+        let previous = appliedTemperature.locations[key]
+        let same = previous?.localDay == localDay
+        let limited = AdaptiveWeighting.rateLimitedTemperatureWeights(
+            proposal: proposal, previous: previous?.multipliers, sameLocalDay: same)
+        let tz = statusTimeZoneIdentifier[key] ?? appliedTemperature.locations[key]?.timeZoneIdentifier
+            ?? AppliedTemperatureWeightStore.coordinate(fromLocationKey: key).map {
+                AppliedTemperatureWeightStore.inferredTimeZone(for: $0).identifier
+            }
+        let entry = AppliedTemperatureWeightStore.Entry(localDay: localDay, timeZoneIdentifier: tz,
+                                                        multipliers: limited)
+        if appliedTemperature.locations[key] != entry {
+            appliedTemperature.locations[key] = entry
+            appliedTemperature.save(to: directory)
+        }
+        return AdaptiveWeighting.blendWeights(temperature: limited)
     }
 
     /// Same as `weightsIfLoaded` for correction offsets (B16). Nil until this key's offsets are in memory.
@@ -774,6 +830,7 @@ public actor ForecastVerifier {
         let all = readAll(VerifiedRecord.self, from: "verified.jsonl")
         verified = all.filter { $0.r.valid >= cutoff }
         if verified.count != all.count { writeAll(verified, to: "verified.jsonl") } // prune
+        appliedTemperature = AppliedTemperatureWeightStore.load(from: directory)
         if let data = try? Data(contentsOf: directory.appendingPathComponent("meta.json")),
            let m = try? Self.decoder.decode([String: Meta].self, from: data) { meta = m }
         if let data = try? Data(contentsOf: directory.appendingPathComponent("sync-reset.json")) {
