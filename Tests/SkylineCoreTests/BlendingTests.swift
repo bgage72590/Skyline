@@ -120,6 +120,20 @@ final class BlendingTests: XCTestCase {
         XCTAssertFalse(WeatherCondition(wmoCode: light).isPrecipitation)
     }
 
+    /// Fix B: `dailyIcon` shares `reconcile`, so a dry daily candidate in the 40–59% band promotes.
+    /// The daily floor (`dailyPrecipitationIconMinPoP` = 30) still forces dry below 30%.
+    func testDailyIconSharesHourlyPromoteFloor() {
+        XCTAssertEqual(ForecastBlender.dailyPrecipitationIconMinPoP, 30)
+        let promoted = ForecastBlender.dailyIcon(code: 3, dryFallback: 2, precipitationProbability: 50,
+                                                 precipitation: 0.5, temperature: 10)
+        XCTAssertTrue(WeatherCondition(wmoCode: promoted).isPrecipitation, "pop 50 with ≥0.2 mm promotes a dry daily candidate")
+        XCTAssertEqual(promoted, 61)
+        let stripped = ForecastBlender.dailyIcon(code: 3, dryFallback: 2, precipitationProbability: 25,
+                                                 precipitation: 0.5, temperature: 10)
+        XCTAssertEqual(stripped, 3)
+        XCTAssertFalse(WeatherCondition(wmoCode: stripped).isPrecipitation, "pop 25 stays dry; the daily floor is 30")
+    }
+
     func testNowcast() {
         let now = Date(timeIntervalSince1970: 1_000_000)
         func series(_ v: [Double]) -> [MinutelyPrecipitation] {
