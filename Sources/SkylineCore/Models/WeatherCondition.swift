@@ -64,14 +64,14 @@ public struct WeatherCondition: Hashable, Sendable {
         case 2: isDay ? "cloud.sun.fill" : "cloud.moon.fill"
         case 3: "cloud.fill"
         case 45, 48: "cloud.fog.fill"
-        case 51, 53, 55: "cloud.drizzle.fill"
+        case 51, 53, 55: "cloud.rain.fill"
         case 56, 57, 66, 67: "cloud.sleet.fill"
         case 61, 63: "cloud.rain.fill"
         case 65: "cloud.heavyrain.fill"
         case 71, 73, 75, 77, 85, 86: "cloud.snow.fill"
-        case 80, 81, 82: isDay ? "cloud.sun.rain.fill" : "cloud.moon.rain.fill"
+        case 80, 81, 82: "cloud.rain.fill"   // was day/night sun/moon rain
         case 95: "cloud.bolt.rain.fill"
-        case 96, 99: "cloud.bolt.fill"
+        case 96, 99: "cloud.bolt.rain.fill"  // was cloud.bolt.fill
         default: "cloud.fill"
         }
     }
