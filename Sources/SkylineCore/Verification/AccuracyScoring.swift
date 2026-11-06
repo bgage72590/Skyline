@@ -161,7 +161,8 @@ public enum AdaptiveWeighting {
         public var minSamples = 20.0
         public var shrink = 40.0
         public var floor = 0.35
-        public var cap = 2.5
+        /// Temperature multiplier ceiling. Raised 2.5 → 3.0 by the cap amend; wind and rain stay at 1.
+        public var cap = 3.0
         /// Kinds allowed to leave 1. v1 is temperature only.
         public var kinds: [BlendWeights.Kind] = [.temperature]
         /// USA long-lead buckets use `longLeadMinSamples` / `longLeadMinDays` instead of the globals.

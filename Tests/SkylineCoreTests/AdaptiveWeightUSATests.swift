@@ -38,12 +38,33 @@ final class AdaptiveWeightUSATests: XCTestCase {
         XCTAssertEqual(cfg.minDays, 3)
         XCTAssertEqual(cfg.minSamples, 20)
         XCTAssertEqual(cfg.floor, 0.35)
-        XCTAssertEqual(cfg.cap, 2.5)
+        XCTAssertEqual(cfg.cap, 3.0, "temperature cap is 3.0; floor, shrink, and half-life are unchanged")
         XCTAssertEqual(cfg.shrink, 40)
         XCTAssertFalse(cfg.longLeadStricterGates)
         XCTAssertEqual(cfg.longLeadMinSamples, 40)
         XCTAssertEqual(cfg.longLeadMinDays, 7)
         XCTAssertEqual(cfg.kinds, [.temperature])
+    }
+
+    /// One nearly perfect source against five poor ones clears the cap. The clamp is 3.0, not 2.5.
+    func testTemperatureMultiplierClampsAtThree() {
+        var recs: [VerifiedRecord] = []
+        for d in 0..<10 {
+            for h in 0..<40 {
+                let valid = t0.addingTimeInterval(Double(d) * 86400 + Double(h) * 3600)
+                var f: [VerificationSource: SourceValues] = [:]
+                for src in VerificationSource.inputs {
+                    f[src] = SourceValues(t: 10 + (src == .nws ? 0 : 12))
+                }
+                recs.append(VerifiedRecord(record(lead: 3, valid: valid, f), ObservedHour(t: 10)))
+            }
+        }
+        let scores = AccuracyScorer.score(recs, now: t0.addingTimeInterval(20 * 86400), halfLifeDays: 0, dedupe: false)
+        let w = AdaptiveWeighting.weights(from: scores)
+        XCTAssertEqual(w.multiplier(.temperature, .nws, leadHours: 3), 3, accuracy: 1e-9)
+        XCTAssertEqual(w.multiplier(.temperature, .gfs, leadHours: 3), AdaptiveWeighting.Config().floor, accuracy: 1e-9)
+        XCTAssertEqual(w.multiplier(.rain, .nws, leadHours: 3), 1)
+        XCTAssertEqual(w.multiplier(.wind, .nws, leadHours: 3), 1)
     }
 
     func testShortLeadKeeps20And3WhenLongLeadGateIsOn() {
