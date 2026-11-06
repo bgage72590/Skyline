@@ -106,18 +106,18 @@ final class BlendingTests: XCTestCase {
 
     func testHourlyPrecipitationIconMinPoP() {
         XCTAssertEqual(ForecastBlender.hourlyPrecipitationIconMinPoP, 40)
-        // Dry code + 54 % + ≥0.2 mm promotes (the old 60 floor left this cloudy).
-        let promoted = ForecastBlender.reconcile(code: 3, precipitationProbability: 54, precipitation: 0.2, temperature: 10)
-        XCTAssertTrue(WeatherCondition(wmoCode: promoted).isPrecipitation, "pop 54 with 0.2 mm promotes a dry code")
+        // Dry code + 54 % + 0 mm promotes (no amount gate; Brian's 8 PM case).
+        let promoted = ForecastBlender.reconcile(code: 3, precipitationProbability: 54, precipitation: 0, temperature: 10)
+        XCTAssertTrue(WeatherCondition(wmoCode: promoted).isPrecipitation, "pop 54 with 0 mm promotes a dry code")
         XCTAssertEqual(promoted, 61)
-        // Just under the floor stays dry even when the amount gate is met.
-        let below = ForecastBlender.reconcile(code: 3, precipitationProbability: 39, precipitation: 0.2, temperature: 10)
+        // Just under the floor stays dry no matter the amount.
+        let below = ForecastBlender.reconcile(code: 3, precipitationProbability: 39, precipitation: 2, temperature: 10)
         XCTAssertEqual(below, 3)
         XCTAssertFalse(WeatherCondition(wmoCode: below).isPrecipitation)
-        // At 50 % but under 0.2 mm stays dry.
-        let light = ForecastBlender.reconcile(code: 3, precipitationProbability: 50, precipitation: 0.19, temperature: 10)
-        XCTAssertEqual(light, 3)
-        XCTAssertFalse(WeatherCondition(wmoCode: light).isPrecipitation)
+        // 50 % with a trace amount still promotes.
+        let trace = ForecastBlender.reconcile(code: 3, precipitationProbability: 50, precipitation: 0.19, temperature: 10)
+        XCTAssertTrue(WeatherCondition(wmoCode: trace).isPrecipitation)
+        XCTAssertEqual(trace, 61)
     }
 
     /// Fix B: `dailyIcon` shares `reconcile`, so a dry daily candidate in the 40–59% band promotes.

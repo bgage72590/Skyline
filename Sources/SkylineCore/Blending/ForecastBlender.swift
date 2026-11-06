@@ -236,7 +236,7 @@ public enum ForecastBlender {
 
     /// Makes the categorical icon agree with the blended numbers.
     /// * precip icon but the chance is below the printed cutoff (20 %), or unlikely and dry → cloudy
-    /// * dry icon but consensus says likely and wet → rain / snow
+    /// * dry icon (not fog) but the chance is at least `hourlyPrecipitationIconMinPoP` → rain / snow
     /// * snow icon but the temperature is above ~37 °F → the matching rain icon
     public static func reconcile(code: Int, precipitationProbability pop: Double?, precipitation: Double?,
                                  temperature: Double) -> Int {
@@ -246,7 +246,7 @@ public enum ForecastBlender {
         // whatever one model's amount says. Before, 15 % + 0.1 mm kept a rain icon with no % under it.
         if condition.isPrecipitation, let pop, pop.rounded() < Double(HourlyDisplay.popCutoff) { return 3 }
         if condition.isPrecipitation, p < 25, amount < 0.05 { return 3 }
-        if !condition.isPrecipitation, condition.category != .fog, p >= hourlyPrecipitationIconMinPoP, amount >= 0.2 {
+        if !condition.isPrecipitation, condition.category != .fog, p >= hourlyPrecipitationIconMinPoP {
             if temperature <= 0 { return amount >= 1 ? 73 : 71 }
             return amount >= 4 ? 65 : (amount >= 1 ? 63 : 61)
         }
