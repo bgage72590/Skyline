@@ -120,6 +120,53 @@ final class BlendingTests: XCTestCase {
         XCTAssertEqual(trace, 61)
     }
 
+    /// NT1+NT2: lead ≤ 3 h does not promote a dry icon on PoP ≥ 40 alone.
+    /// Amount ≥ 0.2 mm or an affirmed radar echo does. Lead > 3 h stays on the PoP-only rule.
+    func testNearTermPrecipIconGate() {
+        XCTAssertEqual(ForecastBlender.nearTermPrecipIconMaxLeadHours, 3)
+        XCTAssertEqual(ForecastBlender.nearTermPrecipIconMinAmount, 0.2)
+
+        // ≤3h + pop≥40 + amount 0 + no echo → stay dry.
+        let blocked = ForecastBlender.reconcile(code: 3, precipitationProbability: 54, precipitation: 0,
+                                                temperature: 10, leadHours: 1, radarEchoNearPin: nil)
+        XCTAssertEqual(blocked, 3)
+        XCTAssertFalse(WeatherCondition(wmoCode: blocked).isPrecipitation)
+
+        // Exactly 3.0 h is still near-term (≤). A trace under 0.2 mm stays dry.
+        let atCap = ForecastBlender.reconcile(code: 3, precipitationProbability: 54, precipitation: 0,
+                                              temperature: 10, leadHours: 3)
+        XCTAssertEqual(atCap, 3)
+        let trace = ForecastBlender.reconcile(code: 3, precipitationProbability: 50, precipitation: 0.19,
+                                              temperature: 10, leadHours: 1)
+        XCTAssertEqual(trace, 3)
+
+        // ≤3h + amount ≥ 0.2 → promote (61).
+        let byAmount = ForecastBlender.reconcile(code: 3, precipitationProbability: 54, precipitation: 0.2,
+                                                 temperature: 10, leadHours: 2)
+        XCTAssertEqual(byAmount, 61)
+        XCTAssertTrue(WeatherCondition(wmoCode: byAmount).isPrecipitation)
+
+        // Radar echo OR: amount 0 still promotes when echo is affirmed; false does not.
+        let byEcho = ForecastBlender.reconcile(code: 3, precipitationProbability: 50, precipitation: 0,
+                                               temperature: 10, leadHours: 0.5, radarEchoNearPin: true)
+        XCTAssertEqual(byEcho, 61)
+        let noEcho = ForecastBlender.reconcile(code: 3, precipitationProbability: 50, precipitation: 0,
+                                               temperature: 10, leadHours: 0.5, radarEchoNearPin: false)
+        XCTAssertEqual(noEcho, 3)
+
+        // Still under the PoP floor, even with amount.
+        let underPop = ForecastBlender.reconcile(code: 3, precipitationProbability: 39, precipitation: 2,
+                                                 temperature: 10, leadHours: 1)
+        XCTAssertEqual(underPop, 3)
+        XCTAssertFalse(WeatherCondition(wmoCode: underPop).isPrecipitation)
+
+        // Lead > 3 preserves PR #33: PoP ≥ 40 promotes with 0 mm.
+        let longer = ForecastBlender.reconcile(code: 3, precipitationProbability: 54, precipitation: 0,
+                                               temperature: 10, leadHours: 4)
+        XCTAssertEqual(longer, 61)
+        XCTAssertTrue(WeatherCondition(wmoCode: longer).isPrecipitation)
+    }
+
     /// Fix B: `dailyIcon` shares `reconcile`, so a dry daily candidate in the 40–59% band promotes.
     /// The daily floor (`dailyPrecipitationIconMinPoP` = 30) still forces dry below 30%.
     func testDailyIconSharesHourlyPromoteFloor() {
