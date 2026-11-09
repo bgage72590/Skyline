@@ -119,8 +119,17 @@ public enum BiasCorrection {
                                 halfLifeDays: Double = halfLifeDays) -> (targetC: Double, n: Int) {
         let n = Set(rows.map { Int($0.localDay.timeIntervalSince1970) }).count
         guard n > 0 else { return (0, 0) }
+        // Sum in a fixed order. Reload prunes training into dictionary order, and a different
+        // addition order moves targetC by ~1e-16, which used to rewrite corrections.json (N1).
+        let ordered = rows.sorted { a, b in
+            if a.localDay != b.localDay { return a.localDay < b.localDay }
+            if a.loc != b.loc { return a.loc < b.loc }
+            if a.target != b.target { return a.target < b.target }
+            if a.n != b.n { return a.n < b.n }
+            return a.sumE < b.sumE
+        }
         var wSum = 0.0, weSum = 0.0
-        for r in rows {
+        for r in ordered {
             let meanE = r.n > 0 ? r.sumE / Double(r.n) : r.sumE
             let ageDays = max(0, asOf.timeIntervalSince(r.localDay) / 86400)
             let w = halfLifeDays > 0 ? pow(0.5, ageDays / halfLifeDays) : 1

@@ -852,6 +852,9 @@ public actor BenchmarkStore {
     /// A non-nil array, even empty, means this key learns hourly targets from the verified pool only (C1).
     public func learnTraining(key: String, timeZoneIdentifier: String,
                               verifiedHourlyRows: [TrainingRow]? = nil) {
+        // WeatherService calls corrections() with measurement off. Learning must not write
+        // training.jsonl on that path (F2).
+        guard AccuracyMeasurement.isEnabled() else { return }
         load()
         assertOffMain()
         guard let tz = TimeZone(identifier: timeZoneIdentifier) else { return }
@@ -936,8 +939,8 @@ public actor BenchmarkStore {
         return out
     }
 
-    /// Daily: one error per row (`sumE`). Hourly: the pair pool when supplied, otherwise one sample per
-    /// training day (mean error) so a seeded row with no pair file still grades. C5.
+    /// Daily: one error per row (`sumE`). Hourly: only the pair-error map. No pair errors
+    /// (nil map or a missing target) grades nothing, so the target stays collecting (F1 / C5).
     private func gradingSamples(target: CorrectionTarget, rows: [TrainingRow],
                                 gradingErrors: [CorrectionTarget: [HeldOutError]]?) -> [HeldOutError] {
         if target.isDaily {
@@ -946,18 +949,12 @@ public actor BenchmarkStore {
                 return HeldOutError(day: r.localDay, error: r.sumE)
             }
         }
-        if let gradingErrors { return gradingErrors[target] ?? [] }
-        return rows.compactMap { r in
-            let e = r.n > 0 ? r.sumE / Double(r.n) : r.sumE
-            guard e.isFinite else { return nil }
-            return HeldOutError(day: r.localDay, error: e)
-        }
+        return gradingErrors?[target] ?? []
     }
 
     /// Recompute applied offsets for a city (rate limit, auto-off). Returns offsets to apply (0 if gated off).
     /// `qaOverrideC` comes from the launch arguments only (ForecastVerifier), never from defaults or data.
-    /// `gradingErrors == nil` grades each training day by its mean (no pair pool on disk).
-    /// A non-nil map, including empty arrays, is the pair-level pool and is used as-is for hourly targets (C3/C4).
+    /// Hourly targets grade only `gradingErrors` (an empty or nil map leaves them collecting).
     /// Daily targets always grade one error per day, the row's `sumE` (C5).
     public func refreshCorrections(key: String, timeZoneIdentifier: String,
                                    sitingOK: Bool, qaOverrideC: Double? = nil,
@@ -990,7 +987,9 @@ public actor BenchmarkStore {
         var changed = false
         let gradedAsOf = t
         let dayStamp = localDay
-        // Errors are already on local midnights. Map `now` onto today's midnight without capturing Calendar.
+        // dayKey relies on training-row and pair-error dates already being local midnight (Note 3).
+        // It only remaps `now` onto today's midnight. Any other instant is left unchanged, so a
+        // date that is not already midnight would be graded on the wrong day.
         let dayKey: @Sendable (Date) -> Date = { d in d == gradedAsOf ? dayStamp : d }
         for target in CorrectionTarget.allCases {
             let rows = training.filter { $0.loc == key && $0.target == target && $0.localDay < localDay }
@@ -1016,7 +1015,7 @@ public actor BenchmarkStore {
             let sameDay = entry.appliedOn.map { cal.isDate($0, inSameDayAs: localDay) } ?? false
             let applied = BiasCorrection.rateLimited(previous: entry.appliedC, targetC: targetC,
                                                      sameLocalDay: sameDay && !forceZero, forceZero: forceZero)
-            if abs(applied - before.appliedC) > 1e-12 || before.targetC != targetC || before.n != n
+            if abs(applied - before.appliedC) > 1e-12 || abs(before.targetC - targetC) > 1e-12 || before.n != n
                 || before.autoOff != entry.autoOff || before.autoOffReason != entry.autoOffReason
                 || before.autoOffAt != entry.autoOffAt
                 || before.heldOutDays != entry.heldOutDays

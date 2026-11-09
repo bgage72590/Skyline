@@ -597,9 +597,14 @@ final class AccuracyPR2Tests: XCTestCase {
         // Need ≥300 pairs over ≥7 days for hourly — seed through the verifier's store actor.
         await v.seedBenchmark(station: station, key: key, training: trains, cityElevationM: 50)
         let offsets = await v.corrections(key, timeZoneIdentifier: "Europe/Paris", cityElevationM: 50)
-        // Warm bias (+1) → applied negative offset.
-        XCTAssertLessThan(offsets[.h0to6] ?? 0, 0)
-        XCTAssertGreaterThan(abs(offsets[.h0to6] ?? 0), 0.01)
+        // Hourly rows with no pair errors stay collecting (F1). The day/pair gate is not enough.
+        XCTAssertEqual(offsets[.h0to6] ?? -1, 0)
+        let bench = BenchmarkStore(directory: await v.benchmarkStoreDirectory(), client: client, now: { Self.t0 })
+        let raw = await bench.correctionEntry(loc: key, target: .h0to6)
+        let entry = try XCTUnwrap(raw)
+        XCTAssertEqual(BiasCorrection.heldOutPhase(of: entry), .collecting)
+        XCTAssertEqual(entry.autoOff, false)
+        XCTAssertEqual(entry.heldOutDays, 0)
     }
 
     // MARK: Review fix H1 — QA override: launch-arg only, finite, clamped, never saved, kill switch → 0

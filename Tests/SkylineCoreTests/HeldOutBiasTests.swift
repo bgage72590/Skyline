@@ -124,13 +124,94 @@ final class HeldOutBiasTests: XCTestCase {
             TrainingRow(loc: "x", localDay: day(-$0), target: .h0to6, sumE: 20, n: 10, distinct: 10)
         }
         await store.seedTraining(rows)
-        let offsets = await store.refreshCorrections(key: "x", timeZoneIdentifier: "UTC", sitingOK: true)
+        // Pair errors turn held-out on. 20×10 is still under the 300-pair gate, so the offset stays 0.
+        let errors = rows.map { HeldOutError(day: $0.localDay, error: 2) }
+        let offsets = await store.refreshCorrections(key: "x", timeZoneIdentifier: "UTC", sitingOK: true,
+                                                     gradingErrors: [.h0to6: errors])
         let rawEntry = await store.correctionEntry(loc: "x", target: .h0to6)
         let entry = try XCTUnwrap(rawEntry)
         XCTAssertGreaterThanOrEqual(entry.heldOutDays ?? 0, 7)
         XCTAssertEqual(entry.autoOff, false, "held-out can be on while the pair gate still fails")
         XCTAssertEqual(offsets[.h0to6], 0)
         XCTAssertEqual(entry.appliedC, 0, accuracy: 1e-12)
+    }
+
+    func testHourlyRowsWithoutPairErrorsStayCollecting() async throws {
+        let clock = TestClock(t0)
+        let dir = scratch("no-pairs")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let v = ForecastVerifier(directory: dir, client: PR1HTTPClient(), now: { clock.now })
+        let rows = (1...25).map {
+            TrainingRow(loc: "x", localDay: day(-$0), target: .h0to6, sumE: 50, n: 50, distinct: 20)
+        }
+        let station = MetarStationPick(stationID: "KXXX", coordinate: Coordinate(latitude: 40, longitude: -74),
+                                       elevationM: 10, distanceKm: 5, elevationDeltaM: 0, pickedAt: t0)
+        await v.seedBenchmark(station: station, key: "x", training: rows, cityElevationM: 10)
+        let offsets = await v.corrections("x", timeZoneIdentifier: "UTC", cityElevationM: 10)
+        XCTAssertEqual(offsets[.h0to6] ?? -1, 0, "hourly rows, no pair errors → collecting, offset 0")
+        let store = BenchmarkStore(directory: dir.appendingPathComponent("benchmark"), client: PR1HTTPClient(),
+                                   now: { clock.now })
+        let raw = await store.correctionEntry(loc: "x", target: .h0to6)
+        let entry = try XCTUnwrap(raw)
+        XCTAssertEqual(BiasCorrection.heldOutPhase(of: entry), .collecting)
+        XCTAssertEqual(entry.autoOff, false)
+        XCTAssertEqual(entry.heldOutDays, 0)
+        XCTAssertEqual(entry.appliedC, 0, accuracy: 1e-12)
+    }
+
+    func testMeasurementOffDoesNotLearnTraining() async throws {
+        UserDefaults.standard.set(false, forKey: AccuracyMeasurement.defaultsKey)
+        let clock = TestClock(t0)
+        let dir = scratch("meas-off")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let past = day(-3)
+        var pairs: [BenchmarkHourlyPair] = []
+        for h in 0..<24 {
+            let valid = past.addingTimeInterval(Double(h) * 3600)
+            pairs.append(BenchmarkHourlyPair(loc: "fx", issued: valid.addingTimeInterval(-3 * 3600), valid: valid,
+                                             kind: .skyline, forecastC: 13, observedC: 10, uncorrectedC: 13))
+        }
+        let v = ForecastVerifier(directory: dir, client: PR1HTTPClient(), now: { clock.now })
+        await v.seedBenchmark(key: "fx", hourly: pairs)
+        let trainingURL = dir.appendingPathComponent("benchmark/training.jsonl")
+        _ = await v.corrections("fx", timeZoneIdentifier: "UTC")
+        let offText = (try? String(contentsOf: trainingURL, encoding: .utf8)) ?? ""
+        XCTAssertTrue(offText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      "measurement off must not learn training rows")
+
+        UserDefaults.standard.removeObject(forKey: AccuracyMeasurement.defaultsKey)
+        _ = await v.corrections("fx", timeZoneIdentifier: "UTC")
+        let store = BenchmarkStore(directory: dir.appendingPathComponent("benchmark"), client: PR1HTTPClient(),
+                                   now: { clock.now })
+        let onRows = await store.trainingRows(for: "fx", target: .h0to6)
+        XCTAssertEqual(onRows.first?.n, 24)
+        XCTAssertEqual(onRows.first?.sumE ?? -1, 72, accuracy: 1e-6)
+    }
+
+    func testRelaunchDoesNotRewriteCorrectionsForSumOrder() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // Newest-first, with values that are not exact in binary, so a reload that sorts by day
+        // used to move targetC by ~1e-16 and rewrite corrections.json (N1).
+        var rows: [TrainingRow] = []
+        for i in 1...40 {
+            let e = Double(i) * 0.1 + 1.23e-13
+            rows.append(TrainingRow(loc: "x", localDay: day(-i), target: .dailyHigh, sumE: e, n: 1))
+        }
+        await store.seedTraining(rows)
+        _ = await store.refreshCorrections(key: "x", timeZoneIdentifier: "UTC", sitingOK: true)
+        let url = dir.appendingPathComponent("corrections.json")
+        let afterFirst = try Data(contentsOf: url)
+        let stamp = modificationDate(url)
+        let logs = await store.correctionsSnapshot().log.count
+        XCTAssertGreaterThan(logs, 0)
+
+        let reloaded = BenchmarkStore(directory: dir, client: PR1HTTPClient(), now: { self.t0 })
+        _ = await reloaded.refreshCorrections(key: "x", timeZoneIdentifier: "UTC", sitingOK: true)
+        let logsAfter = await reloaded.correctionsSnapshot().log.count
+        XCTAssertEqual(logsAfter, logs)
+        XCTAssertEqual(try Data(contentsOf: url), afterFirst)
+        XCTAssertEqual(modificationDate(url), stamp)
     }
 
     func testKillSwitchMeasurementAndSitingForceZero() async throws {

@@ -414,19 +414,22 @@ public actor ForecastVerifier {
         if isUS == true { usKeys.insert(key) }
         statusTimeZoneIdentifier[key] = timeZoneIdentifier
         let pool = heldOutPool(key: key, timeZoneIdentifier: timeZoneIdentifier)
-        if pool.qualifyingPairs > 0 {
-            await benchmark.learnTraining(key: key, timeZoneIdentifier: timeZoneIdentifier,
-                                          verifiedHourlyRows: pool.hourlyRows)
-        } else {
-            await benchmark.learnTraining(key: key, timeZoneIdentifier: timeZoneIdentifier)
+        // Measurement off still refreshes offsets, but must not write training.jsonl (F2).
+        if AccuracyMeasurement.isEnabled() {
+            if pool.qualifyingPairs > 0 {
+                await benchmark.learnTraining(key: key, timeZoneIdentifier: timeZoneIdentifier,
+                                              verifiedHourlyRows: pool.hourlyRows)
+            } else {
+                await benchmark.learnTraining(key: key, timeZoneIdentifier: timeZoneIdentifier)
+            }
         }
         let siting = await benchmark.sitingOK(for: key, cityElevationM: cityElevationM)
-        let grading: [CorrectionTarget: [HeldOutError]]?
+        // Always a pair map. Nil used to fall back to sumE/n and turn hourly targets on (F1).
+        let grading: [CorrectionTarget: [HeldOutError]]
         if pool.qualifyingPairs > 0 {
             grading = pool.errors
         } else {
-            let sky = await benchmark.skylineGradingErrors(key: key, timeZoneIdentifier: timeZoneIdentifier)
-            grading = sky.values.contains(where: { !$0.isEmpty }) ? sky : nil
+            grading = await benchmark.skylineGradingErrors(key: key, timeZoneIdentifier: timeZoneIdentifier)
         }
         let offsets = await benchmark.refreshCorrections(key: key, timeZoneIdentifier: timeZoneIdentifier,
                                                          sitingOK: siting, qaOverrideC: qaOverrideC,
