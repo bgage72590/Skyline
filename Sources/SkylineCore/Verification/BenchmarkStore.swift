@@ -812,8 +812,49 @@ public actor BenchmarkStore {
         pruneIfDue()
     }
 
+    /// Upsert hourly-target rows built from the verified pool (C1). Daily rows, `seedTraining`,
+    /// and the foreign skyline path stay on first-wins `recordTrainingRows`.
+    /// Replaces a same-key row only when it differs and `new.n >= old.n`. Rewrites `training.jsonl`
+    /// once when any row was replaced; appends when rows were only added; writes nothing when unchanged.
+    func upsertHourlyTrainingRows(_ rows: [TrainingRow]) {
+        load()
+        assertOffMain()
+        var index: [String: Int] = [:]
+        for (i, row) in training.enumerated() where index[row.key] == nil {
+            index[row.key] = i
+        }
+        var replaced = false
+        var added: [TrainingRow] = []
+        for row in rows where row.target.isHourly {
+            if let i = index[row.key] {
+                let old = training[i]
+                let differs = old.n != row.n || old.distinct != row.distinct || abs(old.sumE - row.sumE) > 1e-9
+                if differs, row.n >= old.n {
+                    training[i] = row
+                    replaced = true
+                }
+            } else {
+                index[row.key] = training.count
+                training.append(row)
+                added.append(row)
+            }
+        }
+        if replaced {
+            writeAll(training, to: "training.jsonl")
+        } else if !added.isEmpty {
+            append(added, to: "training.jsonl")
+        }
+        if replaced || !added.isEmpty { pruneTrainingIfDue() }
+    }
+
     /// Build compact training rows from completed local days (uncorrected only). Idempotent.
-    public func learnTraining(key: String, timeZoneIdentifier: String) {
+    /// `verifiedHourlyRows == nil` keeps the tip skyline source (foreign / no verified pairs, C4).
+    /// A non-nil array, even empty, means this key learns hourly targets from the verified pool only (C1).
+    public func learnTraining(key: String, timeZoneIdentifier: String,
+                              verifiedHourlyRows: [TrainingRow]? = nil) {
+        // WeatherService calls corrections() with measurement off. Learning must not write
+        // training.jsonl on that path (F2).
+        guard AccuracyMeasurement.isEnabled() else { return }
         load()
         assertOffMain()
         guard let tz = TimeZone(identifier: timeZoneIdentifier) else { return }
@@ -822,24 +863,28 @@ public actor BenchmarkStore {
         cal.timeZone = tz
         var newRows: [TrainingRow] = []
 
-        // Hourly targets from skyline benchmark pairs (learningForecastC = uncorrected).
-        let sky = hourlyBench.filter { $0.loc == key && $0.kind == .skyline
-            && $0.valid.timeIntervalSince($0.issued) / 3600 >= BiasCorrection.minLeadHoursForLearning }
-        let byDay = Dictionary(grouping: sky) { cal.startOfDay(for: $0.valid) }
-        let today = cal.startOfDay(for: t)
-        for (day, pairs) in byDay where day < today {
-            let w = LocalDayAggregator.window(forDay: day, timeZone: tz)
-            guard LocalDayAggregator.isComplete(w, now: t) else { continue }
-            // Dedupe on the lock's key (loc, kind, issued, valid) — loc/kind are fixed above — so every
-            // lead bucket keeps its own pairs for the same valid hour (review fix M4, B1/B2).
-            struct PairKey: Hashable { var issued: Date; var valid: Date }
-            var seenPairs = Set<PairKey>()
-            let deduped = pairs.filter { seenPairs.insert(PairKey(issued: $0.issued, valid: $0.valid)).inserted }
-            let byBucket = Dictionary(grouping: deduped) { CorrectionTarget(bucket: LeadBucket(leadHours: $0.valid.timeIntervalSince($0.issued) / 3600)) }
-            for (target, rows) in byBucket {
-                let sumE = rows.reduce(0.0) { $0 + ($1.learningForecastC - $1.observedC) }
-                newRows.append(TrainingRow(loc: key, localDay: day, target: target,
-                                           sumE: sumE, n: rows.count, distinct: Set(rows.map { Int($0.valid.timeIntervalSince1970 / 3600) }).count))
+        if let verifiedHourlyRows {
+            upsertHourlyTrainingRows(verifiedHourlyRows)
+        } else {
+            // Hourly targets from skyline benchmark pairs (learningForecastC = uncorrected).
+            let sky = hourlyBench.filter { $0.loc == key && $0.kind == .skyline
+                && $0.valid.timeIntervalSince($0.issued) / 3600 >= BiasCorrection.minLeadHoursForLearning }
+            let byDay = Dictionary(grouping: sky) { cal.startOfDay(for: $0.valid) }
+            let today = cal.startOfDay(for: t)
+            for (day, pairs) in byDay where day < today {
+                let w = LocalDayAggregator.window(forDay: day, timeZone: tz)
+                guard LocalDayAggregator.isComplete(w, now: t) else { continue }
+                // Dedupe on the lock's key (loc, kind, issued, valid) — loc/kind are fixed above — so every
+                // lead bucket keeps its own pairs for the same valid hour (review fix M4, B1/B2).
+                struct PairKey: Hashable { var issued: Date; var valid: Date }
+                var seenPairs = Set<PairKey>()
+                let deduped = pairs.filter { seenPairs.insert(PairKey(issued: $0.issued, valid: $0.valid)).inserted }
+                let byBucket = Dictionary(grouping: deduped) { CorrectionTarget(bucket: LeadBucket(leadHours: $0.valid.timeIntervalSince($0.issued) / 3600)) }
+                for (target, rows) in byBucket {
+                    let sumE = rows.reduce(0.0) { $0 + ($1.learningForecastC - $1.observedC) }
+                    newRows.append(TrainingRow(loc: key, localDay: day, target: target,
+                                               sumE: sumE, n: rows.count, distinct: Set(rows.map { Int($0.valid.timeIntervalSince1970 / 3600) }).count))
+                }
             }
         }
 
@@ -867,10 +912,53 @@ public actor BenchmarkStore {
         if !newRows.isEmpty { recordTrainingRows(newRows) }
     }
 
+    /// In-memory pair errors for a key whose verified pool is empty (C4). Last 15 local days only.
+    /// Deduped skyline pairs, lead ≥ 1 h, `learningForecastC − observedC`. Never persisted.
+    func skylineGradingErrors(key: String, timeZoneIdentifier: String) -> [CorrectionTarget: [HeldOutError]] {
+        load()
+        guard let tz = TimeZone(identifier: timeZoneIdentifier) else { return [:] }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        let today = cal.startOfDay(for: now())
+        let recent = cal.date(byAdding: .day, value: -14, to: today) ?? today
+        let sky = hourlyBench.filter { $0.loc == key && $0.kind == .skyline
+            && $0.valid.timeIntervalSince($0.issued) / 3600 >= BiasCorrection.minLeadHoursForLearning }
+        struct PairKey: Hashable { var issued: Date; var valid: Date }
+        var seen = Set<PairKey>()
+        var out: [CorrectionTarget: [HeldOutError]] = [:]
+        for target in CorrectionTarget.allCases where target.isHourly { out[target] = [] }
+        for pair in sky {
+            guard seen.insert(PairKey(issued: pair.issued, valid: pair.valid)).inserted else { continue }
+            let day = cal.startOfDay(for: pair.valid)
+            guard day >= recent else { continue }
+            let err = pair.learningForecastC - pair.observedC
+            guard err.isFinite else { continue }
+            let target = CorrectionTarget(bucket: LeadBucket(leadHours: pair.valid.timeIntervalSince(pair.issued) / 3600))
+            out[target, default: []].append(HeldOutError(day: day, error: err))
+        }
+        return out
+    }
+
+    /// Daily: one error per row (`sumE`). Hourly: only the pair-error map. No pair errors
+    /// (nil map or a missing target) grades nothing, so the target stays collecting (F1 / C5).
+    private func gradingSamples(target: CorrectionTarget, rows: [TrainingRow],
+                                gradingErrors: [CorrectionTarget: [HeldOutError]]?) -> [HeldOutError] {
+        if target.isDaily {
+            return rows.compactMap { r in
+                guard r.sumE.isFinite else { return nil }
+                return HeldOutError(day: r.localDay, error: r.sumE)
+            }
+        }
+        return gradingErrors?[target] ?? []
+    }
+
     /// Recompute applied offsets for a city (rate limit, auto-off). Returns offsets to apply (0 if gated off).
     /// `qaOverrideC` comes from the launch arguments only (ForecastVerifier), never from defaults or data.
+    /// Hourly targets grade only `gradingErrors` (an empty or nil map leaves them collecting).
+    /// Daily targets always grade one error per day, the row's `sumE` (C5).
     public func refreshCorrections(key: String, timeZoneIdentifier: String,
-                                   sitingOK: Bool, qaOverrideC: Double? = nil) -> [CorrectionTarget: Double] {
+                                   sitingOK: Bool, qaOverrideC: Double? = nil,
+                                   gradingErrors: [CorrectionTarget: [HeldOutError]]? = nil) -> [CorrectionTarget: Double] {
         load()
         loadCorrectionsOnly()
         assertOffMain()
@@ -897,11 +985,20 @@ public actor BenchmarkStore {
         }
 
         var changed = false
+        let gradedAsOf = t
+        let dayStamp = localDay
+        // dayKey relies on training-row and pair-error dates already being local midnight (Note 3).
+        // It only remaps `now` onto today's midnight. Any other instant is left unchanged, so a
+        // date that is not already midnight would be graded on the wrong day.
+        let dayKey: @Sendable (Date) -> Date = { d in d == gradedAsOf ? dayStamp : d }
         for target in CorrectionTarget.allCases {
             let rows = training.filter { $0.loc == key && $0.target == target && $0.localDay < localDay }
-            var entry = file.entry(loc: key, target: target)
+            let before = file.entry(loc: key, target: target)
                 ?? CorrectionEntry(loc: key, target: target)
-            let (eval, log) = BiasCorrection.evaluateAutoOff(entry: entry, rows: rows, asOf: t)
+            var entry = before
+            let errors = gradingSamples(target: target, rows: rows, gradingErrors: gradingErrors)
+            let (eval, log) = BiasCorrection.evaluateAutoOff(entry: entry, rows: rows, pairErrors: errors,
+                                                            asOf: gradedAsOf, dayKey: dayKey)
             entry = eval
             if let log {
                 var l = log; l.loc = key; l.target = target
@@ -910,15 +1007,20 @@ public actor BenchmarkStore {
             }
             let gated = BiasCorrection.gate(rows: rows, target: target, sitingOK: sitingOK,
                                             switchOn: switchOn, measurementOn: measurementOn)
-            let forceZero = !switchOn || !measurementOn || !sitingOK || entry.autoOff || !gated
+            let on = BiasCorrection.heldOutPhase(of: entry) == .on
+            let forceZero = !switchOn || !measurementOn || !sitingOK || !gated || !on
             let (est, n) = BiasCorrection.estimate(rows: rows, asOf: localDay)
             // Applied correction = −bias (warm forecasts get a negative offset).
             let targetC = forceZero ? 0 : -est
             let sameDay = entry.appliedOn.map { cal.isDate($0, inSameDayAs: localDay) } ?? false
             let applied = BiasCorrection.rateLimited(previous: entry.appliedC, targetC: targetC,
                                                      sameLocalDay: sameDay && !forceZero, forceZero: forceZero)
-            if abs(applied - entry.appliedC) > 1e-12 || entry.targetC != targetC || entry.n != n
-                || entry.autoOff != eval.autoOff {
+            if abs(applied - before.appliedC) > 1e-12 || abs(before.targetC - targetC) > 1e-12 || before.n != n
+                || before.autoOff != entry.autoOff || before.autoOffReason != entry.autoOffReason
+                || before.autoOffAt != entry.autoOffAt
+                || before.heldOutDays != entry.heldOutDays
+                || before.heldOutRawMAEC != entry.heldOutRawMAEC
+                || before.heldOutCorrMAEC != entry.heldOutCorrMAEC {
                 changed = true
             }
             entry.appliedC = applied

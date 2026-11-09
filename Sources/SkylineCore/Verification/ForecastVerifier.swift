@@ -108,6 +108,9 @@ public actor ForecastVerifier {
     private var usKeys: Set<String> = []
     /// Last time-zone id used to build `cachedStatuses` (in-memory; rebuild after seed).
     private var statusTimeZoneIdentifier: [String: String] = [:]
+    /// Per-key verified pool for held-out learning (C3). Compact rows + last 15 local days of errors.
+    private var heldOutPools: [String: HeldOutPoolCache] = [:]
+    private var heldOutPoolBuilds = 0
 
     public init(directory: URL = ForecastVerifier.defaultDirectory(), client: HTTPClient = URLSessionHTTPClient(),
                 config: AdaptiveWeighting.Config = AdaptiveWeighting.Config(),
@@ -216,6 +219,7 @@ public actor ForecastVerifier {
             unsyncedPairs += newPairs.count
             cachedScores[key] = nil
             cachedWeights[key] = nil
+            heldOutPools[key] = nil
         }
     }
 
@@ -237,6 +241,7 @@ public actor ForecastVerifier {
         appliedTemperature = AppliedTemperatureWeightStore()
         cachedOffsets = [:]; cachedStatuses = [:]; correctionsReady = false
         metarWeightInputs = [:]; metarWeightEligible = []
+        heldOutPools = [:]
         lastNWSObs = [:]
         loaded = true
         for name in ["pending.jsonl", "verified.jsonl", "meta.json", AppliedTemperatureWeightStore.fileName] {
@@ -303,6 +308,7 @@ public actor ForecastVerifier {
             verified = merged
             writeAll(verified, to: "verified.jsonl")
             cachedScores = [:]; cachedWeights = [:]
+            heldOutPools = [:]
             changed = true
         }
         // "Days collected" counts from the earliest pair any Mac has for the location.
@@ -402,13 +408,32 @@ public actor ForecastVerifier {
     @discardableResult
     public func corrections(_ key: String, timeZoneIdentifier: String = TimeZone.gmt.identifier,
                             cityElevationM: Double? = nil, isUS: Bool? = nil) async -> [CorrectionTarget: Double] {
+        load()
         await benchmark.loadCorrectionsOnly()
         correctionsReady = true
         if isUS == true { usKeys.insert(key) }
         statusTimeZoneIdentifier[key] = timeZoneIdentifier
+        let pool = heldOutPool(key: key, timeZoneIdentifier: timeZoneIdentifier)
+        // Measurement off still refreshes offsets, but must not write training.jsonl (F2).
+        if AccuracyMeasurement.isEnabled() {
+            if pool.qualifyingPairs > 0 {
+                await benchmark.learnTraining(key: key, timeZoneIdentifier: timeZoneIdentifier,
+                                              verifiedHourlyRows: pool.hourlyRows)
+            } else {
+                await benchmark.learnTraining(key: key, timeZoneIdentifier: timeZoneIdentifier)
+            }
+        }
         let siting = await benchmark.sitingOK(for: key, cityElevationM: cityElevationM)
+        // Always a pair map. Nil used to fall back to sumE/n and turn hourly targets on (F1).
+        let grading: [CorrectionTarget: [HeldOutError]]
+        if pool.qualifyingPairs > 0 {
+            grading = pool.errors
+        } else {
+            grading = await benchmark.skylineGradingErrors(key: key, timeZoneIdentifier: timeZoneIdentifier)
+        }
         let offsets = await benchmark.refreshCorrections(key: key, timeZoneIdentifier: timeZoneIdentifier,
-                                                         sitingOK: siting, qaOverrideC: qaOverrideC)
+                                                         sitingOK: siting, qaOverrideC: qaOverrideC,
+                                                         gradingErrors: grading)
         cachedOffsets[key] = offsets
         cachedStatuses[key] = await buildStatuses(key: key, timeZoneIdentifier: timeZoneIdentifier,
                                                  sitingOK: siting, offsets: offsets, isUS: isUS)
@@ -446,8 +471,12 @@ public actor ForecastVerifier {
                 entry?.appliedC = offsets[target] ?? 0
             }
             let nPairs = rows.reduce(0) { $0 + max(0, $1.n) }
-            let gated = BiasCorrection.gate(rows: rows, target: target, sitingOK: sitingOK,
-                                            switchOn: switchOn, measurementOn: AccuracyMeasurement.isEnabled())
+            let gate = BiasCorrection.gate(rows: rows, target: target, sitingOK: sitingOK,
+                                           switchOn: switchOn, measurementOn: AccuracyMeasurement.isEnabled())
+            // Collecting (held-out days < 7) must not read as "correction in use" (C11).
+            // QA override still shows the in-use line for a target that passes the day/pair gate.
+            let heldDays = entry?.heldOutDays ?? -1
+            let gated = qa ? gate : (gate && heldDays >= BiasCorrection.heldOutMinDays)
             let line = BiasCorrection.statusLine(entry: entry, gated: gated, sitingOK: sitingOK,
                                                  switchOn: switchOn, nDays: nDays,
                                                  units: { $0 }, qaOverride: qa,
@@ -555,7 +584,8 @@ public actor ForecastVerifier {
             return (o.time, t)
         }
         await benchmark.scoreCompletedDays(key: key, timeZoneIdentifier: timeZoneIdentifier, extraTemps: extraTemps)
-        await benchmark.learnTraining(key: key, timeZoneIdentifier: timeZoneIdentifier)
+        // Hourly training is learned inside `corrections()` after the verified pool is known,
+        // so a key with verified pairs does not also record hourly.jsonl rows (C4).
 
         if !isUS, BiasCorrection.Switch.isEnabled() {
             let siting = await benchmark.sitingOK(for: key, cityElevationM: elev)
@@ -638,7 +668,89 @@ public actor ForecastVerifier {
         await benchmark.noteUSStationSeedFailure(key: key, until: until)
     }
 
+    /// How many times the verified pool was built (C3 test seam). Cache hits do not increment it.
+    public func heldOutPoolBuildCount() -> Int { heldOutPoolBuilds }
+
+    /// In-memory verified pairs for tests. Does not write `verified.jsonl`.
+    func testingSeedVerified(_ records: [VerifiedRecord]) {
+        load()
+        verified.append(contentsOf: records)
+        for rec in records { heldOutPools[rec.r.loc] = nil }
+    }
+
     // MARK: Internals
+
+    /// Compact per-key pool. Not persisted; invalidated with `cachedScores` and on local-day change (C3).
+    private struct HeldOutPoolCache {
+        var timeZoneIdentifier: String
+        var localDay: Date
+        var qualifyingPairs: Int
+        var hourlyRows: [TrainingRow]
+        var errors: [CorrectionTarget: [HeldOutError]]
+    }
+
+    /// One pass over `verified` for `key`: dedupe (issued, valid), lead ≥ 1 h, finite blend and observed
+    /// temperatures. Training rows are complete local days inside the retention window. Pair errors are
+    /// kept for the last 15 local days only (C2 / C3).
+    private func heldOutPool(key: String, timeZoneIdentifier: String) -> HeldOutPoolCache {
+        let tz = TimeZone(identifier: timeZoneIdentifier) ?? TimeZone(secondsFromGMT: 0)!
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        let today = cal.startOfDay(for: now())
+        if let cached = heldOutPools[key], cached.timeZoneIdentifier == timeZoneIdentifier, cached.localDay == today {
+            return cached
+        }
+        heldOutPoolBuilds += 1
+        struct Dedup: Hashable { var issued: Date; var valid: Date }
+        struct Pair {
+            var issued: Date
+            var valid: Date
+            var day: Date
+            var target: CorrectionTarget
+            var error: Double
+        }
+        var seen = Set<Dedup>()
+        var pairs: [Pair] = []
+        let minLead = BiasCorrection.minLeadHoursForLearning
+        for rec in verified where rec.r.loc == key {
+            guard rec.r.leadHours >= minLead else { continue }
+            guard let bt = rec.r.values(.blend)?.t, bt.isFinite, let ot = rec.o.t, ot.isFinite else { continue }
+            guard seen.insert(Dedup(issued: rec.r.issued, valid: rec.r.valid)).inserted else { continue }
+            let day = cal.startOfDay(for: rec.r.valid)
+            let target = CorrectionTarget(bucket: LeadBucket(leadHours: rec.r.leadHours))
+            pairs.append(Pair(issued: rec.r.issued, valid: rec.r.valid, day: day, target: target, error: bt - ot))
+        }
+        let earliest = now().addingTimeInterval((-Self.retentionDays + 1) * 86400)
+        let recent = cal.date(byAdding: .day, value: -14, to: today) ?? today
+        var errors: [CorrectionTarget: [HeldOutError]] = [:]
+        for target in CorrectionTarget.allCases where target.isHourly { errors[target] = [] }
+        var rows: [TrainingRow] = []
+        let groups = Dictionary(grouping: pairs) { "\($0.target.rawValue)|\($0.day.timeIntervalSince1970)" }
+        for group in groups.values {
+            let sorted = group.sorted { a, b in
+                if a.issued != b.issued { return a.issued < b.issued }
+                return a.valid < b.valid
+            }
+            guard let first = sorted.first else { continue }
+            if first.day >= recent {
+                errors[first.target, default: []].append(contentsOf: sorted.map {
+                    HeldOutError(day: first.day, error: $0.error)
+                })
+            }
+            guard first.day < today else { continue }
+            let window = LocalDayAggregator.window(forDay: first.day, timeZone: tz)
+            guard LocalDayAggregator.isComplete(window, now: now()) else { continue }
+            guard first.day >= earliest else { continue }
+            let sumE = sorted.reduce(0.0) { $0 + $1.error }
+            let distinct = Set(sorted.map { Int($0.valid.timeIntervalSince1970 / 3600) }).count
+            rows.append(TrainingRow(loc: key, localDay: first.day, target: first.target,
+                                    sumE: sumE, n: sorted.count, distinct: distinct))
+        }
+        let cache = HeldOutPoolCache(timeZoneIdentifier: timeZoneIdentifier, localDay: today,
+                                     qualifyingPairs: pairs.count, hourlyRows: rows, errors: errors)
+        heldOutPools[key] = cache
+        return cache
+    }
 
     private func scores(_ key: String) -> AccuracyScorer.Scores {
         if let s = cachedScores[key] { return s }

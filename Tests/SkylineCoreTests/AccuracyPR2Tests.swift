@@ -597,9 +597,14 @@ final class AccuracyPR2Tests: XCTestCase {
         // Need ≥300 pairs over ≥7 days for hourly — seed through the verifier's store actor.
         await v.seedBenchmark(station: station, key: key, training: trains, cityElevationM: 50)
         let offsets = await v.corrections(key, timeZoneIdentifier: "Europe/Paris", cityElevationM: 50)
-        // Warm bias (+1) → applied negative offset.
-        XCTAssertLessThan(offsets[.h0to6] ?? 0, 0)
-        XCTAssertGreaterThan(abs(offsets[.h0to6] ?? 0), 0.01)
+        // Hourly rows with no pair errors stay collecting (F1). The day/pair gate is not enough.
+        XCTAssertEqual(offsets[.h0to6] ?? -1, 0)
+        let bench = BenchmarkStore(directory: await v.benchmarkStoreDirectory(), client: client, now: { Self.t0 })
+        let raw = await bench.correctionEntry(loc: key, target: .h0to6)
+        let entry = try XCTUnwrap(raw)
+        XCTAssertEqual(BiasCorrection.heldOutPhase(of: entry), .collecting)
+        XCTAssertEqual(entry.autoOff, false)
+        XCTAssertEqual(entry.heldOutDays, 0)
     }
 
     // MARK: Review fix H1 — QA override: launch-arg only, finite, clamped, never saved, kill switch → 0
@@ -1011,7 +1016,7 @@ final class AccuracyPR2Tests: XCTestCase {
         XCTAssertEqual(mc, metarsBefore)
     }
 
-    // MARK: Review fix M7 — deterministic sticky auto-off with hysteresis and log
+    // MARK: Review fix M7 — held-out auto-off (C6): pause, relaunch, re-enable, ramp
 
     func testAutoOffTripsLogsSurvivesRelaunchAndReenablesWithHysteresis() async throws {
         let dir = tempDir("pr2-autooff")
@@ -1023,7 +1028,7 @@ final class AccuracyPR2Tests: XCTestCase {
         let clock = TestClock(t0)
         let station = MetarStationPick(stationID: "EGLL", coordinate: Coordinate(latitude: 51.47, longitude: -0.45),
                                        elevationM: 25, distanceKm: 10, elevationDeltaM: 0, pickedAt: t0)
-        // 20 old days with a +2 °C bias, then 14 recent days with none: the out-of-sample correction hurts.
+        // 20 old days with a +2 °C bias, then 14 recent days with none: held-out gain ≤ 0 → paused.
         var store = BenchmarkStore(directory: dir, client: PR1HTTPClient(), now: { clock.now })
         await store.seedStation(station, key: "x")
         await store.seedTraining((15...34).map { row(-$0, 2.0) } + (1...14).map { row(-$0, 0.0) })
@@ -1032,48 +1037,34 @@ final class AccuracyPR2Tests: XCTestCase {
         var e = await store.correctionEntry(loc: "x", target: .dailyHigh)
         XCTAssertEqual(e?.autoOff, true)
         XCTAssertEqual(e?.autoOffReason, "worse on recent days")
+        XCTAssertGreaterThanOrEqual(e?.heldOutDays ?? 0, BiasCorrection.heldOutMinDays)
         var log = await store.correctionsSnapshot().log
         XCTAssertEqual(log.last?.state, "off")
+        XCTAssertEqual(log.last?.reason, "worse on recent days")
         XCTAssertEqual(log.last?.loc, "x")
         XCTAssertEqual(log.last?.target, .dailyHigh)
         XCTAssertNotNil(log.last?.correctedMAE)
+        let pausedLogs = log.count
 
-        // Relaunch: a new store on the same directory is still off (sticky, persisted in corrections.json).
+        // Relaunch: still paused. The same data adds no second log (C7 / C8).
         store = BenchmarkStore(directory: dir, client: PR1HTTPClient(), now: { clock.now })
         e = await store.correctionEntry(loc: "x", target: .dailyHigh)
         XCTAssertEqual(e?.autoOff, true)
         o = await store.refreshCorrections(key: "x", timeZoneIdentifier: "UTC", sitingOK: true)
         XCTAssertEqual(o[.dailyHigh], 0)
+        let relaunchLogs = await store.correctionsSnapshot().log.count
+        XCTAssertEqual(relaunchLogs, pausedLogs)
 
-        // 6 new days where correction would clearly help: still off (< 7 new days).
-        await store.seedTraining((1...6).map { row($0, 2.0) })
-        clock.now = day(7).addingTimeInterval(12 * 3600)
-        o = await store.refreshCorrections(key: "x", timeZoneIdentifier: "UTC", sitingOK: true)
-        XCTAssertEqual(o[.dailyHigh], 0)
-        e = await store.correctionEntry(loc: "x", target: .dailyHigh)
-        XCTAssertEqual(e?.autoOff, true)
-
-        // ≥ 7 new days but < 0.05 °C improvement: still off (pure check of the hysteresis rule).
-        var offEntry = CorrectionEntry(loc: "y", target: .dailyHigh, autoOff: true, autoOffAt: day0)
-        let flat = (1...30).map { TrainingRow(loc: "y", localDay: day(-$0), target: .dailyHigh, sumE: 0, n: 1) }
-            + (1...10).map { TrainingRow(loc: "y", localDay: day($0), target: .dailyHigh, sumE: 0, n: 1) }
-        let (stillOff, noLog) = BiasCorrection.evaluateAutoOff(entry: offEntry, rows: flat, asOf: day(11))
-        XCTAssertTrue(stillOff.autoOff); XCTAssertNil(noLog)
-        offEntry.autoOffAt = day(5)
-        let (tooFew, _) = BiasCorrection.evaluateAutoOff(
-            entry: offEntry, rows: (1...30).map { TrainingRow(loc: "y", localDay: day(-$0), target: .dailyHigh, sumE: 2, n: 1) }
-                + (6...11).map { TrainingRow(loc: "y", localDay: day($0), target: .dailyHigh, sumE: 2, n: 1) },
-            asOf: day(12))
-        XCTAssertTrue(tooFew.autoOff, "6 new days < 7")
-
-        // 14 new days (≥ 7) and corrected clearly better: re-enables, logs "on", and ramps from 0 (≤ 0.5 °C).
-        await store.seedTraining((7...14).map { row($0, 2.0) })
+        // 14 new days of the same warm bias. autoOffAt is only hours old — C6 still re-enables
+        // because the held-out gain clears 0.05 °F. There is no 7-day wait. Ramps from 0.
+        await store.seedTraining((1...14).map { row($0, 2.0) })
         clock.now = day(15).addingTimeInterval(12 * 3600)
         o = await store.refreshCorrections(key: "x", timeZoneIdentifier: "UTC", sitingOK: true)
         e = await store.correctionEntry(loc: "x", target: .dailyHigh)
         XCTAssertEqual(e?.autoOff, false)
         log = await store.correctionsSnapshot().log
         XCTAssertEqual(log.last?.state, "on")
+        XCTAssertEqual(log.last?.reason, "hysteresis re-enable")
         let applied = o[.dailyHigh] ?? 0
         XCTAssertLessThan(applied, 0, "warm bias → negative offset")
         XCTAssertGreaterThanOrEqual(applied, -BiasCorrection.rampPerDayC - 1e-12, "re-ramps from 0")
