@@ -16,6 +16,10 @@ public enum BiasCorrection {
     public static let autoOffHysteresisC = 0.05
     public static let autoOffWindowDays = 14
     public static let autoOffReenableDays = 7
+    /// Held-out on/off (C6). ε is 0.05 °F and must not be rounded to 0.03 °C.
+    /// `autoOffReenableDays` / `autoOffHysteresisC` stay as constants; no logic or copy uses them.
+    public static let heldOutMinDays = 7
+    public static let heldOutOnGainC = 0.05 / 1.8
     public static let maxStationDistanceKm = 25.0
     public static let maxElevationDeltaM = 100.0
     public static let unknownCityMaxDistanceKm = 15.0
@@ -275,36 +279,104 @@ public enum BiasCorrection {
         return (cSum / Double(n), uSum / Double(n))
     }
 
-    /// Sticky auto-off with hysteresis. Returns updated entry + optional log line.
-    public static func evaluateAutoOff(entry: CorrectionEntry, rows: [TrainingRow],
-                                       asOf: Date) -> (CorrectionEntry, CorrectionLogEntry?) {
-        var e = entry
-        guard let maes = outOfSampleMAEs(rows: rows) else { return (e, nil) }
-        if e.autoOff {
-            // Re-enable after ≥ 7 new scored days AND corrected better by ≥ 0.05 °C.
-            let newDays = rows.filter { $0.localDay > (e.autoOffAt ?? .distantPast) }.count
-            if newDays >= autoOffReenableDays, maes.uncorrected - maes.corrected >= autoOffHysteresisC {
-                e.autoOff = false
-                e.autoOffReason = nil
-                let log = CorrectionLogEntry(state: "on", reason: "hysteresis re-enable",
-                                             n: rows.count, correctedMAE: maes.corrected,
-                                             uncorrectedMAE: maes.uncorrected, date: asOf)
-                accuracyLog("correction auto-on \(e.loc)/\(e.target.rawValue) n=\(rows.count)")
-                return (e, log)
-            }
-            return (e, nil)
+    /// Pair-level held-out gain (A2 / C5 / A12). Each graded day's offset is `estimate` + `clamp`
+    /// on strictly earlier rows only. `dayKey` is city-local midnight live and UTC valid-day in the replay.
+    /// Non-finite pair errors are skipped. No pairs → days 0, gain 0, MAEs nil.
+    public static func heldOutGain(rows: [TrainingRow], pairErrors: [HeldOutError], asOfDay: Date,
+                                   dayKey: @Sendable (Date) -> Date = { $0 }) -> HeldOutGain {
+        let asOf = dayKey(asOfDay)
+        var byDay: [Date: [Double]] = [:]
+        for sample in pairErrors {
+            guard sample.error.isFinite else { continue }
+            let d = dayKey(sample.day)
+            guard d < asOf else { continue }
+            byDay[d, default: []].append(sample.error)
         }
-        if maes.corrected > maes.uncorrected {
+        let graded = Array(byDay.keys.sorted().suffix(autoOffWindowDays))
+        let fitRows = rows.filter { dayKey($0.localDay) < asOf }
+        var raw = 0.0, corr = 0.0, m = 0
+        for d in graded {
+            let prior = fitRows.filter { dayKey($0.localDay) < d }
+            let offset = -estimate(rows: prior, asOf: d).targetC
+            for e in byDay[d] ?? [] {
+                raw += abs(e)
+                corr += abs(e + offset)
+                m += 1
+            }
+        }
+        guard m > 0 else { return HeldOutGain(days: 0, rawMAE: nil, corrMAE: nil, gain: 0) }
+        let rawMAE = raw / Double(m)
+        let corrMAE = corr / Double(m)
+        return HeldOutGain(days: graded.count, rawMAE: rawMAE, corrMAE: corrMAE, gain: rawMAE - corrMAE)
+    }
+
+    /// Pure on/off decision shared by live refresh and the Swift replay (C6).
+    /// On from off needs ≥ `heldOutMinDays` and gain ≥ 0.05 °F. Stays on while gain > 0.
+    public static func heldOutOn(wasOn: Bool, days: Int, gainC: Double) -> Bool {
+        guard days >= heldOutMinDays, gainC.isFinite else { return false }
+        return wasOn ? gainC > 0 : gainC >= heldOutOnGainC
+    }
+
+    /// S₀ from the stored entry (C6). `autoOff` wins; a legacy applying offset counts as on.
+    public static func heldOutPhase(of entry: CorrectionEntry) -> HeldOutPhase {
+        if entry.autoOff { return .paused }
+        if (entry.heldOutDays ?? -1) >= heldOutMinDays { return .on }
+        if entry.heldOutDays == nil, abs(entry.appliedC) > 1e-12 { return .on }
+        return .collecting
+    }
+
+    /// MAE stored in corrections.json: 1e-4 °C, never NaN/Inf (C9).
+    static func roundedHeldOutMAE(_ value: Double?) -> Double? {
+        guard let value, value.isFinite else { return nil }
+        return (value * 10_000).rounded() / 10_000
+    }
+
+    /// Held-out state machine (C6 / C7 / C8). Replaces the `outOfSampleMAEs` decision.
+    /// One log entry per phase change; the same inputs are idempotent.
+    public static func evaluateAutoOff(entry: CorrectionEntry, rows: [TrainingRow],
+                                       pairErrors: [HeldOutError], asOf: Date,
+                                       dayKey: @Sendable (Date) -> Date) -> (CorrectionEntry, CorrectionLogEntry?) {
+        var e = entry
+        let gain = heldOutGain(rows: rows, pairErrors: pairErrors, asOfDay: asOf, dayKey: dayKey)
+        let phase0 = heldOutPhase(of: entry)
+        let wasOn = phase0 == .on
+        let days = gain.days
+        let newPhase: HeldOutPhase = days < heldOutMinDays
+            ? .collecting
+            : (heldOutOn(wasOn: wasOn, days: days, gainC: gain.gain) ? .on : .paused)
+        let rawMAE: Double? = days == 0 ? nil : roundedHeldOutMAE(gain.rawMAE)
+        let corrMAE: Double? = days == 0 ? nil : roundedHeldOutMAE(gain.corrMAE)
+        var log: CorrectionLogEntry?
+        if newPhase != phase0 {
+            switch newPhase {
+            case .paused:
+                log = CorrectionLogEntry(state: "off", reason: "worse on recent days", n: days,
+                                         correctedMAE: corrMAE, uncorrectedMAE: rawMAE, date: asOf)
+                accuracyLog("correction auto-off \(e.loc)/\(e.target.rawValue) gain=\(gain.gain)")
+            case .on:
+                log = CorrectionLogEntry(state: "on", reason: "hysteresis re-enable", n: days,
+                                         correctedMAE: corrMAE, uncorrectedMAE: rawMAE, date: asOf)
+                accuracyLog("correction auto-on \(e.loc)/\(e.target.rawValue) n=\(days)")
+            case .collecting:
+                log = CorrectionLogEntry(state: "off", reason: "held-out days < 7", n: days,
+                                         correctedMAE: corrMAE, uncorrectedMAE: rawMAE, date: asOf)
+                accuracyLog("correction collecting \(e.loc)/\(e.target.rawValue) days=\(days)")
+            }
+        }
+        switch newPhase {
+        case .collecting, .on:
+            e.autoOff = false
+            e.autoOffReason = nil
+            e.autoOffAt = nil
+        case .paused:
             e.autoOff = true
             e.autoOffReason = "worse on recent days"
-            e.autoOffAt = asOf
-            let log = CorrectionLogEntry(state: "off", reason: e.autoOffReason ?? "",
-                                         n: rows.count, correctedMAE: maes.corrected,
-                                         uncorrectedMAE: maes.uncorrected, date: asOf)
-            accuracyLog("correction auto-off \(e.loc)/\(e.target.rawValue) cMAE=\(maes.corrected) uMAE=\(maes.uncorrected)")
-            return (e, log)
+            if phase0 != .paused { e.autoOffAt = asOf }
         }
-        return (e, nil)
+        e.heldOutDays = days
+        e.heldOutRawMAEC = rawMAE
+        e.heldOutCorrMAEC = corrMAE
+        return (e, log)
     }
 
     // MARK: UI copy
@@ -313,8 +385,11 @@ public enum BiasCorrection {
     public static let offStationPending = "off: station (pending)"
     /// Siting failure after back-off or for a non-US / failed key.
     public static let offStation = "off: station"
-    /// Copy only. Mirrors evaluateAutoOff's re-enable rule (≥ autoOffReenableDays new scored days AND ≥ hysteresis better).
-    public static let autoOffLine = "paused: worse recently · rechecks after \(autoOffReenableDays)+ new days"
+    /// Paused because held-out days did not help. Turns back on at a ≥0.05 °F cut (C6 / C10).
+    public static var autoOffLine: String {
+        let cut = String(format: "%.2f", heldOutOnGainC * 1.8)
+        return "paused: did not help on recent held-out days · turns back on when it would have cut error by ≥\(cut) °F"
+    }
 
     public static func statusLine(entry: CorrectionEntry?, gated: Bool, sitingOK: Bool,
                                   switchOn: Bool, nDays: Int, units: (Double) -> Double,
@@ -324,12 +399,13 @@ public enum BiasCorrection {
                                   stationPending: Bool = false) -> String {
         if !switchOn { return "off: switched off" }
         if !sitingOK { return stationPending ? offStationPending : offStation }
-        if let e = entry, e.autoOff { return autoOffLine }
+        // Gate before paused (C11): an ungated target must not say "paused".
         if !gated {
             let needDays = dayThreshold(for: target)
             let needPairs = pairThreshold(for: target)
             return "off (\(nDays)/\(needDays) days · \(nPairs)/\(needPairs) pairs)"
         }
+        if let e = entry, e.autoOff { return autoOffLine }
         let applied = entry?.appliedC ?? 0
         let shown = units(applied)
         let qa = qaOverride ? " (QA override)" : ""
@@ -412,13 +488,22 @@ public struct CorrectionEntry: Codable, Hashable, Sendable {
     public var autoOffReason: String?
     public var autoOffAt: Date?
     public var n: Int
+    /// Held-out graded days on the last refresh. Nil on files written before this field (C6 legacy).
+    public var heldOutDays: Int?
+    /// Held-out raw MAE (°C), rounded to 1e-4. Nil when there are no graded pairs (C9).
+    public var heldOutRawMAEC: Double?
+    /// Held-out corrected MAE (°C), rounded to 1e-4. Nil when there are no graded pairs (C9).
+    public var heldOutCorrMAEC: Double?
 
     public init(loc: String, target: CorrectionTarget, appliedC: Double = 0, targetC: Double = 0,
                 appliedOn: Date? = nil, autoOff: Bool = false, autoOffReason: String? = nil,
-                autoOffAt: Date? = nil, n: Int = 0) {
+                autoOffAt: Date? = nil, n: Int = 0, heldOutDays: Int? = nil,
+                heldOutRawMAEC: Double? = nil, heldOutCorrMAEC: Double? = nil) {
         self.loc = loc; self.target = target; self.appliedC = appliedC; self.targetC = targetC
         self.appliedOn = appliedOn; self.autoOff = autoOff; self.autoOffReason = autoOffReason
         self.autoOffAt = autoOffAt; self.n = n
+        self.heldOutDays = heldOutDays; self.heldOutRawMAEC = heldOutRawMAEC
+        self.heldOutCorrMAEC = heldOutCorrMAEC
     }
 
     public var key: String { "\(loc)|\(target.rawValue)" }
@@ -467,6 +552,40 @@ public struct CorrectionsFile: Codable, Hashable, Sendable {
     public func entry(loc: String, target: CorrectionTarget) -> CorrectionEntry? {
         entries.first { $0.loc == loc && $0.target == target }
     }
+}
+
+/// One finite pair error on a day key (city-local midnight, or UTC valid-day in the replay).
+public struct HeldOutError: Hashable, Sendable {
+    public var day: Date
+    public var error: Double
+
+    public init(day: Date, error: Double) {
+        self.day = day
+        self.error = error
+    }
+}
+
+/// Pair-level raw vs corrected MAE over the last ≤14 graded days (A2).
+public struct HeldOutGain: Equatable, Sendable {
+    public var days: Int
+    public var rawMAE: Double?
+    public var corrMAE: Double?
+    /// rawMAE − corrMAE (°C). 0 when there is nothing to grade.
+    public var gain: Double
+
+    public init(days: Int, rawMAE: Double?, corrMAE: Double?, gain: Double) {
+        self.days = days
+        self.rawMAE = rawMAE
+        self.corrMAE = corrMAE
+        self.gain = gain
+    }
+}
+
+/// Held-out application state (C6). Collecting is off and not paused.
+public enum HeldOutPhase: Equatable, Sendable {
+    case collecting
+    case on
+    case paused
 }
 
 /// UI / test surface for one city × target correction line.
