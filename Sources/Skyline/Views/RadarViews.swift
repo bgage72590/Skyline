@@ -16,6 +16,7 @@ struct RadarCard: View {
         Card(title: "Precipitation", systemImage: "umbrella.fill") {
             ZStack {
                 RadarMapView(playback: radar, center: location.coordinate, frames: radar.frames,
+                             smoothing: radar.smoothing,
                              maxNativeZoom: radar.provider.maximumNativeZoom, interactive: false,
                              spanDegrees: 3.2, opacity: opacity, pinText: pinText,
                              followsPlayback: !expanded, reportsProgress: !expanded,
@@ -149,6 +150,7 @@ struct ExpandedRadarView: View {
         }
         .background {
             RadarMapView(playback: radar, center: location.coordinate, frames: radar.frames,
+                         smoothing: radar.smoothing,
                          maxNativeZoom: radar.provider.maximumNativeZoom, interactive: true,
                          spanDegrees: radar.provider == .nexrad ? 5 : 9, opacity: opacity,
                          pinText: pinText, followsPlayback: true, reportsProgress: true,
@@ -363,6 +365,7 @@ struct RadarOpacityControl: View {
 struct RadarOptions: View {
     let radar: RadarPlayback
     @Binding var opacity: Double
+    @AppStorage(RadarSmoothing.key) private var smoothing = RadarSmoothing.defaultValue
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 8) {
@@ -410,12 +413,51 @@ struct RadarOptions: View {
                 Text("Radar opacity").font(.caption2.weight(.semibold)).opacity(0.75)
                 RadarOpacityControl(opacity: $opacity)
             }
+            if RadarSmoothing.showsControl(for: radar.layer) {
+                RadarSmoothingControl(smoothing: $smoothing)
+            }
             if let error = radar.errorMessage {
                 Text(error).font(.caption).foregroundStyle(.red)
             }
         }
         .padding(10)
         .glassChip(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .onAppear {
+            let q = RadarSmoothing.quantize(smoothing)
+            if smoothing != q { smoothing = q }
+        }
+        .onChange(of: smoothing) { _, newValue in
+            let q = RadarSmoothing.quantize(newValue)
+            if q != newValue { smoothing = q; return }
+            radar.setSmoothing(q)
+        }
+    }
+}
+
+/// Raw → smooth. Under Radar opacity, hidden on the rainfall-total layers. Steps of 0.1.
+struct RadarSmoothingControl: View {
+    @Binding var smoothing: Double
+
+    private var valueLabel: String { RadarSmoothing.accessibilityValue(smoothing) }
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            Text("Radar smoothing").font(.caption2.weight(.semibold)).opacity(0.75)
+            HStack(spacing: 6) {
+                Text("Raw")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Glass.secondaryText)
+                Slider(value: $smoothing, in: RadarSmoothing.range, step: RadarSmoothing.step)
+                    .controlSize(.small)
+                    .accessibilityLabel(RadarSmoothing.accessibilityLabel)
+                    .accessibilityValue(valueLabel)
+                Text(valueLabel)
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .frame(width: 56, alignment: .trailing)
+            }
+            .frame(width: 280)
+        }
+        .help(RadarSmoothing.help)
     }
 }
 

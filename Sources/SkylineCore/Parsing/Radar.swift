@@ -68,15 +68,38 @@ public enum RainViewerParser {
         var radar: Radar
     }
 
-    /// Color scheme 2 ("Universal Blue") is the one the free tier guarantees; `1_1` = smoothed, snow shown.
+    /// Color scheme 2 ("Universal Blue"), snow shown. `1_1` is smoothed and is the string `decode` always
+    /// produces (today's tiles). `applying(_:q:)` selects `0_1` below `q` 0.5 and leaves this string
+    /// unchanged at 0.5 and above.
+    public static let smoothedSuffix = "/2/1_1.png"
+    public static let rawSuffix = "/2/0_1.png"
+
     public static func decode(_ data: Data) throws -> [RadarFrame] {
         let raw = try JSONDecoder().decode(Raw.self, from: data)
         func frame(_ f: Raw.Frame, forecast: Bool) -> RadarFrame {
             RadarFrame(time: Date(timeIntervalSince1970: f.time),
-                       urlTemplate: "\(raw.host)\(f.path)/256/{z}/{x}/{y}/2/1_1.png", isForecast: forecast)
+                       urlTemplate: "\(raw.host)\(f.path)/256/{z}/{x}/{y}\(smoothedSuffix)", isForecast: forecast)
         }
         return (raw.radar.past.map { frame($0, forecast: false) } + (raw.radar.nowcast ?? []).map { frame($0, forecast: true) })
             .sorted { $0.time < $1.time }
+    }
+
+    public static func isTemplate(_ url: String) -> Bool {
+        url.hasSuffix(smoothedSuffix) || url.hasSuffix(rawSuffix)
+    }
+
+    /// Every RainViewer frame (past and nowcast) uses the same option, so a loop never mixes the two.
+    /// `q >= 0.5` keeps `decode`'s `/2/1_1.png` byte-identical. Other sources are returned unchanged.
+    /// `time` and `isForecast` are unchanged. Idempotent.
+    public static func applying(_ frames: [RadarFrame], q: Double) -> [RadarFrame] {
+        let target = q < 0.5 ? rawSuffix : smoothedSuffix
+        let source = target == rawSuffix ? smoothedSuffix : rawSuffix
+        return frames.map { frame in
+            guard frame.urlTemplate.hasSuffix(source) else { return frame }
+            var copy = frame
+            copy.urlTemplate = String(frame.urlTemplate.dropLast(source.count)) + target
+            return copy
+        }
     }
 }
 

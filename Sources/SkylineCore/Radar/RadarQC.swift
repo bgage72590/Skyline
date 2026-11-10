@@ -73,10 +73,17 @@ public enum RadarQC {
         return (String(s[..<h]), params)
     }
 
+    /// `&sm=N` in the fragment (0…10). Never sent to the server. Nil when the frame has no smoothing tag,
+    /// which renders as today's full smooth (`t = 1`).
+    public static func smoothingLevel(_ raw: String) -> Double? {
+        guard let n = Int(raw), (0...10).contains(n) else { return nil }
+        return Double(n) / 10
+    }
+
     /// Splits a tile URL into the image to download, its QC mask template (`…/{z}/{x}/{y}.png`, the
-    /// fragment had the display tile's numbers substituted in), the display tile and the scan raster
-    /// base (local single-site frames, RidgeRaster).
-    public static func split(_ url: URL) -> (image: URL, maskTemplate: String?, tile: RadarQCMask.TileID?, raster: String?) {
+    /// fragment had the display tile's numbers substituted in), the display tile, the scan raster
+    /// base (local single-site frames, RidgeRaster) and the smoothing level from `&sm=`.
+    public static func split(_ url: URL) -> (image: URL, maskTemplate: String?, tile: RadarQCMask.TileID?, raster: String?, smoothing: Double?) {
         let (base, params) = fragment(url)
         let image = URL(string: base) ?? url
         func zxy(_ u: String) -> (prefix: Substring, tile: RadarQCMask.TileID)? {
@@ -87,7 +94,7 @@ public enum RadarQC {
         }
         let tile = zxy(base)?.tile
         let mask = params[String(fragmentKey.dropLast())].flatMap(zxy).map { String($0.prefix) + "{z}/{x}/{y}.png" }
-        return (image, mask, tile, params["raw"])
+        return (image, mask, tile, params["raw"], params["sm"].flatMap(smoothingLevel))
     }
 
 }

@@ -30,6 +30,12 @@ final class RadarPlayback {
     /// Reflectivity loop, or a rainfall-total overlay (L21, NEXRAD/US only). Not persisted: each launch
     /// starts on the radar.
     private(set) var layer: RadarLayer = .reflectivity
+    /// Smoothing level shared by the compact and expanded maps (0 Raw … 1 smooth). Applied to frames
+    /// in place; a slider move does not reload the index or zero progress.
+    private(set) var smoothing: Double = RadarSmoothing.stored()
+    @ObservationIgnored private var smoothingTask: Task<Void, Never>?
+    /// Level the debounce is already waiting to apply, so a second write of the same notch doesn't restart it.
+    @ObservationIgnored private var pendingSmoothing: Double?
     /// NEXRAD view: nearest site (default), the national composite, or a site the user picked. Persisted.
     private(set) var siteChoice = RadarSiteChoice(stored: UserDefaults.standard.string(forKey: "radarSite"))
     /// The single site being shown (nil: national composite or not NEXRAD).
@@ -244,6 +250,8 @@ final class RadarPlayback {
             if requestedLayer.isRainfallTotal {
                 new = IEMMRMS.frame(requestedLayer, now: Date()).map { [$0] } ?? []
             } else {
+                // The service returns today's URLs. indexUpdate applies the live level before comparing
+                // ids, so a slider move during this fetch is not a second code path and not a reset.
                 var loaded = site == nil ? [] : ((try? await service.radarFrames(requested, range: requestedRange, future: future, site: site, forceRefresh: force)) ?? [])
                 if loaded.isEmpty {
                     loaded = try await service.radarFrames(requested, range: requestedRange, future: future, forceRefresh: force)
@@ -259,16 +267,18 @@ final class RadarPlayback {
                   requestedStation == station else { return }
             loadedAt = Date()
             errorMessage = new.isEmpty ? "No radar frames available." : nil
-            if IEMRidge.isNewestUpgrade(from: frames, to: new) {
-                // CR #7: the newest scan's raster arrived; swap that one frame to smooth in place. The
-                // map keeps the blocky tiles up until the smooth ones are drawn (replace-on-reload).
-                frames = new
-            } else if new.map(\.id) != frames.map(\.id) {
-                let wasAtNow = index >= nowIndex
-                frames = new
-                // Start on "now" (the newest scan), not the end of the forecast.
-                if wasAtNow || !isPlaying { index = nowIndex }
-                index = min(index, max(0, new.count - 1))
+            // Retag / RainViewer option before the upgrade check and the id compare (A4a). A same-level
+            // refresh is not a new set. The masked blocky→smooth case still resets, matching today.
+            switch RadarSmoothing.indexUpdate(current: frames, fetched: new, q: smoothing, index: index, isPlaying: isPlaying) {
+            case .unchanged:
+                break
+            case .upgrade(let next):
+                // CR #7: the newest scan's raster arrived; swap that one frame in place. Index and
+                // progress stay. The map keeps the blocky tiles up until the smooth ones are drawn.
+                frames = next
+            case .reset(let next, let newIndex):
+                frames = next
+                if newIndex != index { index = newIndex }
                 progress = 0
                 progressGate.reset()
             }
@@ -355,6 +365,42 @@ final class RadarPlayback {
     /// Jump the scrubber to the newest observed scan ("Now").
     func jumpToNow() {
         scrub(to: nowIndex)
+    }
+
+    /// Slider moved. The value is stored immediately; frames and the display filter update after a
+    /// short pause so a drag doesn't rebuild every notch. Does not call `loadFrames`.
+    func setSmoothing(_ t: Double) {
+        let q = RadarSmoothing.quantize(t)
+        if UserDefaults.standard.object(forKey: RadarSmoothing.key) as? Double != q {
+            UserDefaults.standard.set(q, forKey: RadarSmoothing.key)
+        }
+        if q == smoothing {
+            // Back on the level already showing: drop a notch that hasn't been applied yet.
+            pendingSmoothing = nil
+            smoothingTask?.cancel()
+            smoothingTask = nil
+            return
+        }
+        if pendingSmoothing == q { return }
+        pendingSmoothing = q
+        smoothingTask?.cancel()
+        smoothingTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(RadarSmoothing.debounceMilliseconds))
+            guard !Task.isCancelled else { return }
+            self?.applySmoothing(q)
+        }
+    }
+
+    /// Applies `q` to the loaded frames in place. No index reload, and index and progress stay put.
+    /// Composite / HRRR / MRMS keep their URLs; the map redraws from `smoothing` alone.
+    func applySmoothing(_ t: Double) {
+        let q = RadarSmoothing.quantize(t)
+        pendingSmoothing = nil
+        smoothingTask = nil
+        if q != smoothing { smoothing = q }
+        guard !frames.isEmpty else { return }
+        let next = RadarLoopState(frames: frames, index: index, progress: progress).withSmoothing(q)
+        if next.frames.map(\.id) != frames.map(\.id) { frames = next.frames }
     }
 
     func setPlaybackSpeed(_ speed: RadarPlaybackSpeed) {

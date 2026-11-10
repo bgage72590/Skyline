@@ -20,6 +20,9 @@ struct RadarMapView: NSViewRepresentable {
     let playback: RadarPlayback
     var center: Coordinate
     var frames: [RadarFrame]
+    /// Applied smoothing (`RadarPlayback.smoothing`), not the live slider thumb. Compact and expanded
+    /// maps share it, so one level is one cache key.
+    var smoothing: Double
     var maxNativeZoom: Int
     var interactive: Bool
     var spanDegrees: Double
@@ -92,6 +95,7 @@ struct RadarMapView: NSViewRepresentable {
         }
         let radar = container.radar
         radar.connect(playback: playback, follows: followsPlayback, reportsProgress: reportsProgress)
+        radar.setSmoothing(smoothing)
         radar.setFrames(frames, maxZ: maxNativeZoom)
         radar.setOpacity(Float(opacity))
         if interactive {
@@ -773,14 +777,18 @@ final class RadarDrawState: @unchecked Sendable {
     /// expanded ahead off the main thread) is expanded, every other held frame stays packed.
     private var expanded: [TileKey: CGImage] = [:]
     private var frameToken: AnyHashable?
+    /// Per committed frame: nearest-neighbour magnification while that tile is enlarged. Under the lock
+    /// because `draw` runs on MapKit's threads. Minification stays linear regardless.
+    private var rawMagnification = false
 
     /// Main thread. `token` identifies the frame (generation + index); expansions are reused within it.
     /// `prebuilt`: images already expanded in the background for this frame.
     /// `expandMissing: false` leaves tiles without a prebuilt image out (returned) for the caller to
     /// expand in the background: the off-screen ring around a frame prepared ahead (build 48, M2).
+    /// `nearest` is stored with the tiles so a draw can't see one without the other.
     @discardableResult
     func set(_ new: [TileKey: RadarTile], zoom: Int, token: AnyHashable, prebuilt: [TileKey: CGImage]? = nil,
-             expandMissing: Bool = true) -> [TileKey: RadarTile] {
+             expandMissing: Bool = true, nearest: Bool? = nil) -> [TileKey: RadarTile] {
         if token != frameToken { expanded = prebuilt ?? [:]; frameToken = token }
         else if let prebuilt { expanded.merge(prebuilt) { old, _ in old } }
         expanded = expanded.filter { new[$0.key] != nil }
@@ -789,13 +797,21 @@ final class RadarDrawState: @unchecked Sendable {
             if expandMissing { expanded[key] = tile.image() } else { missing[key] = tile }
         }
         let ordered = RadarPolicy.drawOrder(Array(expanded.keys), currentZoom: zoom).map { ($0, expanded[$0]!) }
-        lock.lock(); tiles = ordered; lock.unlock()
+        lock.lock()
+        tiles = ordered
+        if let nearest { rawMagnification = nearest }
+        lock.unlock()
         return missing
     }
     var token: AnyHashable? { frameToken }
-    func clear() { expanded = [:]; frameToken = nil; lock.lock(); tiles = []; lock.unlock() }
+    func clear() { expanded = [:]; frameToken = nil; lock.lock(); tiles = []; rawMagnification = false; lock.unlock() }
     /// What the renderer draws: the frame on screen, or nothing while hidden behind the crossfade copies.
-    func snapshot() -> [(TileKey, CGImage)] { lock.lock(); defer { lock.unlock() }; return hidden ? [] : tiles }
+    func snapshot() -> (tiles: [(TileKey, CGImage)], nearest: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        return (hidden ? [] : tiles, rawMagnification)
+    }
+    var prefersNearest: Bool { lock.lock(); defer { lock.unlock() }; return rawMagnification }
+    func setPrefersNearest(_ value: Bool) { lock.lock(); rawMagnification = value; lock.unlock() }
     /// The frame's tiles even while hidden (for the copies).
     func drawable() -> [(TileKey, CGImage)] { lock.lock(); defer { lock.unlock() }; return tiles }
     var isHidden: Bool { lock.lock(); defer { lock.unlock() }; return hidden }
@@ -815,15 +831,20 @@ final class RadarOverlayRenderer: MKOverlayRenderer {
     }
 
     override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in context: CGContext) {
-        let tiles = state.snapshot()
+        let snap = state.snapshot()
         defer { state.noteDraw() }
-        guard !tiles.isEmpty else { return }
-        context.interpolationQuality = .medium
-        for (key, image) in tiles {
+        guard !snap.tiles.isEmpty else { return }
+        for (key, image) in snap.tiles {
             let r = TileMath.rect(key)
             let tileRect = MKMapRect(x: r.x, y: r.y, width: r.width, height: r.height)
             guard tileRect.intersects(mapRect) else { continue }
             let cg = rect(for: tileRect)
+            // One context quality covers both directions. `.none` only when this tile is magnified, so
+            // zooming out (and a higher-zoom placeholder drawn small) stays smooth and doesn't shimmer.
+            let transform = context.ctm
+            let scale = hypot(transform.a, transform.c)
+            let magnified = abs(cg.width * scale) > CGFloat(image.width) + 0.5
+            context.interpolationQuality = (snap.nearest && magnified) ? .none : .medium
             context.saveGState()
             // MapKit's context is y-down; CGImage draws y-up.
             context.translateBy(x: cg.minX, y: cg.maxY)
@@ -890,6 +911,10 @@ final class RadarLayerView: NSView {
     private var keep: Set<TileKey> = []
     private var index = 0
     private var opacity: Float = Float(RadarOpacity.defaultValue)
+    /// Level the slider has settled on. `shownSmoothing` is the level of the frame on screen; it lags
+    /// while a new local or RainViewer generation is loading so raw pixels aren't blurred in the meantime.
+    private var targetSmoothing = RadarSmoothing.defaultValue
+    private var shownSmoothing = RadarSmoothing.defaultValue
     private var retryObserver: NSObjectProtocol?
 
     private weak var playback: RadarPlayback?
@@ -1013,6 +1038,33 @@ final class RadarLayerView: NSView {
         showTarget(animated: animated)
     }
 
+    /// Applied smoothing from playback. URL changes wait for the pending generation (the old frame stays).
+    /// A level that doesn't change URLs (composite, HRRR, MRMS, RainViewer between 0 and 0.5) redraws now.
+    func setSmoothing(_ q: Double) {
+        let quantized = RadarSmoothing.quantize(q)
+        guard quantized != targetSmoothing else { return }
+        targetSmoothing = quantized
+        guard let frames = active?.frames, !frames.isEmpty,
+              RadarSmoothing.applying(frames, q: quantized).map(\.id) != frames.map(\.id) else {
+            shownSmoothing = quantized
+            applyShownFilter()
+            return
+        }
+    }
+
+    private func filterIsRaw(_ frame: RadarFrame) -> Bool {
+        RadarSmoothing.displayFilter(q: shownSmoothing, frame: frame, layer: playback?.layer ?? .reflectivity) == .raw
+    }
+
+    /// Redraw the frame on screen and any live fade copies with this frame's filter.
+    private func applyShownFilter() {
+        if let g = active, let i = shownFrame, g.frames.indices.contains(i) {
+            states[0].setPrefersNearest(filterIsRaw(g.frames[i]))
+        }
+        reapplyCopyFilters()
+        renderers[0]?.setNeedsDisplay()
+    }
+
     func setOpacity(_ value: Float) {
         guard value != opacity else { return }
         opacity = value
@@ -1093,10 +1145,11 @@ final class RadarLayerView: NSView {
         // A1a: `isPlaying` covers every transition, including the latest/now holds. Nil playback
         // (no loop) still fades when the caller asked for one.
         let fadeNow = animated && playback?.isPlaying != true
+        let outgoingFrame: RadarFrame? = shownFrame.flatMap { g.frames.indices.contains($0) ? g.frames[$0] : nil }
         fade.show(target, at: CACurrentMediaTime(), animated: fadeNow)
         shownFrame = target
         if fadeNow, onScreen, Self.crossfadeEnabled, let map, bounds.width > 1 {
-            startFade(g, target, token: token, images: images, visible: map.visibleMapRect)
+            startFade(g, target, token: token, images: images, visible: map.visibleMapRect, outgoing: outgoingFrame)
         } else {
             if fadeLayers.isEmpty {
                 commit(g, target, token: token, images: images)
@@ -1126,8 +1179,10 @@ final class RadarLayerView: NSView {
     private var incoming: (token: AnyHashable, layer: CALayer, images: [TileKey: CGImage])?
     private var fadeSerial = 0
 
-    private func copyLayer(_ tiles: [(TileKey, CGImage)], visible v: MKMapRect) -> CALayer {
-        let group = CALayer()
+    private func copyLayer(_ tiles: [(TileKey, CGImage)], visible v: MKMapRect, frame: RadarFrame?, nearest: Bool) -> FrameCopy {
+        let group = FrameCopy()
+        group.radarFrame = frame
+        group.nearest = nearest
         group.frame = bounds
         group.actions = Self.noActions
         group.allowsGroupOpacity = false
@@ -1137,6 +1192,21 @@ final class RadarLayerView: NSView {
         let reach = bounds.insetBy(dx: -bounds.width, dy: -bounds.height)
         for (key, image) in tiles where tileFrame(key, visible: v).intersects(reach) { addTileLayer(key, image, to: group, visible: v) }
         return group
+    }
+
+    /// Each copy keeps its own frame, so an observed tile can be Raw while the HRRR copy stays smooth.
+    private func reapplyCopyFilters() {
+        guard !fadeLayers.isEmpty else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for case let group as FrameCopy in fadeLayers {
+            if let frame = group.radarFrame { group.nearest = filterIsRaw(frame) }
+            for case let tile as TileLayer in group.sublayers ?? [] {
+                tile.magnificationFilter = group.nearest ? .nearest : .linear
+                tile.minificationFilter = .linear
+            }
+        }
+        CATransaction.commit()
     }
 
     /// Review L5: the copies drop tiles the frame no longer has (pruned), releasing their CGImages
@@ -1170,7 +1240,10 @@ final class RadarLayerView: NSView {
         tile.actions = Self.noActions
         tile.contents = image
         tile.contentsGravity = .resize
-        tile.magnificationFilter = .linear
+        // Minification stays linear at every level (no shimmer when zoomed out). Magnification follows
+        // the frame: nearest only for a Raw observed / RainViewer frame.
+        let nearest = (group as? FrameCopy)?.nearest ?? states[0].prefersNearest
+        tile.magnificationFilter = nearest ? .nearest : .linear
         tile.minificationFilter = .linear
         tile.frame = tileFrame(key, visible: v)
         tile.opacity = opacity
@@ -1178,6 +1251,10 @@ final class RadarLayerView: NSView {
     }
 
     private final class TileLayer: CALayer { var key: TileKey? }
+    private final class FrameCopy: CALayer {
+        var radarFrame: RadarFrame?
+        var nearest = false
+    }
 
     /// Re-places the copies for the map's current region and size (pan, zoom, resize mid-fade).
     private func relayoutCopies() {
@@ -1207,15 +1284,16 @@ final class RadarLayerView: NSView {
         return anim
     }
 
-    private func startFade(_ g: Generation, _ target: Int, token: AnyHashable, images: [TileKey: CGImage], visible v: MKMapRect) {
+    private func startFade(_ g: Generation, _ target: Int, token: AnyHashable, images: [TileKey: CGImage], visible v: MKMapRect, outgoing: RadarFrame?) {
         guard let host = layer else { return }
         // The old frame as MapKit has it (a switch mid-fade starts from the frame being faded in).
         let old = states[0].drawable()
         removeCopies()
         fadeSerial += 1
         let serial = fadeSerial
-        let out = copyLayer(old, visible: v)
-        let inc = copyLayer(ordered(images), visible: v)
+        let incomingFrame = g.frames.indices.contains(target) ? g.frames[target] : nil
+        let out = copyLayer(old, visible: v, frame: outgoing, nearest: states[0].prefersNearest)
+        let inc = copyLayer(ordered(images), visible: v, frame: incomingFrame, nearest: incomingFrame.map(filterIsRaw) ?? false)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         // Model values at the start values: if an animation isn't applied on the first displayed frame,
@@ -1297,7 +1375,8 @@ final class RadarLayerView: NSView {
                         redraw: Bool = true) {
         if !hidden, redraw, incoming?.token == token { incoming = nil }
         states[0].setHidden(hidden)
-        let ring = states[0].set(g.tiles[i], zoom: zoom, token: token, prebuilt: images, expandMissing: false)
+        let nearest = g.frames.indices.contains(i) && filterIsRaw(g.frames[i])
+        let ring = states[0].set(g.tiles[i], zoom: zoom, token: token, prebuilt: images, expandMissing: false, nearest: nearest)
         if redraw { renderers[0]?.setNeedsDisplay() }
         expandInBackground(ring, g, i, token: token)
     }
@@ -1605,6 +1684,8 @@ final class RadarLayerView: NSView {
         // A1b: a new scan or newest-frame upgrade bypasses `RadarPlayback.crossfade`. While the
         // loop is playing the swap is a hard cut; when it is not, one fade then the hand-back.
         let wasShowing = shownFrame != nil && !states[0].drawable().isEmpty
+        // The new generation was rendered at the level the slider settled on.
+        shownSmoothing = targetSmoothing
         active = p
         pending = nil
         dropAhead()
@@ -1634,8 +1715,20 @@ final class RadarLayerView: NSView {
         }
     }
 
+    /// Same times and forecast flags: a smoothing change or the newest-scan upgrade. Keep reporting the
+    /// playing set so `progress` doesn't drop and the clock doesn't pause (R3-3). A new scan has different
+    /// times and still waits on the pending set.
+    private func progressGeneration() -> Generation? {
+        if let pending, let active, !active.frames.isEmpty,
+           pending.frames.count == active.frames.count,
+           zip(pending.frames, active.frames).allSatisfy({ $0.time == $1.time && $0.isForecast == $1.isForecast }) {
+            return active
+        }
+        return pending ?? active
+    }
+
     private func currentProgress() -> Double {
-        guard let g = pending ?? active, !g.frames.isEmpty, !desired.isEmpty else { return 0 }
+        guard let g = progressGeneration(), !g.frames.isEmpty, !desired.isEmpty else { return 0 }
         let needed = neededFrames(g)
         var resolved = 0
         for i in needed {

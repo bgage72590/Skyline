@@ -48,6 +48,59 @@ struct RidgeRasterTests {
         #expect(e.sample(lon: 0.6, lat: 0) == nil)
     }
 
+    /// The default argument is `t: 1`, so this only checks that the explicit argument takes that path.
+    /// Base output is pinned by `renderTileFullSmoothMatchesBaseDigest`.
+    @Test func renderTileDefaultCallMatchesExplicitFullSmooth() throws {
+        let r = try Self.raster()
+        for (z, x, y) in [(10, 307, 383), (9, 153, 191), (8, 76, 95)] {
+            #expect(r.renderTile(z: z, x: x, y: y, t: 1) == r.renderTile(z: z, x: x, y: y))
+            #expect(r.sample(lon: r.lon0, lat: r.lat0, t: 1) == r.sample(lon: r.lon0, lat: r.lat0))
+        }
+    }
+
+    /// A4b: full smooth matches the base render. Digests were taken at `00f7e028` (FNV-1a-64 over
+    /// z6–z11, 9 tiles each) on a synthetic raster, so this runs without the palette PNG.
+    @Test func renderTileFullSmoothMatchesBaseDigest() {
+        var rng: UInt64 = 0x9E3779B97F4A7C15
+        func next() -> UInt64 { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng }
+        let w = 120, h = 100
+        var idx = [UInt8](repeating: 0, count: w * h)
+        for i in 0..<idx.count {
+            let roll = next() % 100
+            idx[i] = roll < 45 ? 0 : UInt8(2 + next() % 200)
+        }
+        let raster = RidgeRaster(width: w, height: h, indices: idx,
+                                 palette: (0..<256).map { (UInt8($0), UInt8(255 - $0), UInt8($0 / 2)) },
+                                 lon0: -98.6, lat0: 36.0, dLon: 0.01, dLat: -0.01)
+        let plain = Self.tileDigest(raster, explicit: false)
+        let full = Self.tileDigest(raster, explicit: true)
+        #expect(plain.hash == 0x7ecc24932c8e431e && plain.nonzero == 3_170_464)
+        #expect(full.hash == 0x7ecc24932c8e431e && full.nonzero == 3_170_464)
+    }
+
+    /// FNV-1a-64 over the same tiles the base probe hashed. `explicit` passes `t: 1`; otherwise the default.
+    private static func tileDigest(_ raster: RidgeRaster, explicit: Bool) -> (hash: UInt64, nonzero: Int) {
+        var acc: UInt64 = 1469598103934665603
+        var nonzero = 0
+        for z in [6, 7, 8, 9, 10, 11] {
+            let n = pow(2.0, Double(z))
+            let x = Int((-98.0 + 180) / 360 * n)
+            let latR = 35.5 * Double.pi / 180
+            let y = Int((1 - log(tan(latR) + 1 / cos(latR)) / Double.pi) / 2 * n)
+            for dx in -1...1 {
+                for dy in -1...1 {
+                    let px = explicit ? raster.renderTile(z: z, x: x + dx, y: y + dy, t: 1)
+                                      : raster.renderTile(z: z, x: x + dx, y: y + dy)
+                    for b in px {
+                        acc = (acc ^ UInt64(b)) &* 1099511628211
+                        if b != 0 { nonzero += 1 }
+                    }
+                }
+            }
+        }
+        return (acc, nonzero)
+    }
+
     static func rgb(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> Int { Int(r) << 16 | Int(g) << 8 | Int(b) }
     static func usedColours(_ px: [UInt8]) -> Set<Int> {
         var out = Set<Int>()

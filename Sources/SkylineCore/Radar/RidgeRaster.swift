@@ -63,16 +63,16 @@ public struct RidgeRaster: Sendable {
         return true
     }
 
-    /// Smoothed palette index at a point, or nil for no echo. Bilinear over the 4 surrounding cells,
-    /// averaging only cells with echo (no halo), drawn where those cover at least half. Near a local-max
-    /// cell's centre the full peak value is kept, so every core reaches its raw maximum.
-    public func sample(lon: Double, lat: Double) -> UInt8? {
-        sampleEcho(lon: lon, lat: lat)?.level
+    /// Palette index at a point, or nil for no echo. `t` is the quantized smoothing level (default 1,
+    /// today's bilinear path). The peak check runs first at every `t`.
+    public func sample(lon: Double, lat: Double, t: Double = 1) -> UInt8? {
+        sampleEcho(lon: lon, lat: lat, t: t)?.level
     }
 
-    /// The smoothed level plus how much of the neighbourhood is echo (1 at a kept core). Nil outside the
-    /// ≥ ½ contour, so the drawn footprint matches `sample`.
-    public func sampleEcho(lon: Double, lat: Double) -> (level: UInt8, cover: Double)? {
+    /// Level plus the cover passed to `echoAlpha` (1 at a kept core). `t >= 1` is today's path:
+    /// echo-only bilinear, drawn where cover is at least half. Below that, the footprint, level and
+    /// alpha follow the smoothing rule (nearest echo under 0.5, coverage contour at 0.5 and up).
+    public func sampleEcho(lon: Double, lat: Double, t: Double = 1) -> (level: UInt8, cover: Double)? {
         let fc = (lon - lon0) / dLon, fr = (lat - lat0) / dLat
         guard fc > -1, fr > -1, fc < Double(width), fr < Double(height) else { return nil }
         let c0 = Int(fc.rounded(.down)), r0 = Int(fr.rounded(.down))
@@ -84,13 +84,31 @@ public struct RidgeRaster: Sendable {
             sum += Double(v) * w; cover += w
         }
         // Peak: the nearest cell, when it is a local maximum and the point is close to its centre.
+        // Unchanged at every t, so a core still reaches its raw maximum.
         let nr = Int(fr.rounded()), nc = Int(fc.rounded())
         if let v = echo(nr, nc), (fr - Double(nr)) * (fr - Double(nr)) + (fc - Double(nc)) * (fc - Double(nc)) <= Self.peakRadius * Self.peakRadius,
            isPeak(nr, nc, v) {
             return (v, 1)
         }
-        guard cover >= 0.5 else { return nil }
-        return (UInt8(min(255, (sum / cover).rounded())), cover)
+        // t = 1 is today's render, byte-identical: ≥ ½ contour, echo-only bilinear, raw cover.
+        if t >= 1 {
+            guard cover >= 0.5 else { return nil }
+            return (UInt8(min(255, (sum / cover).rounded())), cover)
+        }
+        let q = t <= 0 ? 0 : t
+        let nearest = echo(nr, nc)
+        let draws = q < 0.5 ? nearest != nil : cover >= 0.5
+        guard draws else { return nil }
+        let bilinear = cover > 0 ? sum / cover : nil
+        let level: Double
+        switch (nearest.map(Double.init), bilinear) {
+        case let (n?, b?): level = (1 - q) * n + q * b
+        case let (n?, nil): level = n
+        case let (nil, b?): level = b
+        default: return nil
+        }
+        let alphaCover = q == 0 ? 1 : (1 - q) + q * cover
+        return (UInt8(min(255, max(0, level.rounded()))), alphaCover)
     }
 
     /// Interior alpha for echo at or below 0 dBZ: 160/255 ≈ 63% of an opaque core, so the weakest bin
@@ -117,7 +135,8 @@ public struct RidgeRaster: Sendable {
 
     /// Straight RGBA for Web Mercator tile z/x/y, 256². RGB is the IEM palette entry for that bin
     /// (the legend colour), never scaled by alpha. Alpha follows `echoAlpha`.
-    public func renderTile(z: Int, x: Int, y: Int, size: Int = 256) -> [UInt8] {
+    /// `t` defaults to 1 (today's smooth tile). Callers pass the quantized level from `&sm=`.
+    public func renderTile(z: Int, x: Int, y: Int, size: Int = 256, t: Double = 1) -> [UInt8] {
         var out = [UInt8](repeating: 0, count: size * size * 4)
         guard (0...22).contains(z) else { return out }
         let n = pow(2.0, Double(z))
@@ -128,7 +147,7 @@ public struct RidgeRaster: Sendable {
             let fr = (lat - lat0) / dLat
             if fr < -1 || fr > Double(height) { continue }
             for px in 0..<size {
-                guard let s = sampleEcho(lon: lons[px], lat: lat), Int(s.level) < palette.count else { continue }
+                guard let s = sampleEcho(lon: lons[px], lat: lat, t: t), Int(s.level) < palette.count else { continue }
                 let c = palette[Int(s.level)], a = Self.echoAlpha(level: Int(s.level), cover: s.cover)
                 guard a > 0 else { continue }
                 let p = (py * size + px) * 4
