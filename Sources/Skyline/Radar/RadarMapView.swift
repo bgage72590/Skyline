@@ -749,7 +749,9 @@ final class PinView: NSView {
 
 /// The radar as one world-sized MapKit overlay (build 35) whose renderer paints the shown frame's
 /// decoded tiles, so MapKit draws the radar in the same render pass as the base map (no lag or edge pop
-/// while panning). Crossfades are Core Animation copies on top (RadarLayerView.startFade).
+/// while panning). The overlay is `.aboveRoads`: rain covers roadways, and Apple's city labels and road
+/// shields draw above it. While the loop plays, frames hard-cut in MapKit. Crossfade copies
+/// (`startFade`) run only when it is not playing, and each fade hands the frame back when it ends.
 final class RadarOverlay: NSObject, MKOverlay {
     // Centre of the world rect (review L6); not an annotation and never geocoded.
     let coordinate = MKMapPoint(x: MKMapRect.world.midX, y: MKMapRect.world.midY).coordinate
@@ -917,7 +919,8 @@ final class RadarLayerView: NSView {
 
     private func attachOverlays() {
         guard let map else { return }
-        if !map.overlays.contains(where: { $0 === overlay }) { map.addOverlay(overlay, level: .aboveLabels) }
+        // Above roadways, below city labels and road shields. Roads stay under the rain.
+        if !map.overlays.contains(where: { $0 === overlay }) { map.addOverlay(overlay, level: .aboveRoads) }
     }
 
     func isRadarOverlay(_ overlay: any MKOverlay) -> Bool { overlay === self.overlay }
@@ -1044,11 +1047,15 @@ final class RadarLayerView: NSView {
 
     private func shownIndex(_ g: Generation) -> Int { min(max(index, 0), max(g.frames.count - 1, 0)) }
 
-    // MARK: Showing frames (crossfade, never a mix of two frames)
+    // MARK: Showing frames
+    // Playing, including steps into and out of the latest/now holds: hard cut in MapKit, no copies,
+    // so city labels stay above the rain the whole time. Not playing: 0.35 s crossfade, then hand
+    // the frame back so labels finish on top.
 
     /// Shows the playback's frame once every on-screen tile of it is resolved (or after
     /// `RadarPolicy.incompleteTimeout`); until then the previous frame stays on screen. Frames come
-    /// expanded from a background queue; animated switches crossfade (`startFade`).
+    /// expanded from a background queue. `animated` crossfades (`startFade`) only while the loop is
+    /// not playing; a playing loop hard-cuts on this renderer.
     private func showTarget(animated: Bool) {
         guard let g = active, !g.frames.isEmpty else {
             cancelFade()
@@ -1083,9 +1090,12 @@ final class RadarLayerView: NSView {
             }
             return
         }
-        fade.show(target, at: CACurrentMediaTime(), animated: animated)
+        // A1a: `isPlaying` covers every transition, including the latest/now holds. Nil playback
+        // (no loop) still fades when the caller asked for one.
+        let fadeNow = animated && playback?.isPlaying != true
+        fade.show(target, at: CACurrentMediaTime(), animated: fadeNow)
         shownFrame = target
-        if animated, onScreen, Self.crossfadeEnabled, let map, bounds.width > 1 {
+        if fadeNow, onScreen, Self.crossfadeEnabled, let map, bounds.width > 1 {
             startFade(g, target, token: token, images: images, visible: map.visibleMapRect)
         } else {
             if fadeLayers.isEmpty {
@@ -1104,10 +1114,11 @@ final class RadarLayerView: NSView {
     // MARK: Simultaneous crossfade (build 52, reviews M1 / QA X1)
 
     /// Old and new frames as Core Animation copies on top of the map: old 1→0 and new 0→1 together over
-    /// 0.35 s (GPU only), so the radar is never two frames at full strength and never snaps back.
+    /// 0.35 s (GPU only), so a paused fade is never two frames at full strength and never snaps back.
     /// MapKit gets the new frame at the start but is told to draw nothing under the copies while they
-    /// fade; at the end it draws the new frame again and the copies go only once it has actually drawn
-    /// (review H1: the copies always cover until then, so the radar never goes blank). During a pan or
+    /// fade. When the fade timer ends, the outgoing copy goes and `revealRenderer` hands the frame
+    /// back: the copies stay until MapKit has drawn (review H1), so labels finish above the rain and
+    /// the radar never goes blank. That hand-back runs for every fade that completes. During a pan or
     /// resize the copies follow the map.
     private var fadeLayers: [CALayer] = []
     private var waitTarget: (token: AnyHashable, since: CFTimeInterval)?
@@ -1237,14 +1248,14 @@ final class RadarLayerView: NSView {
         hideWhenCopiesShow(inc, serial: serial, started: CACurrentMediaTime())
         DispatchQueue.main.asyncAfter(deadline: .now() + RadarCrossfade.duration + 0.02) { [weak self, weak out] in
             guard let self, self.fadeSerial == serial, let out else { return }
-            // The new frame stays on screen as its copy (MapKit still hidden) until the map moves: no
-            // hand-back during playback, so no moment with both or neither drawn.
+            // Every fade that completes hands the frame back (A1b), not only a pan. The incoming
+            // copy stays until MapKit has drawn (H1); the ~100 ms overlap matches a pan hand-back.
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             out.removeFromSuperlayer()
             CATransaction.commit()
             self.fadeLayers.removeAll { $0 === out }
-            self.fade.finish()
+            self.revealRenderer(serial: serial)
         }
     }
 
@@ -1591,15 +1602,14 @@ final class RadarLayerView: NSView {
     private func promotePendingIfReady() {
         guard let p = pending, p.isComplete(shownIndex(p), desired: desired) else { return }
         // Swap: the old set is released here, then the new one fills the rest of its loop.
-        // QA P2: a new scan mid-playback used to be a hard cut (shownFrame = nil, unanimated). With a frame
-        // on screen it now crossfades like any step: the old generation's tiles are still in MapKit's
-        // state (and its copy), so `startFade` fades from them to the new generation's frame.
+        // A1b: a new scan or newest-frame upgrade bypasses `RadarPlayback.crossfade`. While the
+        // loop is playing the swap is a hard cut; when it is not, one fade then the hand-back.
         let wasShowing = shownFrame != nil && !states[0].drawable().isEmpty
         active = p
         pending = nil
         dropAhead()
         shownFrame = nil
-        showTarget(animated: wasShowing)
+        showTarget(animated: wasShowing && playback?.isPlaying != true)
         updateTilesSoon()
     }
 
