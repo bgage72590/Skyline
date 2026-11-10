@@ -40,7 +40,8 @@ struct RadarQCTests {
         #expect(RadarQC.masked(out, latestMask: latest) == out)
         // The image half goes to the server without the fragment; the mask comes back as a template.
         let url = okx.url(z: 8, x: 75, y: 95)!
-        let (image, mask, tile, _) = RadarQC.split(url)
+        let split = RadarQC.split(url)
+        let (image, mask, tile) = (split.image, split.maskTemplate, split.tile)
         #expect(image.absoluteString == "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/ridge::OKX-N0B-202610161719/8/75/95.png")
         #expect(mask == "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/mrms::lcref-202610161718/{z}/{x}/{y}.png")
         #expect(tile == .init(z: 8, x: 75, y: 95))

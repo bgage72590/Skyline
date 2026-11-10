@@ -48,6 +48,15 @@ struct RidgeRasterTests {
         #expect(e.sample(lon: 0.6, lat: 0) == nil)
     }
 
+    @Test func renderTileAtFullSmoothIsByteIdentical() throws {
+        let r = try Self.raster()
+        for (z, x, y) in [(10, 307, 383), (9, 153, 191), (8, 76, 95)] {
+            let base = r.renderTile(z: z, x: x, y: y)
+            #expect(r.renderTile(z: z, x: x, y: y, t: 1) == base)
+            #expect(r.sample(lon: r.lon0, lat: r.lat0, t: 1) == r.sample(lon: r.lon0, lat: r.lat0))
+        }
+    }
+
     static func rgb(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> Int { Int(r) << 16 | Int(g) << 8 | Int(b) }
     static func usedColours(_ px: [UInt8]) -> Set<Int> {
         var out = Set<Int>()

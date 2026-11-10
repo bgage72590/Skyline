@@ -289,7 +289,7 @@ final class RadarImageCache {
     nonisolated private static func fetchDecoded(session: URLSession, url: URL, masks: RadarQCMaskStore,
                                                  rasters: RidgeRasterStore) async -> Outcome {
         // False-green fix: a NEXRAD tile may carry an MRMS QC mask in its fragment (RadarQC).
-        let (imageURL, maskTemplate, tile, rasterBase) = RadarQC.split(url)
+        let (imageURL, maskTemplate, tile, rasterBase, smoothing) = RadarQC.split(url)
         // Item 4: local-site frames render smoothly from the scan raster; IEM's tile is the fallback.
         if let rasterBase, let tile {
             // CR #7.6: a frame that renders smooth never falls back to blocky tiles (no mixed loop): if
@@ -300,7 +300,7 @@ final class RadarImageCache {
             } else { nil }
             let wantsMask = maskTemplate != nil
             let rendered: RadarTile? = await onDecodeQueue {
-                var px = raster.renderTile(z: tile.z, x: tile.x, y: tile.y)
+                var px = raster.renderTile(z: tile.z, x: tile.x, y: tile.y, t: smoothing ?? 1)
                 // Straight legend RGB. Scale alpha only; RadarQC.image premultiplies once for Quartz.
                 if let mask { RadarQCMask.apply(rgba: &px, tile: tile, mask: mask, straightAlpha: true) }
                 guard px.contains(where: { $0 != 0 }) else { return nil }
