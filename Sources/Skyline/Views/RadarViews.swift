@@ -442,7 +442,12 @@ struct RadarSmoothingControl: View {
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 2) {
-            Text("Radar smoothing").font(.caption2.weight(.semibold)).opacity(0.75)
+            HStack(spacing: 6) {
+                Text("Radar smoothing").font(.caption2.weight(.semibold)).opacity(0.75)
+                Text(valueLabel)
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .frame(width: 56, alignment: .trailing)
+            }
             HStack(spacing: 6) {
                 Text("Raw")
                     .font(.caption2.weight(.semibold))
@@ -451,9 +456,9 @@ struct RadarSmoothingControl: View {
                     .controlSize(.small)
                     .accessibilityLabel(RadarSmoothing.accessibilityLabel)
                     .accessibilityValue(valueLabel)
-                Text(valueLabel)
-                    .font(.caption.monospacedDigit().weight(.semibold))
-                    .frame(width: 56, alignment: .trailing)
+                Text("Smooth")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Glass.secondaryText)
             }
             .frame(width: 280)
         }
