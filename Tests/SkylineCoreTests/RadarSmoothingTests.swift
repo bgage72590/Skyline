@@ -46,7 +46,7 @@ struct RadarSmoothingTests {
 
     @Test func helpAndAccessibility() {
         #expect(RadarSmoothing.accessibilityLabel == "Radar smoothing")
-        #expect(RadarSmoothing.help == "Raw → Smooth (local radar). National composite: Raw at 0, smooth above 0.")
+        #expect(RadarSmoothing.help == "Raw → Smooth (local radar and RainViewer). National composite: Raw at 0, smooth above 0.")
         #expect(RadarSmoothing.accessibilityValue(0) == "Raw")
         #expect(RadarSmoothing.accessibilityValue(0.04) == "Raw")
         #expect(RadarSmoothing.accessibilityValue(1) == "Smooth")

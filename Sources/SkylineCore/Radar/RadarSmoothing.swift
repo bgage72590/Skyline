@@ -17,7 +17,7 @@ public enum RadarSmoothing {
     public static let debounceMilliseconds = 90
     public static let accessibilityLabel = "Radar smoothing"
     /// Shown as the slider's help, including the composite's two looks.
-    public static let help = "Raw → Smooth (local radar). National composite: Raw at 0, smooth above 0."
+    public static let help = "Raw → Smooth (local radar and RainViewer). National composite: Raw at 0, smooth above 0."
 
     /// `.smooth` is today's pair: `CGContext` interpolation `.medium` and layer magnification `.linear`.
     /// `.raw` is `.none` / `.nearest`, and the context uses it only while that tile is magnified.
