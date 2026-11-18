@@ -105,28 +105,32 @@ final class BlendingTests: XCTestCase {
     }
 
     func testHourlyPrecipitationIconMinPoP() {
-        XCTAssertEqual(ForecastBlender.hourlyPrecipitationIconMinPoP, 40)
-        // Dry code + 54 % + 0 mm promotes (no amount gate; Brian's 8 PM case).
+        XCTAssertEqual(ForecastBlender.hourlyPrecipitationIconMinPoP, 35)
+        // Dry code + 54 % + 0 mm + nil lead promotes (no amount gate; Brian's 8 PM case).
         let promoted = ForecastBlender.reconcile(code: 3, precipitationProbability: 54, precipitation: 0, temperature: 10)
         XCTAssertTrue(WeatherCondition(wmoCode: promoted).isPrecipitation, "pop 54 with 0 mm promotes a dry code")
         XCTAssertEqual(promoted, 61)
         // Just under the floor stays dry no matter the amount.
-        let below = ForecastBlender.reconcile(code: 3, precipitationProbability: 39, precipitation: 2, temperature: 10)
+        let below = ForecastBlender.reconcile(code: 3, precipitationProbability: 34, precipitation: 2, temperature: 10)
         XCTAssertEqual(below, 3)
         XCTAssertFalse(WeatherCondition(wmoCode: below).isPrecipitation)
         // 50 % with a trace amount still promotes.
         let trace = ForecastBlender.reconcile(code: 3, precipitationProbability: 50, precipitation: 0.19, temperature: 10)
         XCTAssertTrue(WeatherCondition(wmoCode: trace).isPrecipitation)
         XCTAssertEqual(trace, 61)
+        // Dry code + pop 35 + 0 mm + nil lead promotes to 61.
+        let atFloor = ForecastBlender.reconcile(code: 3, precipitationProbability: 35, precipitation: 0, temperature: 10)
+        XCTAssertTrue(WeatherCondition(wmoCode: atFloor).isPrecipitation, "pop 35 with 0 mm and nil lead promotes a dry code")
+        XCTAssertEqual(atFloor, 61)
     }
 
-    /// NT1+NT2: lead ≤ 3 h does not promote a dry icon on PoP ≥ 40 alone.
+    /// NT1+NT2: lead ≤ 3 h does not promote a dry icon on PoP ≥ 35 alone.
     /// Amount ≥ 0.2 mm or an affirmed radar echo does. Lead > 3 h stays on the PoP-only rule.
     func testNearTermPrecipIconGate() {
         XCTAssertEqual(ForecastBlender.nearTermPrecipIconMaxLeadHours, 3)
         XCTAssertEqual(ForecastBlender.nearTermPrecipIconMinAmount, 0.2)
 
-        // ≤3h + pop≥40 + amount 0 + no echo → stay dry.
+        // ≤3h + pop≥35 + amount 0 + no echo → stay dry.
         let blocked = ForecastBlender.reconcile(code: 3, precipitationProbability: 54, precipitation: 0,
                                                 temperature: 10, leadHours: 1, radarEchoNearPin: nil)
         XCTAssertEqual(blocked, 3)
@@ -155,19 +159,37 @@ final class BlendingTests: XCTestCase {
         XCTAssertEqual(noEcho, 3)
 
         // Still under the PoP floor, even with amount.
-        let underPop = ForecastBlender.reconcile(code: 3, precipitationProbability: 39, precipitation: 2,
+        let underPop = ForecastBlender.reconcile(code: 3, precipitationProbability: 34, precipitation: 2,
                                                  temperature: 10, leadHours: 1)
         XCTAssertEqual(underPop, 3)
         XCTAssertFalse(WeatherCondition(wmoCode: underPop).isPrecipitation)
 
-        // Lead > 3 preserves PR #33: PoP ≥ 40 promotes with 0 mm.
+        // Lead > 3 preserves PR #33: PoP ≥ 35 promotes with 0 mm.
         let longer = ForecastBlender.reconcile(code: 3, precipitationProbability: 54, precipitation: 0,
                                                temperature: 10, leadHours: 4)
         XCTAssertEqual(longer, 61)
         XCTAssertTrue(WeatherCondition(wmoCode: longer).isPrecipitation)
+
+        // ≤3h + pop 35 + 0 mm + no echo stays dry.
+        let floorBlocked = ForecastBlender.reconcile(code: 3, precipitationProbability: 35, precipitation: 0,
+                                                     temperature: 10, leadHours: 1, radarEchoNearPin: false)
+        XCTAssertEqual(floorBlocked, 3)
+        XCTAssertFalse(WeatherCondition(wmoCode: floorBlocked).isPrecipitation)
+
+        // ≤3h + pop 35 + 0.2 mm promotes to 61.
+        let floorAmount = ForecastBlender.reconcile(code: 3, precipitationProbability: 35, precipitation: 0.2,
+                                                    temperature: 10, leadHours: 2)
+        XCTAssertEqual(floorAmount, 61)
+        XCTAssertTrue(WeatherCondition(wmoCode: floorAmount).isPrecipitation)
+
+        // Lead 4h + pop 35 + 0 mm promotes to 61.
+        let floorLonger = ForecastBlender.reconcile(code: 3, precipitationProbability: 35, precipitation: 0,
+                                                    temperature: 10, leadHours: 4)
+        XCTAssertEqual(floorLonger, 61)
+        XCTAssertTrue(WeatherCondition(wmoCode: floorLonger).isPrecipitation)
     }
 
-    /// Fix B: `dailyIcon` shares `reconcile`, so a dry daily candidate in the 40–59% band promotes.
+    /// Fix B: `dailyIcon` shares `reconcile`, so a dry daily candidate in the 35–59% band promotes.
     /// The daily floor (`dailyPrecipitationIconMinPoP` = 30) still forces dry below 30%.
     func testDailyIconSharesHourlyPromoteFloor() {
         XCTAssertEqual(ForecastBlender.dailyPrecipitationIconMinPoP, 30)
@@ -179,6 +201,15 @@ final class BlendingTests: XCTestCase {
                                                  precipitation: 0.5, temperature: 10)
         XCTAssertEqual(stripped, 3)
         XCTAssertFalse(WeatherCondition(wmoCode: stripped).isPrecipitation, "pop 25 stays dry; the daily floor is 30")
+        // Dry daily candidate + pop 35 + 0.5 mm gets a precip icon; pop 34 stays dry.
+        let atFloor = ForecastBlender.dailyIcon(code: 3, dryFallback: 2, precipitationProbability: 35,
+                                                precipitation: 0.5, temperature: 10)
+        XCTAssertTrue(WeatherCondition(wmoCode: atFloor).isPrecipitation, "pop 35 with 0.5 mm promotes a dry daily candidate")
+        XCTAssertEqual(atFloor, 61)
+        let underFloor = ForecastBlender.dailyIcon(code: 3, dryFallback: 2, precipitationProbability: 34,
+                                                   precipitation: 0.5, temperature: 10)
+        XCTAssertEqual(underFloor, 3)
+        XCTAssertFalse(WeatherCondition(wmoCode: underFloor).isPrecipitation, "pop 34 stays dry")
     }
 
     func testNowcast() {

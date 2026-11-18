@@ -263,8 +263,8 @@ public enum ForecastBlender {
 
     /// Above this (°C, ~37 °F) snow is shown as rain: it can't plausibly be snowing at the surface.
     public static let snowToRainAbove = 2.8
-    /// Below this blended hourly rain chance (%) a dry code is not promoted to a precipitation icon.
-    public static let hourlyPrecipitationIconMinPoP = 40.0
+    /// At or above this blended hourly rain chance (%), a dry non-fog code may promote to a precipitation icon.
+    public static let hourlyPrecipitationIconMinPoP = 35.0
     /// Lead (hours) at or below which dry→precip promote needs radar echo OR short-range amount.
     public static let nearTermPrecipIconMaxLeadHours = 3.0
     /// Minimum blended precipitation (mm) to promote a dry hourly icon when lead ≤ `nearTermPrecipIconMaxLeadHours`
