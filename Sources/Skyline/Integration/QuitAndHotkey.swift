@@ -174,6 +174,18 @@ enum GlobalHotkey {
     /// Hidden QA hook: `-SkylineShowDropdown <seconds>` opens the dropdown panel once the forecast has
     /// loaded and prints its window number (`[dropdown] window=N height=H`) for `screencapture -l N`.
     static func showDropdownIfRequested() {
+        let cycles = UserDefaults.standard.integer(forKey: "SkylineDropdownCycles")  // MEASUREMENT ONLY
+        if cycles > 0 {
+            Task {
+                try? await Task.sleep(for: .seconds(UserDefaults.standard.double(forKey: "SkylineDropdownAt")))
+                for i in 1...cycles {
+                    fire(); try? await Task.sleep(for: .seconds(3))
+                    print("[slim] cycle \(i) open=\(isPanelOpen) store=\(IntentStore.shared != nil)"); fflush(stdout)
+                    closePanel(); try? await Task.sleep(for: .seconds(3))
+                }
+                print("[slim] cycles done"); fflush(stdout)
+            }
+        }
         let delay = UserDefaults.standard.double(forKey: "SkylineShowDropdown")
         guard delay > 0 else { return }
         Task {

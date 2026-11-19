@@ -23,6 +23,8 @@ struct SkylineApp: App {
         // T18: wide enough on a fresh install for the three-column layout (sidebar 290 + detail ≥ 1000);
         // macOS clamps it to smaller screens, where the narrow layout takes over as before.
         .defaultSize(width: 1360, height: 860)
+        // MEASUREMENT ONLY: -SkylineSlimMode YES never builds the main window at launch.
+        .defaultLaunchBehavior(UserDefaults.standard.bool(forKey: "SkylineSlimMode") ? .suppressed : .automatic)
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .appInfo) {
